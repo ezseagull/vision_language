@@ -1,0 +1,72 @@
+dataset:
+  name: nextgqa
+  # Cập nhật đường dẫn tuyệt đối
+  csv_path: /content/data/nextgqa
+  features_path: /content/data/nextqa/video_feature/CLIPL
+  causal_feature_path: /content/data/nextgqa/causal_feature
+  vocab_path: 
+  # Tối ưu cho Colab T4 GPU
+  batch_size: 32
+  num_thread_reader: 4
+  qmax_words: 30
+  amax_words: 38
+  max_feats: 32
+  mc: 5
+  a2id: 
+  feat_type: CLIPL
+
+model:
+  name: CRA
+  baseline: refine
+  lan: RoBERTa
+  # SỬA LỖI CHÍ MẠNG: Tải mô hình từ HuggingFace thay vì máy tác giả
+  lan_weight_path: "roberta-base"
+  feature_dim: 768
+  word_dim: 768
+  num_layers: 2
+  num_heads: 8
+  d_model: 768
+  d_ff: 768
+  dropout: 0.3
+  vocab_size: 50265
+  n_negs: 1
+  prop_num: 1
+  sigma: 9
+  gamma: 1
+  lamb: 0.15
+  window_sizes: [1,3,5]
+  time_penalty: 
+  do: true 
+  vg_loss: 1
+  vote: 0
+
+optim:
+  pipeline: cra
+  optimizer: Adam
+  loss: {"ce": {"vq":1, "vqa":1}, "align": {"g": 0.5}}
+  clip: 12
+  lr: 1.e-5
+  weight_decay: 0
+  epochs: 30
+  save_period: 1
+  lr_scheduler: warmup
+  step_size: 1
+  amsgrad: true
+
+stat:
+  monitor:
+    mode: max
+    metric: acc
+    early_stop: 30
+    vis: false
+    display_port: 8099
+  # Thư mục lưu kết quả / weights
+  record_dir: ./output
+  resume: 
+
+misc:
+  running_name: 'CRA/NextGQA/CRA'
+  info: "Temp[CLIP] (CRA)"
+  # Đổi ID GPU về 0 cho Colab
+  cuda: "0"
+  seed: 2024
