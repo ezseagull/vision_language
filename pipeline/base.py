@@ -189,6 +189,6 @@ class BasePipeline(object):
         for key, value in self.best_recorder['val'].items():
             print('\t{:15s}: {}'.format(str(key), value))
 
-        print('Best results (w.r.t {}) in test set:'.format(self.args["monitor_metric"]))
+        print('Best results (w.r.t {}) in test set:'.format(self.cfgs["stat"]["monitor"]["metric"]))
         for key, value in self.best_recorder['test'].items():
             print('\t{:15s}: {}'.format(str(key), value))

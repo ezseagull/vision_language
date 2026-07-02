@@ -47,7 +47,7 @@ optim:
   clip: 12
   lr: 1.e-5
   weight_decay: 0
-  epochs: 30
+  epochs: 5
   save_period: 1
   lr_scheduler: warmup
   step_size: 1

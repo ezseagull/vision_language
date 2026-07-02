@@ -15,8 +15,8 @@ class Bert(nn.Module):
             self.bert = DistilBertModel.from_pretrained("distilbert-base-uncased", config=config)
         elif lan == 'BERT':
             from transformers import BertModel, BertConfig
-            config = BertConfig.from_pretrained("/data2/chenweixing/Other/VQA/bert-base-uncased", output_hidden_states=True)
-            self.bert = BertModel.from_pretrained("/data2/chenweixing/Other/VQA/bert-base-uncased", config=config)
+            config = BertConfig.from_pretrained("bert-base-uncased", output_hidden_states=True)
+            self.bert = BertModel.from_pretrained("bert-base-uncased", config=config)
         elif lan == 'RoBERTa':
             from transformers import RobertaModel, RobertaConfig
             config = RobertaConfig.from_pretrained("roberta-base", output_hidden_states=True)
