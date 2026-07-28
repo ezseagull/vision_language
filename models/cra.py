@@ -63,7 +63,21 @@ class CRA(nn.Module):
             # qsn_g = self.do(qsn_g)  
             # answer_g = answer_g.view(B, M, D)
 
-        video_proj, video_attn, time_param = self.decoder(video_f, qsn_g, video_mask, gsub=gsub, do=self.cfgs["model"]["do"], window_sizes=self.cfgs["model"]["window_sizes"])
+        # video_proj, video_attn, time_param = self.decoder(video_f, qsn_g, video_mask, gsub=gsub, do=self.cfgs["model"]["do"], window_sizes=self.cfgs["model"]["window_sizes"])
+        use_gpeb = (
+            self.cfgs["model"].get("gpeb_enabled", False)
+            and mode.upper() == "VQA"
+        )
+
+        video_proj, video_attn, time_param = self.decoder(
+            video_f,
+            qsn_g,
+            video_mask,
+            gsub=gsub,
+            do=self.cfgs["model"]["do"],
+            window_sizes=self.cfgs["model"]["window_sizes"],
+            use_gpeb=use_gpeb,
+        )
         
         answer_proj = answer_g
         

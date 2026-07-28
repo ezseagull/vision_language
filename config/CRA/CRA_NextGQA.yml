@@ -19,7 +19,6 @@ model:
   name: CRA
   baseline: refine
   lan: RoBERTa
-  # SỬA LỖI CHÍ MẠNG: Tải mô hình từ HuggingFace thay vì máy tác giả
   lan_weight_path: "roberta-base"
   feature_dim: 768
   word_dim: 768
@@ -40,14 +39,25 @@ model:
   vg_loss: 1
   vote: 0
 
+  #new module
+  gpeb_enabled: true
+  gpeb_hidden_dim: 256
+  gpeb_num_bins: 4
+  gpeb_use_grounding_prior: true
+  gpeb_alpha_init: 0.0
+  gpeb_bridge_loss_weight: 0.05
+
 optim:
   pipeline: cra
   optimizer: Adam
   loss: {"ce": {"vq":1, "vqa":1}, "align": {"g": 0.5}}
   clip: 12
   lr: 1.e-5
+  #new module lr
+  gpeb_lr: 1.e-4
+  gpeb_alpha_lr: 1.e-3
   weight_decay: 0
-  epochs: 5
+  epochs: 10
   save_period: 1
   lr_scheduler: warmup
   step_size: 1

@@ -4,6 +4,7 @@ import numpy as np
 from tabulate import tabulate
 import torch
 from torch import nn
+import torch.nn.functional as F
 from .base import BasePipeline
 from utils.misc.misc import get_mask, load_file
 import matplotlib.pyplot as plt
@@ -16,6 +17,115 @@ import wandb
 class CRAPipeline(BasePipeline):
     def __init__(self, cfgs) -> None:
         super().__init__(cfgs)
+    def _compute_gpeb_loss(self, gqa_output):
+        """
+        Compute midpoint and endpoint reconstruction losses
+        for Grounded Predictive Event Bridge.
+
+        Args:
+            gqa_output:
+                Output returned by CRA in mode="VQA".
+
+        Returns:
+            bridge_loss:
+                Scalar tensor, or None if GPEB is disabled.
+            loss_logs:
+                Dictionary of detached component losses.
+        """
+        if not self.cfgs["model"].get("gpeb_enabled", False):
+            return None, {}
+
+        if len(gqa_output) < 3:
+            return None, {}
+
+        model_outputs = gqa_output[2]
+
+        if "time_param" not in model_outputs:
+            return None, {}
+
+        time_param = model_outputs["time_param"]
+        gpeb_aux = time_param.get("gpeb_aux")
+
+        if gpeb_aux is None:
+            return None, {}
+
+        required_keys = [
+            "predicted_middles",
+            "target_middles",
+            "predicted_ends",
+            "target_ends",
+            "event_valid_mask",
+        ]
+
+        missing_keys = [
+            key
+            for key in required_keys
+            if key not in gpeb_aux
+        ]
+
+        if missing_keys:
+            raise KeyError(
+                "Missing GPEB outputs: "
+                + ", ".join(missing_keys)
+            )
+
+        event_mask = gpeb_aux[
+            "event_valid_mask"
+        ].bool()
+
+        # Defensive guard, although with 32 frames
+        # and 4 bins this should normally be True.
+        if not event_mask.any():
+            zero_loss = gpeb_aux[
+                "predicted_middles"
+            ].sum() * 0.0
+
+            return zero_loss, {
+                "gpeb_middle_loss": 0.0,
+                "gpeb_end_loss": 0.0,
+            }
+
+        predicted_middles = gpeb_aux[
+            "predicted_middles"
+        ][event_mask]
+
+        target_middles = gpeb_aux[
+            "target_middles"
+        ][event_mask].detach()
+
+        predicted_ends = gpeb_aux[
+            "predicted_ends"
+        ][event_mask]
+
+        target_ends = gpeb_aux[
+            "target_ends"
+        ][event_mask].detach()
+
+        middle_loss = F.smooth_l1_loss(
+            predicted_middles,
+            target_middles,
+        )
+
+        end_loss = F.smooth_l1_loss(
+            predicted_ends,
+            target_ends,
+        )
+
+        # Average instead of sum to keep the scale stable.
+        bridge_loss = 0.5 * (
+            middle_loss + end_loss
+        )
+
+        loss_logs = {
+            "gpeb_middle_loss": (
+                middle_loss.detach().item()
+            ),
+            "gpeb_end_loss": (
+                end_loss.detach().item()
+            ),
+        }
+
+        return bridge_loss, loss_logs
     
     def get_loss(self, batch):
         answer_id, answer, video_frames, question = (
@@ -78,6 +188,39 @@ class CRAPipeline(BasePipeline):
         target["vqa_align_gt"] = gqa_output[2]["align_gt"]
 
         loss = self.criterion(pred, target)
+        
+        #########################################
+        # GPEB bridge reconstruction loss
+        #########################################
+        gpeb_bridge_loss, gpeb_logs = (
+            self._compute_gpeb_loss(
+                gqa_output
+            )
+        )
+
+        if gpeb_bridge_loss is not None:
+            gpeb_loss_weight = self.cfgs[
+                "model"
+            ].get(
+                "gpeb_bridge_loss_weight",
+                0.05,
+            )
+
+            weighted_gpeb_loss = (
+                gpeb_loss_weight
+                * gpeb_bridge_loss
+            )
+
+            # Keep the raw loss for monitoring.
+            loss["gpeb_bridge_loss"] = (
+                gpeb_bridge_loss
+            )
+
+            # Only weighted loss is added to total training loss.
+            loss["total_loss"] = (
+                loss["total_loss"]
+                + weighted_gpeb_loss
+            )
 
         predicted = torch.max(predicts, dim=1).indices.cpu()
         running_acc = (predicted == answer_id).sum().item() / BS

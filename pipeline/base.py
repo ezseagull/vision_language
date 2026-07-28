@@ -38,6 +38,8 @@ class BasePipeline(object):
         self.criterion = BuildLossFunc(cfgs)
         # optim
         self.optimizer = build_optimizer(cfgs, self.model)
+        # Verify that the new GPEB branch is included.
+        self._check_gpeb_optimizer()
         # lr_scheduler
         self.lr_scheduler = build_lr_scheduler(cfgs, self.optimizer, len(self.train_dataloader))
 
@@ -69,7 +71,77 @@ class BasePipeline(object):
         self.monitor = Monitor(cfgs)
         self.monitor.log_info(json.dumps(cfgs,sort_keys=True,indent=4), end='\n')
 
+    def _check_gpeb_optimizer(self):
+        """
+        Verify that all trainable GPEB parameters are registered
+        in the optimizer.
+        """
+        if not self.cfgs["model"].get("gpeb_enabled", False):
+            return
 
+        optimizer_param_ids = {
+            id(parameter)
+            for group in self.optimizer.param_groups
+            for parameter in group["params"]
+        }
+
+        gpeb_parameters = []
+        missing_parameters = []
+
+        for name, parameter in self.model.named_parameters():
+            if "gpeb" not in name:
+                continue
+
+            if not parameter.requires_grad:
+                continue
+
+            gpeb_parameters.append(
+                (name, parameter.numel())
+            )
+
+            if id(parameter) not in optimizer_param_ids:
+                missing_parameters.append(name)
+
+        total_gpeb_params = sum(
+            numel for _, numel in gpeb_parameters
+        )
+
+        print("\n[GPEB Optimizer Check]")
+        print(
+            f"Trainable GPEB parameters: "
+            f"{total_gpeb_params:,}"
+        )
+
+        print(
+            "GPEB tensors registered:",
+            len(gpeb_parameters),
+        )
+
+        print(
+            "Optimizer parameter groups:",
+            len(self.optimizer.param_groups),
+        )
+
+        for group_index, group in enumerate(
+            self.optimizer.param_groups
+        ):
+            print(
+                f"  Group {group_index}: "
+                f"lr={group.get('lr')}, "
+                f"num_tensors={len(group['params'])}"
+            )
+
+        if missing_parameters:
+            raise RuntimeError(
+                "The following GPEB parameters are missing "
+                "from the optimizer:\n"
+                + "\n".join(missing_parameters)
+            )
+
+        print(
+            "All GPEB parameters are registered "
+            "in the optimizer.\n"
+        )
     def train(self):
         not_improved_count = 0
         for epoch in range(self.start_epoch, self.epochs + 1):
@@ -119,30 +191,68 @@ class BasePipeline(object):
         self._print_best_to_file()
 
     def _print_best_to_file(self):
-        crt_time = time.asctime(time.localtime(time.time()))
-        self.best_recorder['val']['time'] = crt_time
-        self.best_recorder['test']['time'] = crt_time
-        self.best_recorder['val']['seed'] = self.args["seed"]
-        self.best_recorder['test']['seed'] = self.args["seed"]
-        self.best_recorder['val']['best_model_from'] = 'val'
-        self.best_recorder['test']['best_model_from'] = 'test'
+      crt_time = time.asctime(
+          time.localtime(time.time())
+      )
 
-        if not os.path.exists(self.args["record_dir"]):
-            os.makedirs(self.args["record_dir"])
-        record_path = os.path.join(self.args["record_dir"], self.args["dataset_name"] + '.csv')
-        if not os.path.exists(record_path):
-            record_table = pd.DataFrame()
-        else:
-            record_table = pd.read_csv(record_path)
-        record_table = record_table.append(self.best_recorder['val'], ignore_index=True)
-        record_table = record_table.append(self.best_recorder['test'], ignore_index=True)
-        record_table.to_csv(record_path, index=False)
+      self.best_recorder["val"]["time"] = crt_time
+      self.best_recorder["test"]["time"] = crt_time
+
+      seed = self.cfgs["misc"]["seed"]
+
+      self.best_recorder["val"]["seed"] = seed
+      self.best_recorder["test"]["seed"] = seed
+
+      self.best_recorder["val"]["best_model_from"] = "val"
+      self.best_recorder["test"]["best_model_from"] = "test"
+
+      record_dir = self.cfgs["stat"]["record_dir"]
+      dataset_name = self.cfgs["dataset"]["name"]
+
+      if not os.path.exists(record_dir):
+          os.makedirs(
+              record_dir,
+              exist_ok=True,
+          )
+
+      record_path = os.path.join(
+          record_dir,
+          f"{dataset_name}.csv",
+      )
+
+      new_records = pd.DataFrame([
+          self.best_recorder["val"],
+          self.best_recorder["test"],
+      ])
+
+      if os.path.exists(record_path):
+          old_records = pd.read_csv(record_path)
+
+          record_table = pd.concat(
+              [
+                  old_records,
+                  new_records,
+              ],
+              ignore_index=True,
+          )
+      else:
+          record_table = new_records
+
+      record_table.to_csv(
+          record_path,
+          index=False,
+      )
+
+      print(
+          f"Best results saved to: {record_path}"
+      )
 
     def _save_checkpoint(self, epoch, save_best=False):
         state = {
             'epoch': epoch,
             'state_dict': self.model.state_dict(),
             'optimizer': self.optimizer.state_dict(),
+            'lr_scheduler': self.lr_scheduler.state_dict(),
             'monitor_best': self.mnt_best
         }
         filename = os.path.join(self.checkpoint_dir, 'current_checkpoint.pth')
@@ -162,7 +272,16 @@ class BasePipeline(object):
         self.model.load_state_dict(checkpoint['state_dict']) # , strict=False)
         try: self.optimizer.load_state_dict(checkpoint['optimizer'])
         except: print("Can not load the optimizer from checkpoint")
-
+        if "lr_scheduler" in checkpoint:
+          try:
+              self.lr_scheduler.load_state_dict(
+                  checkpoint["lr_scheduler"]
+              )
+          except Exception as error:
+              print(
+                  "Cannot load scheduler state:",
+                  error,
+              )
         print("Checkpoint loaded. Resume training from epoch {}".format(self.start_epoch))
 
     def _record_best(self, log, result):

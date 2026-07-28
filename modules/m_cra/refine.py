@@ -5,7 +5,9 @@ from modules.m_cra.only_trans import clones, PositionwiseFeedForward, LayerNorm,
 from modules.m_cra.grounding import GroundingModule
 from modules.m_cra.causal_module import VisualIntervention
 import math
-
+from modules.m_cra.event_bridge import (
+    GroundedPredictiveEventBridge,
+)
 
 class RefineMHA(MultiHeadedAttention):
     def __init__(self, h, d_model, dropout=0.1):
@@ -112,8 +114,52 @@ class Decoder(nn.Module):
         #### our proposed module ####
         self.grounding_module = GroundingModule()
         self.do = VisualIntervention(self.cfgs)
+        
+        #####################################
+        # GPEB prototype module
+        #####################################
+        model_cfg = self.cfgs.get("model", {})
 
-    def forward(self, x, qa, self_mask=None, gsub=None, do=False, window_sizes=[1, 3, 5]):
+        self.gpeb_enabled = model_cfg.get(
+            "gpeb_enabled",
+            False,
+        )
+
+        if self.gpeb_enabled:
+            self.gpeb = GroundedPredictiveEventBridge(
+                input_dim=embed_dim,
+                hidden_dim=model_cfg.get(
+                    "gpeb_hidden_dim",
+                    256,
+                ),
+                num_bins=model_cfg.get(
+                    "gpeb_num_bins",
+                    4,
+                ),
+                use_grounding_prior=model_cfg.get(
+                    "gpeb_use_grounding_prior",
+                    True,
+                ),
+            )
+
+            # tanh(0) = 0, output ban đầu giống hệt CRA
+            self.gpeb_alpha = nn.Parameter(
+                torch.tensor(
+                    float(
+                        model_cfg.get(
+                            "gpeb_alpha_init",
+                            0.0,
+                        )
+                    )
+                )
+            )
+
+    def forward(self, x, qa, self_mask=None, gsub=None, do=False, window_sizes=[1, 3, 5], use_gpeb=False):
+        #####################################
+        # preserve raw timestep features
+        #####################################
+        x_raw = x
+        
         #####################################
         # encoding for the time relation
         #####################################
@@ -150,10 +196,50 @@ class Decoder(nn.Module):
             x_star = torch.mean(x_bar, dim=1)
             x_star = self.video_proj(x_star)
             video_proj = self.do(x_star, video_proj)
+        
+        #####################################
+        # preserve original CRA representation
+        #####################################
+        cra_video_proj = video_proj
+
+        # Các loss grounding/alignment cũ của CRA
+        # vẫn dùng representation nguyên bản.
+        time_param["grounding_feature"] = cra_video_proj
+
+        #####################################
+        # GPEB prototype branch
+        #####################################
+        gpeb_aux = None
+
+        if self.gpeb_enabled and use_gpeb:
+            gpeb_aux = self.gpeb(
+                raw_video=x_raw,
+                contextual_video=x_bar,
+                qa_features=qa,
+                video_mask=self_mask,
+                grounding_weights=time_param["key"],
+            )
+
+            gpeb_alpha = torch.tanh(
+                self.gpeb_alpha
+            )
+
+            video_proj = (
+                cra_video_proj
+                + gpeb_alpha
+                * gpeb_aux["bridge_repr"]
+            )
+
+            gpeb_aux["alpha"] = gpeb_alpha
+        else:
+            video_proj = cra_video_proj
+
+        time_param["gpeb_aux"] = gpeb_aux
+        time_param["gpeb_feature"] = video_proj
 
         #####################################
         # align feature
         #####################################
             
-        time_param["grounding_feature"] = video_proj
+        # time_param["grounding_feature"] = video_proj
         return video_proj, time_param["key"], time_param
