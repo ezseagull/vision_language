@@ -50,8 +50,18 @@ class VideoQADataset(Dataset):
         
         # NOTE gsub
         # self.gsub = load_file(f"data/nextgqa/gsub_{split}.json") if split != "train" else None
-        self.gsub = load_file(f"data/{cfgs['dataset']['name']}/gsub_{split}.json") if split != "train" else None
-
+        # self.gsub = load_file(f"data/{cfgs['dataset']['name']}/gsub_{split}.json") if split != "train" else None
+        self.gsub = (
+            load_file(
+                osp.join(
+                    cfgs["dataset"]["csv_path"],
+                    f"gsub_{split}.json",
+                )
+            )
+            if split != "train"
+            else None
+        )
+        
         self.v_questions = {}
         self.max_feats = cfgs["dataset"]["max_feats"]
         self.mc = cfgs["dataset"]["mc"]
@@ -202,14 +212,14 @@ class VideoQADataset(Dataset):
             
             if random.random() < 0.3:
                 same_v_qsn = set(self.v_questions[vid_id])
-                same_v_other_qsn = list(same_v_qsn - set(question_txt))
+                same_v_other_qsn = list(same_v_qsn - {question_txt})
                 num_other = len(same_v_other_qsn)
                 if num_other >= self.mc-1:
                     qchoices = random.sample(same_v_other_qsn, self.mc-1)
                 else:
                     cand_qsn = valid_qsncans - same_v_qsn
                     if len(cand_qsn) < self.mc-1-num_other:
-                        cand_qsn = set(self.all_question) - same_v_qsn
+                        cand_qsn = set(self.all_questions) - same_v_qsn
                     qchoices = same_v_other_qsn + random.sample(list(cand_qsn), self.mc-1-num_other)
             else:
                 cand_qsns = valid_qsncans - set(question_txt)
@@ -258,8 +268,8 @@ class VideoQADataset(Dataset):
                 else:
                     valid_anscans = self.ans_group[qtype]
                 
-                cand_answers = valid_anscans - set(ans)
-                choices = random.sample(list(cand_answers), self.mc-1)
+                cand_answers = valid_anscans - {ans}
+                choices = random.sample(sorted(cand_answers), self.mc-1)
                 choices.append(ans)
 
                 random.shuffle(choices)

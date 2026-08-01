@@ -30,7 +30,15 @@ class CRA(nn.Module):
             self.forward = self.baseline_forward
         
         elif cfgs["model"]["baseline"] == "refine":
-            self.decoder = RefineDecoder(num_layer=cfgs["model"]["num_layers"], cfgs=cfgs)
+            # self.decoder = RefineDecoder(num_layer=cfgs["model"]["num_layers"], cfgs=cfgs)
+            self.decoder = RefineDecoder(
+                embed_dim=cfgs["model"]["d_model"],
+                num_layer=cfgs["model"]["num_layers"],
+                num_heads=cfgs["model"]["num_heads"],
+                ff_dim=cfgs["model"]["d_ff"],
+                dropout=cfgs["model"]["dropout"],
+                cfgs=cfgs,
+            )
             self.forward = self.refine_forward
 
     def _check_device(self, module, x):

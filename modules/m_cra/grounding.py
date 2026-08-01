@@ -52,7 +52,7 @@ class AdaptiveGaussianFilter(nn.Module):
 
 
 class GroundingModule(nn.Module):
-    def __init__(self, d_model=768, dropout=0.3):
+    def __init__(self, d_model=768, dropout=0.3, initial_sigma=1.0, window_sizes=(1, 3, 5)):
         super().__init__()
         self.qa_proj = nn.Sequential(
             nn.LayerNorm(d_model),
@@ -74,66 +74,110 @@ class GroundingModule(nn.Module):
                 nn.Softmax(dim=-2)
                 )
     
-        self.gs_filter = AdaptiveGaussianFilter()
+        # self.gs_filter = AdaptiveGaussianFilter()
+        self.gs_filter = AdaptiveGaussianFilter(
+            initial_sigma=float(initial_sigma),
+        )
+
+        self.window_sizes = list(window_sizes)
     
-    def gen_grounding(self, keyframe_prob, window_sizes=[1, 3, 5]):
+    def gen_grounding(self, keyframe_prob, window_sizes=None):
         bs, length = keyframe_prob.size()[:2]
-        max_indices = self.find_best_interval(keyframe_prob)
+        if window_sizes is None:
+            window_sizes = self.window_sizes
+        max_indices = self.find_best_interval(keyframe_prob, window_sizes=window_sizes)
         start_indices = max_indices[:, 0].unsqueeze(1).expand(-1, length)
         end_indices = max_indices[:, 1].unsqueeze(1).expand(-1, length)
         range_tensor = torch.arange(length, device=keyframe_prob.device).expand(bs, length)
         keyframe_mask = (range_tensor >= start_indices) & (range_tensor <= end_indices)
-        start_time = max_indices[:, 0] / 31.
-        end_time = max_indices[:, 1] / 31.
-        time_param = {"key": keyframe_prob, "max_indices": max_indices, "start": start_time, "end": end_time, "mask": keyframe_mask}
-        return time_param
+        denominator = float(
+            max(length - 1, 1)
+        )
 
-    def find_best_interval(self, keyframe_prob, window_sizes=[1, 3, 5]):
+        start_time = (
+            max_indices[:, 0].float()
+            / denominator
+        )
+
+        end_time = (
+            max_indices[:, 1].float()
+            / denominator
+        )
+
+        # Kiểm tra phòng lỗi
+        start_time = start_time.clamp(0.0, 1.0)
+        end_time = end_time.clamp(0.0, 1.0)
+
+        return {
+            "key": keyframe_prob,
+            "max_indices": max_indices,
+            "start": start_time,
+            "end": end_time,
+            "mask": keyframe_mask,
+        }
+
+    def find_best_interval(self, keyframe_prob, window_sizes=None):
+        if window_sizes is None:
+            window_sizes = self.window_sizes
         bs, length = keyframe_prob.shape
         max_interval_size = length // 2
         max_indices = torch.zeros((bs, 2), dtype=torch.long, device=keyframe_prob.device)
 
         # Initialize a tensor to store the maximum scores and their corresponding indices
-        best_scores = torch.full((bs,), float('-inf'), dtype=torch.float, device=keyframe_prob.device)
+        best_scores = torch.full((bs,), float('-inf'), dtype=keyframe_prob.dtype, device=keyframe_prob.device)
+        max_positions = keyframe_prob.argmax(dim=1)
         
         for window_size in window_sizes:
-            if window_size > max_interval_size:
+            if (window_size <= 0 or window_size > max_interval_size):
                 continue
 
             # Calculate sliding window sums for all batches simultaneously using 1D convolution
             sliding_sums = F.conv1d(
                 keyframe_prob.unsqueeze(1), 
-                weight=torch.ones((1, 1, window_size), device=keyframe_prob.device), 
+                weight=torch.ones((1, 1, window_size), device=keyframe_prob.device, dtype=keyframe_prob.dtype), 
                 padding=0, 
                 stride=1
             ).squeeze(1)
 
             # Create a mask to ensure the max value in the distribution is within the interval
-            max_values = keyframe_prob.max(dim=1, keepdim=True).values
-            max_positions = keyframe_prob.argmax(dim=1, keepdim=True)
+            # max_values = keyframe_prob.max(dim=1, keepdim=True).values
+            # max_positions = keyframe_prob.argmax(dim=1, keepdim=True)
 
             for start in range(length - window_size + 1):
-                end = start + window_size
+                end = (start + window_size - 1)
                 contains_max = (max_positions >= start) & (max_positions < end)
                 
-                window_scores = sliding_sums[:, start]
-                window_scores[~contains_max.squeeze()] = float('-inf')
+                window_scores = (sliding_sums[:, start].clone())
+                # window_scores[~contains_max.squeeze()] = float('-inf')
+                window_scores = (
+                    window_scores.masked_fill(
+                        ~contains_max,
+                        float("-inf"),
+                    )
+                )
                 
                 # Update best scores and indices
                 better_scores = window_scores > best_scores
                 best_scores = torch.where(better_scores, window_scores, best_scores)
-                max_indices[better_scores] = torch.tensor([start, end], device=keyframe_prob.device)
+                if better_scores.any():
+                    max_indices[better_scores,0,] = start
+                    max_indices[better_scores,1,] = end
+                # max_indices[better_scores] = torch.tensor([start, end], device=keyframe_prob.device)
 
         return max_indices
     
-    def forward(self, v, qa):
+    def forward(self, v, qa, window_sizes=None):
         v = self.v_proj(v)
         qa = self.qa_proj(qa)
         gate = (torch.matmul(v, qa.unsqueeze(dim=-1))).tanh()#  # bs, length, 1
         keyframe_prob = self.grounding(v*gate) # bs, length, 1
         keyframe_prob_gs = self.gs_filter(keyframe_prob)  # [bs, length]
         keyframe_prob_gs = keyframe_prob_gs.squeeze(dim=-1)
-        time_param = self.gen_grounding(keyframe_prob_gs)
+        # time_param = self.gen_grounding(keyframe_prob_gs)
+        time_param = self.gen_grounding(
+            keyframe_prob_gs,
+            window_sizes=window_sizes,
+        )
         time_param["ori_key"] = keyframe_prob.squeeze(dim=-1)
         return time_param
 

@@ -6,7 +6,7 @@ dataset:
   causal_feature_path: /content/data/nextgqa/causal_feature
   vocab_path: 
   # Tối ưu cho Colab T4 GPU
-  batch_size: 32
+  batch_size: 64
   num_thread_reader: 4
   qmax_words: 30
   amax_words: 38
@@ -40,7 +40,7 @@ model:
   vote: 0
 
   #new module
-  gpeb_enabled: true
+  gpeb_enabled: false
   gpeb_hidden_dim: 256
   gpeb_num_bins: 4
   gpeb_use_grounding_prior: true
@@ -57,7 +57,7 @@ optim:
   gpeb_lr: 1.e-4
   gpeb_alpha_lr: 1.e-3
   weight_decay: 0
-  epochs: 10
+  epochs: 30
   save_period: 1
   lr_scheduler: warmup
   step_size: 1

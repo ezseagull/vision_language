@@ -112,7 +112,15 @@ class Decoder(nn.Module):
             )
         
         #### our proposed module ####
-        self.grounding_module = GroundingModule()
+        # self.grounding_module = GroundingModule()
+        model_cfg = self.cfgs["model"]
+
+        self.grounding_module = GroundingModule(
+            d_model=embed_dim,
+            dropout=model_cfg["dropout"],
+            initial_sigma=model_cfg["sigma"],
+            window_sizes=model_cfg["window_sizes"],
+        )
         self.do = VisualIntervention(self.cfgs)
         
         #####################################
@@ -164,14 +172,18 @@ class Decoder(nn.Module):
         # encoding for the time relation
         #####################################
         for i in range(len(self.layers)):
-            x = self.layers[i](x)
+            x = self.layers[i](x, self_mask,)
         x_bar = self.norm(x)
 
         #####################################
         # generate the grounding
         #####################################
-        time_param = self.grounding_module(x_bar, qa) # cross-model grounding
-        
+        # time_param = self.grounding_module(x_bar, qa) # cross-model grounding
+        time_param = self.grounding_module(
+            x_bar,
+            qa,
+            window_sizes=window_sizes,
+        )
         # attn = self.attention_video_feature(x_bar)
         #####################################
         # NOTE train the recon module 
