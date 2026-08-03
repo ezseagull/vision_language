@@ -30,7 +30,7 @@ model:
   vocab_size: 50265
   n_negs: 1
   prop_num: 1
-  sigma: 9
+  sigma: 3.0
   gamma: 1
   lamb: 0.15
   window_sizes: [1,3,5]
@@ -40,7 +40,7 @@ model:
   vote: 0
 
   #new module
-  gpeb_enabled: false
+  gpeb_enabled: true
   gpeb_hidden_dim: 256
   gpeb_num_bins: 4
   gpeb_use_grounding_prior: true
