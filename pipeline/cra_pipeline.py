@@ -17,6 +17,22 @@ import wandb
 class CRAPipeline(BasePipeline):
     def __init__(self, cfgs) -> None:
         super().__init__(cfgs)
+
+    def _get_gpeb_aux(self, gqa_output):
+        """Safely extract GPEB auxiliary outputs from CRA VQA output."""
+        if not self.cfgs["model"].get("gpeb_enabled", False):
+            return None
+
+        if len(gqa_output) < 3:
+            return None
+
+        model_outputs = gqa_output[2]
+        time_param = model_outputs.get("time_param")
+        if time_param is None:
+            return None
+
+        return time_param.get("gpeb_aux")
+
     def _compute_gpeb_loss(self, gqa_output):
         """
         Compute midpoint and endpoint reconstruction losses
@@ -32,20 +48,7 @@ class CRAPipeline(BasePipeline):
             loss_logs:
                 Dictionary of detached component losses.
         """
-        if not self.cfgs["model"].get("gpeb_enabled", False):
-            return None, {}
-
-        if len(gqa_output) < 3:
-            return None, {}
-
-        model_outputs = gqa_output[2]
-
-        if "time_param" not in model_outputs:
-            return None, {}
-
-        time_param = model_outputs["time_param"]
-        gpeb_aux = time_param.get("gpeb_aux")
-
+        gpeb_aux = self._get_gpeb_aux(gqa_output)
         if gpeb_aux is None:
             return None, {}
 
@@ -126,109 +129,322 @@ class CRAPipeline(BasePipeline):
         }
 
         return bridge_loss, loss_logs
+
+    def _compute_gpeb_aux_qa_loss(
+        self,
+        gqa_output,
+        answer_proj,
+        answer_id,
+        batch_size,
+    ):
+        """
+        Score each answer candidate using only the GPEB representation.
+
+        The existing answer embeddings are reused so this branch introduces
+        no new classifier parameters. By default they are detached, ensuring
+        that this auxiliary objective primarily trains GPEB rather than
+        duplicating gradients into the language/answer encoder.
+        """
+        gpeb_aux = self._get_gpeb_aux(gqa_output)
+        if gpeb_aux is None:
+            return None, None, None
+
+        bridge_repr = gpeb_aux.get("bridge_repr")
+        if bridge_repr is None:
+            raise KeyError(
+                "GPEB Ver0.5 requires gpeb_aux['bridge_repr']."
+            )
+
+        if bridge_repr.ndim != 2:
+            raise ValueError(
+                "bridge_repr must be [B, D], got "
+                f"{tuple(bridge_repr.shape)}."
+            )
+
+        detach_answer = self.cfgs["model"].get(
+            "gpeb_aux_detach_answer",
+            True,
+        )
+        aux_answer_proj = (
+            answer_proj.detach()
+            if detach_answer
+            else answer_proj
+        )
+
+        if aux_answer_proj.ndim != 3:
+            raise ValueError(
+                "answer_proj must be [B, C, D], got "
+                f"{tuple(aux_answer_proj.shape)}."
+            )
+
+        if aux_answer_proj.size(0) != bridge_repr.size(0):
+            raise ValueError(
+                "answer_proj and bridge_repr batch sizes differ: "
+                f"{aux_answer_proj.size(0)} vs {bridge_repr.size(0)}."
+            )
+
+        if aux_answer_proj.size(-1) != bridge_repr.size(-1):
+            raise ValueError(
+                "answer_proj and bridge_repr feature dimensions differ: "
+                f"{aux_answer_proj.size(-1)} vs {bridge_repr.size(-1)}."
+            )
+
+        aux_logits = torch.bmm(
+            aux_answer_proj,
+            bridge_repr.unsqueeze(-1),
+        ).squeeze(-1)
+
+        prop_num = self.cfgs["model"].get("prop_num", 1)
+        aux_logits = aux_logits.view(
+            batch_size,
+            prop_num,
+            -1,
+        ).mean(dim=1)
+
+        answer_id_cuda = answer_id.to(
+            device=aux_logits.device,
+            dtype=torch.long,
+        ).reshape(-1)
+        if answer_id_cuda.numel() != aux_logits.size(0):
+            raise ValueError(
+                "answer_id size does not match GPEB auxiliary logits."
+            )
+        aux_loss = F.cross_entropy(
+            aux_logits,
+            answer_id_cuda,
+        )
+        aux_predicted = aux_logits.argmax(dim=1)
+        aux_accuracy = (
+            aux_predicted == answer_id_cuda
+        ).float().mean()
+
+        return aux_loss, aux_logits, aux_accuracy
+
+    @staticmethod
+    def _masked_scalar_mean(values, mask=None):
+        if values is None:
+            return None
+        if not torch.is_tensor(values):
+            return float(values)
+        if mask is not None and values.ndim >= 2:
+            values = values[mask]
+        if values.numel() == 0:
+            return 0.0
+        return values.detach().float().mean().item()
+
+    def _collect_gpeb_stats(self, gqa_output, loss_logs=None):
+        """Collect detached diagnostics for terminal and W&B logging."""
+        stats = {}
+        if loss_logs:
+            stats.update(loss_logs)
+
+        gpeb_aux = self._get_gpeb_aux(gqa_output)
+        if gpeb_aux is None:
+            return stats
+
+        direct_scalar_keys = [
+            "gate_mean",
+            "gate_std",
+            "gate_min",
+            "gate_max",
+            "residual_ratio_mean",
+            "residual_ratio_unclipped_mean",
+            "residual_clip_scale_mean",
+            "residual_max_ratio",
+            "branch_cosine_mean",
+            "grounding_scale_used",
+        ]
+        for key in direct_scalar_keys:
+            value = gpeb_aux.get(key)
+            scalar = self._masked_scalar_mean(value)
+            if scalar is not None:
+                stats[f"gpeb_{key}"] = scalar
+
+        event_mask = gpeb_aux.get("event_valid_mask")
+        if event_mask is not None:
+            event_mask = event_mask.bool()
+
+        event_keys = {
+            "event_prediction_error": "gpeb_prediction_error",
+            "event_weight_entropy": "gpeb_event_entropy",
+            "event_effective_count": "gpeb_effective_event_count",
+        }
+        for source_key, log_key in event_keys.items():
+            value = gpeb_aux.get(source_key)
+            scalar = self._masked_scalar_mean(
+                value,
+                event_mask if source_key == "event_prediction_error" else None,
+            )
+            if scalar is not None:
+                stats[log_key] = scalar
+
+        fusion_delta = gpeb_aux.get("fusion_delta")
+        if torch.is_tensor(fusion_delta):
+            stats["gpeb_fusion_delta_norm"] = (
+                fusion_delta.detach().float().norm(dim=-1).mean().item()
+            )
+
+        return stats
+
+    def _gpeb_monitor_keys(self):
+        return [
+            "gpeb_aux_acc",
+            "gpeb_middle_loss",
+            "gpeb_end_loss",
+            "gpeb_gate_mean",
+            "gpeb_gate_std",
+            "gpeb_gate_min",
+            "gpeb_gate_max",
+            "gpeb_residual_ratio_mean",
+            "gpeb_residual_ratio_unclipped_mean",
+            "gpeb_residual_clip_scale_mean",
+            "gpeb_residual_max_ratio",
+            "gpeb_branch_cosine_mean",
+            "gpeb_grounding_scale_used",
+            "gpeb_prediction_error",
+            "gpeb_event_entropy",
+            "gpeb_effective_event_count",
+            "gpeb_fusion_delta_norm",
+        ]
     
     def get_loss(self, batch):
         answer_id, answer, video_frames, question = (
-                batch["answer_id"],
-                batch["answer"],
-                batch["video_frames"].cuda(),
-                batch["question"].cuda(),
-            )
-        
+            batch["answer_id"],
+            batch["answer"],
+            batch["video_frames"].cuda(),
+            batch["question"].cuda(),
+        )
+
         qsns_id, qsns_token_ids, qsns_seq_len = (
-            batch['qsns_id'],
-            batch['qsns_token_ids'],
-            batch['qsns_seq_len']
+            batch["qsns_id"],
+            batch["qsns_token_ids"],
+            batch["qsns_seq_len"],
         )
-        
+
         video_len = batch["video_len"]
-
-        pad_id = self.tokenizer.pad_token_id
-        question_mask = (question!=pad_id).float().cuda() 
-        answer_mask = (answer!=pad_id).float().cuda()
-
         video_mask = (
-            get_mask(video_len, self.cfgs["dataset"]["max_feats"]).cuda() if self.cfgs["dataset"]["max_feats"] > 0 else None
+            get_mask(
+                video_len,
+                self.cfgs["dataset"]["max_feats"],
+            ).cuda()
+            if self.cfgs["dataset"]["max_feats"] > 0
+            else None
         )
 
-        BS = answer_id.size(0)
+        batch_size = answer_id.size(0)
+        answer_id_cuda = answer_id.cuda()
         pred = {}
         target = {}
-        # find the video moments that are relevant to the question. 
-        # qsns_mask = (qsns_token_ids != pad_id).float().cuda()
+
+        # Find video moments relevant to the question.
         if self.cfgs["model"]["vg_loss"]:
-            video_len = batch["video_len"]
-
-            video_mask = (
-                get_mask(video_len, self.cfgs["dataset"]["max_feats"]).cuda() if self.cfgs["dataset"]["max_feats"] > 0 else None
+            vq_output = self.model(
+                video_frames,
+                video_mask,
+                qsns_token_ids,
+                qsns_id,
+                mode="VQ",
             )
+            vq_video_proj = vq_output[0].unsqueeze(-1)
+            vq_predicts = torch.bmm(
+                vq_output[1],
+                vq_video_proj,
+            ).squeeze(-1)
+            vq_predicts = vq_predicts.view(
+                batch_size,
+                self.cfgs["model"]["prop_num"],
+                -1,
+            ).mean(dim=1)
 
-            vq_output = self.model(video_frames, video_mask, qsns_token_ids, qsns_id, mode="VQ")
-            video_proj = vq_output[0].unsqueeze(2)
-            vq_predicts = torch.bmm(vq_output[1], video_proj).squeeze()
-            vq_predicts = vq_predicts.view(answer.size(0), self.cfgs["model"]["prop_num"], -1).mean(dim=1)
-            # base
             pred["vq_pred"] = vq_predicts
             target["vq_target"] = qsns_id.cuda()
-            # align
-            pred["vq_align_pred"] = vq_output[2]["time_param"]["grounding_feature"]
+            pred["vq_align_pred"] = (
+                vq_output[2]["time_param"]["grounding_feature"]
+            )
             target["vq_align_gt"] = vq_output[2]["align_gt"]
 
-        #refine the moments according to the answer
-        gqa_output = self.model(video_frames, video_mask, answer, answer_id, mode="VQA")
-        video_proj = gqa_output[0].unsqueeze(2)
-        vqa_predicts = torch.bmm(gqa_output[1], video_proj).squeeze()
-        predicts = vqa_predicts.view(answer.size(0), self.cfgs["model"]["prop_num"], -1).mean(dim=1)
+        # Refine moments according to candidate answers.
+        gqa_output = self.model(
+            video_frames,
+            video_mask,
+            answer,
+            answer_id,
+            mode="VQA",
+        )
+        main_video_proj = gqa_output[0].unsqueeze(-1)
+        answer_proj = gqa_output[1]
+        vqa_predicts = torch.bmm(
+            answer_proj,
+            main_video_proj,
+        ).squeeze(-1)
+        predicts = vqa_predicts.view(
+            batch_size,
+            self.cfgs["model"]["prop_num"],
+            -1,
+        ).mean(dim=1)
 
-        # vqa_loss = self.criterion(predicts, answer_id.cuda())
         pred["vqa_pred"] = predicts
-        target["vqa_target"] = answer_id.cuda()
-
-        pred["vqa_align_pred"] = gqa_output[2]["time_param"]["grounding_feature"]
+        target["vqa_target"] = answer_id_cuda
+        pred["vqa_align_pred"] = (
+            gqa_output[2]["time_param"]["grounding_feature"]
+        )
         target["vqa_align_gt"] = gqa_output[2]["align_gt"]
 
         loss = self.criterion(pred, target)
-        
-        #########################################
-        # GPEB bridge reconstruction loss
-        #########################################
-        gpeb_bridge_loss, gpeb_logs = (
-            self._compute_gpeb_loss(
-                gqa_output
-            )
-        )
 
+        # GPEB predictive reconstruction objective.
+        gpeb_bridge_loss, bridge_logs = self._compute_gpeb_loss(
+            gqa_output
+        )
         if gpeb_bridge_loss is not None:
-            gpeb_loss_weight = self.cfgs[
-                "model"
-            ].get(
+            bridge_weight = self.cfgs["model"].get(
                 "gpeb_bridge_loss_weight",
                 0.05,
             )
-
-            weighted_gpeb_loss = (
-                gpeb_loss_weight
-                * gpeb_bridge_loss
-            )
-
-            # Keep the raw loss for monitoring.
-            loss["gpeb_bridge_loss"] = (
-                gpeb_bridge_loss
-            )
-
-            # Only weighted loss is added to total training loss.
+            loss["gpeb_bridge_loss"] = gpeb_bridge_loss
             loss["total_loss"] = (
                 loss["total_loss"]
-                + weighted_gpeb_loss
+                + bridge_weight * gpeb_bridge_loss
             )
 
-        predicted = torch.max(predicts, dim=1).indices.cpu()
-        running_acc = (predicted == answer_id).sum().item() / BS
-        
-        return loss, running_acc
+        # GPEB-only answer objective. This explicitly forces bridge_repr
+        # to contain information capable of distinguishing answer choices.
+        gpeb_aux_loss, _, gpeb_aux_acc = (
+            self._compute_gpeb_aux_qa_loss(
+                gqa_output=gqa_output,
+                answer_proj=answer_proj,
+                answer_id=answer_id,
+                batch_size=batch_size,
+            )
+        )
+        if gpeb_aux_loss is not None:
+            aux_weight = self.cfgs["model"].get(
+                "gpeb_aux_qa_weight",
+                0.30,
+            )
+            loss["gpeb_aux_qa_loss"] = gpeb_aux_loss
+            loss["total_loss"] = (
+                loss["total_loss"]
+                + aux_weight * gpeb_aux_loss
+            )
+
+        predicted = predicts.argmax(dim=1).detach().cpu()
+        running_acc = (
+            predicted == answer_id.cpu()
+        ).float().mean().item()
+
+        gpeb_stats = self._collect_gpeb_stats(
+            gqa_output,
+            bridge_logs,
+        )
+        if gpeb_aux_acc is not None:
+            gpeb_stats["gpeb_aux_acc"] = (
+                gpeb_aux_acc.detach().item()
+            )
+
+        return loss, running_acc, gpeb_stats
 
     def _train_epoch(self, epoch):
-        
         self.monitor.log_info(f"\n{'#'*20} Epoch {epoch}/{self.cfgs['optim']['epochs']} ... {'#'*20}\n")
         #########################################
         # Train Stage
@@ -242,13 +458,21 @@ class CRAPipeline(BasePipeline):
             if key == "ce" or key == "align":
                 continue
             self.monitor.reset_kv(f"{key}_loss")
+
+        if self.cfgs["model"].get("gpeb_enabled", False):
+            self.monitor.reset_kv("gpeb_bridge_loss")
+            self.monitor.reset_kv("gpeb_aux_qa_loss")
+            for key in self._gpeb_monitor_keys():
+                self.monitor.reset_kv(key)
         # train iter
 
         for idx, batch in enumerate(self.train_dataloader):
             start_time = time.time()
-            loss, monitor_metric = self.get_loss(batch)
+            loss, monitor_metric, gpeb_stats = self.get_loss(batch)
             
             self.monitor.logkv_mean("acc", monitor_metric)
+            for name, value in gpeb_stats.items():
+                self.monitor.logkv_mean(name, value)
             self.optimizer.zero_grad()
             loss["total_loss"].backward()
             if self.cfgs["optim"]["clip"]:
@@ -344,6 +568,20 @@ class CRAPipeline(BasePipeline):
         if 'test_merge' in score.keys():
             self.monitor.log_info("\n================= test_merge ==================")
             _print_score(score['test_merge'])
+
+        gpeb_keys = [
+            key for key in score
+            if key.startswith("val_gpeb_")
+            or key.startswith("test_gpeb_")
+        ]
+        if gpeb_keys:
+            self.monitor.log_info(
+                "\n================ GPEB diagnostics ================"
+            )
+            for key in gpeb_keys:
+                self.monitor.log_info(
+                    f"{key}: {score[key]:.6f}"
+                )
         print("\n")
     
     def draw_grounding(self, gt, posthoc, attn, merge, epoch, probs=None):
@@ -398,6 +636,10 @@ class CRAPipeline(BasePipeline):
         ground_pre = {}
         keyframe = {}
         ori_keyframe = {}
+        gpeb_aux_correct = 0
+        gpeb_aux_count = 0
+        gpeb_stat_sums = collections.defaultdict(float)
+        gpeb_stat_count = 0
 
         with torch.no_grad():
             if not self.cfgs["dataset"]["mc"]:
@@ -430,6 +672,43 @@ class CRAPipeline(BasePipeline):
                 if predicts.dim() == 1:
                     predicts = predicts.unsqueeze(0)
                 # ---------------------------------------------
+
+                # GPEB-only validation accuracy and diagnostics.
+                if "time_param" in kargs:
+                    eval_gpeb_aux = kargs["time_param"].get("gpeb_aux")
+                else:
+                    eval_gpeb_aux = None
+
+                if eval_gpeb_aux is not None:
+                    bridge_repr = eval_gpeb_aux.get("bridge_repr")
+                    if bridge_repr is not None:
+                        aux_logits = torch.bmm(
+                            answer_proj,
+                            bridge_repr.unsqueeze(-1),
+                        ).squeeze(-1)
+                        aux_logits = aux_logits.view(
+                            answer_id.size(0),
+                            self.cfgs["model"]["prop_num"],
+                            -1,
+                        ).mean(dim=1)
+                        aux_predicted = aux_logits.argmax(dim=1).cpu()
+                        gpeb_aux_correct += (
+                            aux_predicted == answer_id.cpu()
+                        ).sum().item()
+                        gpeb_aux_count += answer_id.size(0)
+
+                    # Build a CRA-like wrapper for the shared collector.
+                    eval_wrapper = (
+                        None,
+                        None,
+                        {"time_param": kargs["time_param"]},
+                    )
+                    batch_stats = self._collect_gpeb_stats(eval_wrapper)
+                    for name, value in batch_stats.items():
+                        gpeb_stat_sums[name] += (
+                            float(value) * answer_id.size(0)
+                        )
+                    gpeb_stat_count += answer_id.size(0)
                 
                 predicted = torch.max(predicts, dim=1).indices.cpu()
                 score["acc"] += (predicted == answer_id.cpu()).sum().item()
@@ -460,6 +739,14 @@ class CRAPipeline(BasePipeline):
 
         # --- TÍNH TOÁN METRIC SAU KHI XONG VÒNG LẶP ---
         score["acc"] /= count
+        if gpeb_aux_count > 0:
+            score["gpeb_aux_acc"] = (
+                gpeb_aux_correct / gpeb_aux_count
+            )
+        if gpeb_stat_count > 0:
+            for name, value_sum in gpeb_stat_sums.items():
+                score[name] = value_sum / gpeb_stat_count
+
         gt_file = os.path.join(self.cfgs["dataset"]["csv_path"], f'gsub_{data_loader.dataset.split}.json')
         gt_ground = load_file(gt_file)
         seg_file = os.path.join(self.cfgs["dataset"]["csv_path"], f'frame2time_{data_loader.dataset.split}.json')

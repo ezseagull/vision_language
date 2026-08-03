@@ -44,8 +44,26 @@ model:
   gpeb_hidden_dim: 256
   gpeb_num_bins: 4
   gpeb_use_grounding_prior: true
-  gpeb_alpha_init: 0.0
-  gpeb_bridge_loss_weight: 0.05
+  # gpeb_alpha_init: 0.0
+  # gpeb_bridge_loss_weight: 0.05
+  gpeb_dropout: 0.1
+  gpeb_grounding_prior_clip: 4.0
+  gpeb_grounding_scale_max: 5.0
+
+  gpeb_gate_hidden_dim: 384
+  gpeb_gate_dropout: 0.1
+  gpeb_gate_bias_init: -0.5
+  gpeb_residual_dropout: 0.1
+
+   # New Ver0.5b safeguards
+  gpeb_detach_backbone_inputs: true
+  gpeb_detach_gate_context: true
+  gpeb_residual_max_ratio: 0.15
+
+  # Ver0.5 losses
+  gpeb_bridge_loss_weight: 0.02
+  gpeb_aux_qa_weight: 0.1
+  gpeb_aux_detach_answer: true
 
 optim:
   pipeline: cra
@@ -54,8 +72,10 @@ optim:
   clip: 12
   lr: 1.e-5
   #new module lr
-  gpeb_lr: 1.e-4
-  gpeb_alpha_lr: 1.e-3
+  gpeb_lr: 5.e-5
+  gpeb_weight_decay: 0
+
+  # gpeb_alpha_lr: 1.e-3
   weight_decay: 0
   epochs: 30
   save_period: 1
@@ -75,7 +95,7 @@ stat:
   resume: 
 
 misc:
-  running_name: 'CRA/NextGQA/CRA'
+  running_name: 'CRA/NextGQA/GPEB_v0_5b_seed2024'
   info: "Temp[CLIP] (CRA)"
   # Đổi ID GPU về 0 cho Colab
   cuda: "0"

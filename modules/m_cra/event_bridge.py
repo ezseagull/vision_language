@@ -2,11 +2,16 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class GroundedPredictiveEventBridge(nn.Module):
     """
-    Grounded Predictive Event Bridge - Version 0.
+    Grounded Predictive Event Bridge - Version 0.5.
+
+    Version 0.5 deliberately keeps the fixed-bin event construction of
+    Version 0. Its purpose is to make the bridge easier to optimize,
+    diagnose, and safely fuse with the CRA representation.
 
     Inputs:
         raw_video:
@@ -32,9 +37,13 @@ class GroundedPredictiveEventBridge(nn.Module):
             CRA frame-level grounding distribution.
             Shape: [B, T]
 
-    Outputs:
+    Main outputs:
         bridge_repr:
-            Aggregated GPEB representation.
+            Semantic GPEB representation for the auxiliary QA head.
+            Shape: [B, input_dim]
+
+        fusion_delta:
+            Zero-initialized residual feature for gated fusion with CRA.
             Shape: [B, input_dim]
 
         event_tokens:
@@ -48,16 +57,34 @@ class GroundedPredictiveEventBridge(nn.Module):
         hidden_dim: int = 256,
         num_bins: int = 4,
         use_grounding_prior: bool = True,
+        dropout: float = 0.1,
+        grounding_prior_clip: float = 4.0,
+        grounding_scale_max: float = 5.0,
     ) -> None:
         super().__init__()
 
         if num_bins < 1:
             raise ValueError("num_bins must be at least 1.")
 
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError("dropout must be in [0, 1).")
+
+        if grounding_prior_clip <= 0.0:
+            raise ValueError(
+                "grounding_prior_clip must be positive."
+            )
+
+        if grounding_scale_max <= 0.0:
+            raise ValueError(
+                "grounding_scale_max must be positive."
+            )
+
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.num_bins = num_bins
         self.use_grounding_prior = use_grounding_prior
+        self.grounding_prior_clip = grounding_prior_clip
+        self.grounding_scale_max = grounding_scale_max
 
         # x before CRA refinement:
         # mainly used to obtain local temporal differences.
@@ -129,12 +156,39 @@ class GroundedPredictiveEventBridge(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
+        # Keep a semantic bridge representation for the auxiliary QA head.
+        # This branch is not zero-initialized so it can learn immediately.
+        self.bridge_hidden_norm = nn.LayerNorm(hidden_dim)
+
         self.output_proj = nn.Sequential(
             nn.Linear(hidden_dim, input_dim),
             nn.LayerNorm(input_dim),
         )
 
+        # A separate residual adapter is used only for fusion with CRA.
+        # The last layer is initialized to zero so that, at initialization:
+        #
+        #   cra_repr + gate * fusion_delta ~= cra_repr
+        #
+        # This protects the baseline while still allowing the bridge-only
+        # auxiliary head to train from bridge_repr.
+        self.fusion_adapter = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, input_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(input_dim, input_dim),
+        )
+
+        last_fusion_layer = self.fusion_adapter[-1]
+        nn.init.zeros_(last_fusion_layer.weight)
+        nn.init.zeros_(last_fusion_layer.bias)
+
         # Learnable strength of CRA grounding prior.
+        #
+        # The parameter name is kept for checkpoint compatibility with
+        # Version 0. The effective value is clamped in forward() so the
+        # prior cannot be inverted by becoming negative.
         self.grounding_scale = nn.Parameter(
             torch.tensor(1.0)
         )
@@ -151,7 +205,9 @@ class GroundedPredictiveEventBridge(nn.Module):
         or:
             [B, number_of_candidates, D]
 
-        Version 0 averages candidate/token dimensions.
+        Version 0.5 retains the Version 0 averaging behavior for
+        compatibility. Whether qa_features contains only the question or
+        candidate-conditioned features should be checked in the caller.
         """
         if qa_features.ndim < 2:
             raise ValueError(
@@ -263,6 +319,28 @@ class GroundedPredictiveEventBridge(nn.Module):
 
         return weights / denominator
 
+    @staticmethod
+    def _masked_mean_scalar(
+        values: torch.Tensor,
+        mask: torch.Tensor,
+        dim: int = -1,
+    ) -> torch.Tensor:
+        weights = mask.to(values.dtype)
+
+        numerator = torch.sum(
+            values * weights,
+            dim=dim,
+            keepdim=True,
+        )
+
+        denominator = torch.sum(
+            weights,
+            dim=dim,
+            keepdim=True,
+        ).clamp_min(1.0)
+
+        return numerator / denominator
+
     def _pool_start_middle_end(
         self,
         segment: torch.Tensor,
@@ -357,6 +435,42 @@ class GroundedPredictiveEventBridge(nn.Module):
 
         return start_state + state_update
 
+    def _build_grounding_log_prior(
+        self,
+        event_grounding: torch.Tensor,
+        event_valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Construct a stable log grounding prior.
+
+        Version 0 directly added log(event_grounding) to event logits.
+        Extremely small event probabilities could therefore dominate the
+        learned event score. Version 0.5 centers and clips the valid log
+        prior while preserving its relative ordering.
+        """
+        log_prior = torch.log(
+            event_grounding.clamp_min(1e-6)
+        )
+
+        prior_mean = self._masked_mean_scalar(
+            log_prior,
+            event_valid_mask,
+            dim=-1,
+        )
+
+        log_prior = log_prior - prior_mean
+
+        log_prior = torch.clamp(
+            log_prior,
+            min=-self.grounding_prior_clip,
+            max=self.grounding_prior_clip,
+        )
+
+        return (
+            log_prior
+            * event_valid_mask.to(log_prior.dtype)
+        )
+
     def forward(
         self,
         raw_video: torch.Tensor,
@@ -416,7 +530,13 @@ class GroundedPredictiveEventBridge(nn.Module):
                     f"{tuple(grounding_weights.shape)}."
                 )
 
+            grounding_weights = (
+                grounding_weights
+                * video_mask.to(grounding_weights.dtype)
+            )
+
         raw_states = self.raw_proj(raw_video)
+
         contextual_states = self.context_proj(
             contextual_video
         )
@@ -424,7 +544,10 @@ class GroundedPredictiveEventBridge(nn.Module):
         qa_summary = self._summarize_qa(
             qa_features
         )
-        qa_state = self.qa_proj(qa_summary)
+
+        qa_state = self.qa_proj(
+            qa_summary
+        )
 
         gamma, beta = self.qa_film(
             qa_state
@@ -696,13 +819,47 @@ class GroundedPredictiveEventBridge(nn.Module):
             ).clamp_min(1e-6)
         )
 
+        # Per-event prediction error is returned for diagnostics and later
+        # Ver1.0 boundary learning. It does not affect event selection yet.
+        middle_prediction_error = (
+            1.0
+            - F.cosine_similarity(
+                predicted_middles,
+                target_middles,
+                dim=-1,
+                eps=1e-6,
+            )
+        )
+
+        end_prediction_error = (
+            1.0
+            - F.cosine_similarity(
+                predicted_ends,
+                target_ends,
+                dim=-1,
+                eps=1e-6,
+            )
+        )
+
+        event_prediction_error = 0.5 * (
+            middle_prediction_error
+            + end_prediction_error
+        )
+
+        event_prediction_error = (
+            event_prediction_error
+            * event_valid_mask.to(
+                event_prediction_error.dtype
+            )
+        )
+
         qa_expanded = qa_state.unsqueeze(1).expand(
             -1,
             self.num_bins,
             -1,
         )
 
-        event_logits = self.event_score(
+        event_learned_logits = self.event_score(
             torch.cat(
                 [
                     event_tokens,
@@ -712,15 +869,28 @@ class GroundedPredictiveEventBridge(nn.Module):
             )
         ).squeeze(-1)
 
+        grounding_log_prior = (
+            self._build_grounding_log_prior(
+                event_grounding,
+                event_valid_mask,
+            )
+        )
+
+        grounding_scale_used = torch.clamp(
+            self.grounding_scale,
+            min=0.0,
+            max=self.grounding_scale_max,
+        )
+
+        event_logits = event_learned_logits
+
         if (
             self.use_grounding_prior
             and grounding_weights is not None
         ):
             event_logits = event_logits + (
-                self.grounding_scale
-                * torch.log(
-                    event_grounding.clamp_min(1e-6)
-                )
+                grounding_scale_used
+                * grounding_log_prior
             )
 
         event_weights = self._masked_softmax(
@@ -735,11 +905,32 @@ class GroundedPredictiveEventBridge(nn.Module):
             dim=1,
         )
 
-        bridge_repr = self.output_proj(
+        bridge_hidden = self.bridge_hidden_norm(
             event_summary
         )
 
+        bridge_repr = self.output_proj(
+            bridge_hidden
+        )
+
+        fusion_delta = self.fusion_adapter(
+            bridge_repr
+        )
+
+        event_weight_entropy = -torch.sum(
+            event_weights
+            * torch.log(
+                event_weights.clamp_min(1e-8)
+            ),
+            dim=-1,
+        )
+
+        event_effective_count = torch.exp(
+            event_weight_entropy
+        )
+
         return {
+            # Existing Version 0 outputs.
             "bridge_repr": bridge_repr,
             "event_tokens": event_tokens,
             "event_weights": event_weights,
@@ -749,4 +940,16 @@ class GroundedPredictiveEventBridge(nn.Module):
             "predicted_ends": predicted_ends,
             "target_ends": target_ends,
             "event_valid_mask": event_valid_mask,
+
+            # Version 0.5 outputs.
+            "fusion_delta": fusion_delta,
+            "bridge_hidden": bridge_hidden,
+            "qa_state": qa_state,
+            "event_logits": event_logits,
+            "event_learned_logits": event_learned_logits,
+            "grounding_log_prior": grounding_log_prior,
+            "grounding_scale_used": grounding_scale_used,
+            "event_prediction_error": event_prediction_error,
+            "event_weight_entropy": event_weight_entropy,
+            "event_effective_count": event_effective_count,
         }
