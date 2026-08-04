@@ -10,22 +10,46 @@ from modules.m_cra.causal_module import LinguisticInterventionGraph
 
 
 class CRA(nn.Module):
+    """
+    CRA with optional Q-Bound Ver1.0 event reasoning.
+
+    The original CRA path remains candidate-conditioned for compatibility.
+    Q-Bound receives a separate question-only representation so that learned
+    event boundaries do not directly depend on answer choices.
+    """
+
     def __init__(self, cfgs, tokenizer) -> None:
         super().__init__()
 
         self.cfgs = cfgs
         self.tokenizer = tokenizer
-        self.baseline = cfgs["model"]["baseline"]
-        self.qmax_words = cfgs["dataset"]["qmax_words"]
-        self.max_feats = cfgs["dataset"]["max_feats"]
-        self.n_negs = cfgs["model"]["n_negs"]
 
-        d_model = cfgs["model"]["d_model"]
+        model_cfg = cfgs["model"]
+        dataset_cfg = cfgs["dataset"]
 
-        # Language and video encoders.
+        self.baseline = model_cfg["baseline"]
+        self.qmax_words = dataset_cfg["qmax_words"]
+        self.max_feats = dataset_cfg["max_feats"]
+        self.n_negs = model_cfg["n_negs"]
+
+        self.gpeb_enabled = bool(
+            model_cfg.get("gpeb_enabled", False)
+        )
+        self.gpeb_version = str(
+            model_cfg.get("gpeb_version", "0.0")
+        )
+        self.gpeb_require_question_only = bool(
+            model_cfg.get(
+                "gpeb_require_question_only",
+                self.gpeb_version.startswith("1"),
+            )
+        )
+
+        d_model = model_cfg["d_model"]
+
         self.lang_model = LanModel(
             tokenizer,
-            lan=cfgs["model"]["lan"],
+            lan=model_cfg["lan"],
             out_dim=d_model,
         )
         self.video_model = VideoEmbedding(cfgs)
@@ -35,11 +59,8 @@ class CRA(nn.Module):
             self.decoder = BaselineDecoder()
             self.forward = self.baseline_forward
         elif self.baseline == "refine":
-            # Keep the same decoder construction used by the CRA baseline
-            # and Ver0 so that Ver0.5 changes only the GPEB path. Note that
-            # RefineDecoder's internal default dropout remains 0.1 here.
             self.decoder = RefineDecoder(
-                num_layer=cfgs["model"]["num_layers"],
+                num_layer=model_cfg["num_layers"],
                 cfgs=cfgs,
             )
             self.forward = self.refine_forward
@@ -80,16 +101,43 @@ class CRA(nn.Module):
         candidate_indices: torch.Tensor,
     ) -> torch.Tensor:
         """Select one [D] feature from [B, C, D] for every sample."""
+        if candidate_features.ndim != 3:
+            raise ValueError(
+                "candidate_features must be [B, C, D], "
+                f"got {tuple(candidate_features.shape)}."
+            )
+
+        if candidate_indices.ndim != 1:
+            raise ValueError(
+                "candidate_indices must be [B], "
+                f"got {tuple(candidate_indices.shape)}."
+            )
+
         batch_indices = torch.arange(
             candidate_features.size(0),
             device=candidate_features.device,
         )
+
         return candidate_features[
             batch_indices,
             candidate_indices,
         ]
 
-    def _encode_answers(self, answer, device):
+    def _encode_answers(
+        self,
+        answer,
+        device: torch.device,
+    ):
+        """
+        Encode candidate question-answer sequences.
+
+        Expected input:
+            answer: [B, C, L]
+
+        Returns:
+            answer_global: [B, C, D]
+            answer_tokens: [B, C, L, D]
+        """
         if answer is None:
             raise ValueError("answer tokens must not be None.")
 
@@ -97,15 +145,91 @@ class CRA(nn.Module):
             device=device,
             non_blocking=True,
         )
-        answer_g, answer_w = self.lang_model(answer)
 
-        if answer_g.ndim != 3:
+        if answer.ndim != 3:
             raise ValueError(
-                "LanModel must return answer_g with shape [B, C, D], "
-                f"got {tuple(answer_g.shape)}."
+                "Candidate answer tokens must have shape [B, C, L], "
+                f"got {tuple(answer.shape)}."
             )
 
-        return answer_g, answer_w
+        if hasattr(self.lang_model, "encode_candidates"):
+            answer_global, answer_tokens = (
+                self.lang_model.encode_candidates(answer)
+            )
+        else:
+            # Compatibility fallback for the original LanModel.
+            answer_global, answer_tokens = self.lang_model(answer)
+
+        if answer_global.ndim != 3:
+            raise ValueError(
+                "LanModel must return candidate features [B, C, D], "
+                f"got {tuple(answer_global.shape)}."
+            )
+
+        return answer_global, answer_tokens
+
+    def _encode_question(
+        self,
+        question,
+        device: torch.device,
+    ):
+        """
+        Encode question-only tokens for Q-Bound.
+
+        Accepted input:
+            [B, L]
+            [B, 1, L]  (the singleton candidate dimension is removed)
+
+        Returns:
+            question_global: [B, D]
+            question_tokens: [B, L, D]
+        """
+        if question is None:
+            return None, None
+
+        question = question.to(
+            device=device,
+            non_blocking=True,
+        )
+
+        if question.ndim == 3 and question.size(1) == 1:
+            question = question.squeeze(1)
+
+        if question.ndim != 2:
+            raise ValueError(
+                "Question-only tokens must have shape [B, L] "
+                "or [B, 1, L], "
+                f"got {tuple(question.shape)}."
+            )
+
+        if hasattr(self.lang_model, "encode_question"):
+            question_global, question_tokens = (
+                self.lang_model.encode_question(question)
+            )
+        else:
+            # Compatibility fallback for the original LanModel.
+            question_global, question_tokens = self.lang_model(question)
+
+        if question_global.ndim != 2:
+            raise ValueError(
+                "LanModel must return question features [B, D], "
+                f"got {tuple(question_global.shape)}."
+            )
+
+        return question_global, question_tokens
+
+    @staticmethod
+    def _move_video_mask(
+        video_mask,
+        device: torch.device,
+    ):
+        if video_mask is None:
+            return None
+
+        return video_mask.to(
+            device=device,
+            non_blocking=True,
+        )
 
     def refine_forward(
         self,
@@ -115,15 +239,28 @@ class CRA(nn.Module):
         answer_id=None,
         mode="VQA",
         gsub=None,
+        question=None,
     ):
+        """
+        Refined CRA forward.
+
+        `question` is optional for old experiments, but required by default
+        when gpeb_version starts with "1" and Q-Bound is active.
+        """
         mode = mode.upper()
+
         if mode not in {"VQ", "VQA"}:
             raise ValueError(
                 f"Unsupported CRA mode {mode!r}; expected 'VQ' or 'VQA'."
             )
 
         device = video.device
-        answer_g, answer_w = self._encode_answers(
+        video_mask = self._move_video_mask(
+            video_mask,
+            device,
+        )
+
+        answer_g, _ = self._encode_answers(
             answer,
             device,
         )
@@ -139,18 +276,14 @@ class CRA(nn.Module):
         qsn_gt = None
 
         if mode == "VQ" and answer_indices is not None:
-            # Question-only branch in the original training pipeline passes
-            # qsns_token_ids and qsns_id through the same language interface.
+            # Preserve the original VQ behavior.
             qsn_g = self._select_candidate_features(
                 answer_g,
                 answer_indices,
             )
             qsn_gt = qsn_g
         else:
-            # Preserve the original CRA behavior for a fair Ver0/Ver0.5
-            # comparison. This is an element-wise maximum over candidate QA
-            # representations; it is therefore QA-candidate-conditioned, not
-            # a pure question-only representation.
+            # Preserve the original CRA candidate-conditioned context.
             qsn_g = answer_g.max(dim=1).values
 
             if answer_indices is not None:
@@ -160,9 +293,36 @@ class CRA(nn.Module):
                 )
 
         use_gpeb = (
-            self.cfgs["model"].get("gpeb_enabled", False)
+            self.gpeb_enabled
             and mode == "VQA"
         )
+
+        question_g = None
+        question_tokens = None
+
+        if use_gpeb:
+            if question is None:
+                if self.gpeb_require_question_only:
+                    raise ValueError(
+                        "Q-Bound Ver1.0 requires question-only token ids. "
+                        "Pass them through CRA.forward(..., question=...). "
+                        "Do not silently reuse candidate answer features, "
+                        "because that would leak answer-choice semantics "
+                        "into boundary learning."
+                    )
+            else:
+                question_g, question_tokens = (
+                    self._encode_question(
+                        question,
+                        device,
+                    )
+                )
+
+                if question_g.size(0) != batch_size:
+                    raise ValueError(
+                        "Question and answer batch sizes do not match: "
+                        f"{question_g.size(0)} vs {batch_size}."
+                    )
 
         video_proj, video_attn, time_param = self.decoder(
             video_f,
@@ -175,10 +335,11 @@ class CRA(nn.Module):
                 [1, 3, 5],
             ),
             use_gpeb=use_gpeb,
+            question_feature=question_g,
         )
 
-        # Candidate answer embeddings are reused by both the main QA scorer
-        # and the GPEB-only auxiliary QA loss in cra_pipeline.py.
+        # Candidate embeddings are shared by the main scorer and the
+        # bridge-only auxiliary/counterfactual scorers in the pipeline.
         answer_proj = answer_g
 
         outs = {
@@ -186,8 +347,16 @@ class CRA(nn.Module):
             "time_param": time_param,
             "align_gt": qsn_gt,
             "qa_condition": qsn_g,
+            "question_condition": question_g,
+            "question_tokens": question_tokens,
+            "question_only_conditioning": torch.as_tensor(
+                question_g is not None,
+                device=video_proj.device,
+                dtype=video_proj.dtype,
+            ),
             "gpeb_active": use_gpeb,
         }
+
         return video_proj, answer_proj, outs
 
     def baseline_forward(
@@ -198,9 +367,24 @@ class CRA(nn.Module):
         answer_id=None,
         mode="VQA",
         gsub=None,
+        question=None,
     ):
+        # Keep a common call signature with refine_forward.
+        del gsub, question
+
+        mode = mode.upper()
+        if mode not in {"VQ", "VQA"}:
+            raise ValueError(
+                f"Unsupported CRA mode {mode!r}; expected 'VQ' or 'VQA'."
+            )
+
         device = video.device
-        answer_g, answer_w = self._encode_answers(
+        video_mask = self._move_video_mask(
+            video_mask,
+            device,
+        )
+
+        answer_g, answer_tokens = self._encode_answers(
             answer,
             device,
         )
@@ -223,18 +407,23 @@ class CRA(nn.Module):
 
         video_proj, video_attn = self.decoder(
             video_f,
-            answer_w,
+            answer_tokens,
             video_mask,
         )
-        answer_proj = answer_g
 
         outs = {
             "fatt": video_attn,
             "qa_condition": qsn_g,
         }
-        return video_proj, answer_proj, outs
 
-    def align_loss(self, qsn, grounding_feature, neg_sample=None):
+        return video_proj, answer_g, outs
+
+    def align_loss(
+        self,
+        qsn,
+        grounding_feature,
+        neg_sample=None,
+    ):
         def _sample_negatives(x_pos, k):
             """Sample k negatives for each item, with replacement."""
             batch_size, feature_dim = x_pos.size()
@@ -267,12 +456,14 @@ class CRA(nn.Module):
                         ),
                     ]
                 )
+
                 sampled_positions = torch.randint(
                     low=0,
                     high=candidate_indices.numel(),
                     size=(k,),
                     device=x_pos.device,
                 )
+
                 x_neg[index] = x_pos[
                     candidate_indices[sampled_positions]
                 ]
@@ -324,9 +515,14 @@ class CRA(nn.Module):
             [pos_sim, neg_sim],
             dim=-1,
         )
+
         labels = torch.zeros(
             x.size(0),
             dtype=torch.long,
             device=x.device,
         )
-        return F.cross_entropy(logits, labels)
+
+        return F.cross_entropy(
+            logits,
+            labels,
+        )

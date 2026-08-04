@@ -16,8 +16,14 @@ class BasePipeline(object):
     def __init__(self, cfgs) -> None:
         self.cfgs = cfgs
         # set cuda device
-        os.environ['CUDA_VISIBLE_DEVICES'] = cfgs["misc"]["cuda"]
-        os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(
+            cfgs["misc"].get("cuda", "0")
+        )
+        os.environ["CUDA_LAUNCH_BLOCKING"] = (
+            "1"
+            if cfgs["misc"].get("cuda_launch_blocking", False)
+            else "0"
+        )
         self.tokenizer = build_tokenizer(cfgs)
         self.a2id, self.id2a, self.a2v = None, None, None
         if not cfgs["dataset"]["mc"]:
@@ -41,10 +47,11 @@ class BasePipeline(object):
         #
         # Build the repository's original optimizer first so that all
         # existing optimizer options remain unchanged. Then move the
-        # Ver0.5 GPEB parameters to their own parameter group.
+        # Ver1.0 GPEB parameters to their own parameter group.
         self.optimizer = build_optimizer(cfgs, self.model)
         self._configure_gpeb_optimizer_groups()
         self._check_gpeb_optimizer()
+        self._check_optimizer_coverage()
 
         # Build the scheduler only after the parameter groups are final.
         self.lr_scheduler = build_lr_scheduler(
@@ -72,8 +79,9 @@ class BasePipeline(object):
         if not os.path.exists(self.checkpoint_dir):
             os.makedirs(self.checkpoint_dir)
 
-        if cfgs["stat"]["resume"] != None:
-            self._resume_checkpoint(cfgs["stat"]["resume"])
+        resume_path = cfgs["stat"].get("resume")
+        if resume_path:
+            self._resume_checkpoint(resume_path)
 
         self.best_recorder = {'val': {self.mnt_metric: self.mnt_best},
                               'test': {self.mnt_metric_test: self.mnt_best}}
@@ -85,7 +93,7 @@ class BasePipeline(object):
     @staticmethod
     def _is_gpeb_parameter_name(name):
         """
-        Return True for all Ver0.5 GPEB-related parameters.
+        Return True for all Ver1.0 GPEB-related parameters.
 
         This matches:
             decoder.gpeb.*
@@ -126,11 +134,10 @@ class BasePipeline(object):
             return
 
         if "gpeb_lr" not in optim_cfg:
-            print(
-                "[GPEB Optimizer] optim.gpeb_lr is not set; "
-                "GPEB will use the repository's default optimizer LR."
+            raise ValueError(
+                "model.gpeb_enabled=True requires optim.gpeb_lr. "
+                "For Q-Bound Ver1.0, use gpeb_lr: 5.e-5."
             )
-            return
 
         gpeb_lr = float(optim_cfg["gpeb_lr"])
         if gpeb_lr <= 0:
@@ -152,7 +159,7 @@ class BasePipeline(object):
             raise RuntimeError(
                 "model.gpeb_enabled=True, but no trainable parameter "
                 "whose name contains 'gpeb' was found. Check whether "
-                "the Ver0.5 refine decoder is actually instantiated."
+                "the Ver1.0 refine decoder is actually instantiated."
             )
 
         gpeb_param_ids = {
@@ -320,10 +327,13 @@ class BasePipeline(object):
 
             num_gpeb_tensors = sum(
                 id(parameter) in group_parameter_ids
-                for _, parameter in self.model.named_parameters()
+                for parameter_name, parameter
+                in self.model.named_parameters()
                 if (
                     parameter.requires_grad
-                    and self._is_gpeb_parameter_name(_)
+                    and self._is_gpeb_parameter_name(
+                        parameter_name
+                    )
                 )
             )
 
@@ -393,6 +403,54 @@ class BasePipeline(object):
         print(
             f"Verified GPEB learning rate: "
             f"{actual_gpeb_lr}\n"
+        )
+
+    def _check_optimizer_coverage(self):
+        """
+        Verify that every trainable model parameter appears exactly once.
+
+        The GPEB-specific check is necessary but not sufficient: mutating
+        optimizer groups must not accidentally drop or duplicate ordinary
+        CRA, language, video, or grounding parameters.
+        """
+        optimizer_counts = {}
+
+        for group in self.optimizer.param_groups:
+            for parameter in group["params"]:
+                parameter_id = id(parameter)
+                optimizer_counts[parameter_id] = (
+                    optimizer_counts.get(parameter_id, 0) + 1
+                )
+
+        missing = []
+        duplicated = []
+
+        for name, parameter in self.model.named_parameters():
+            if not parameter.requires_grad:
+                continue
+
+            count = optimizer_counts.get(id(parameter), 0)
+
+            if count == 0:
+                missing.append(name)
+            elif count > 1:
+                duplicated.append(name)
+
+        if missing:
+            raise RuntimeError(
+                "Trainable parameters missing from optimizer:\n"
+                + "\n".join(missing)
+            )
+
+        if duplicated:
+            raise RuntimeError(
+                "Trainable parameters duplicated in optimizer:\n"
+                + "\n".join(duplicated)
+            )
+
+        print(
+            "[Optimizer Coverage Check] "
+            "Every trainable parameter is registered exactly once.\n"
         )
 
     def _check_gpeb_scheduler(self):
@@ -499,7 +557,7 @@ class BasePipeline(object):
                 else:
                     not_improved_count += 1
 
-                if not_improved_count > self.early_stop:
+                if not_improved_count >= self.early_stop:
                     print("Validation performance didn\'t improve for {} epochs. " "Training stops.".format(
                         self.early_stop))
                     break
@@ -523,7 +581,7 @@ class BasePipeline(object):
       self.best_recorder["test"]["seed"] = seed
 
       self.best_recorder["val"]["best_model_from"] = "val"
-      self.best_recorder["test"]["best_model_from"] = "test"
+      self.best_recorder["test"]["best_model_from"] = "val"
 
       record_dir = self.cfgs["stat"]["record_dir"]
       dataset_name = self.cfgs["dataset"]["name"]
@@ -585,7 +643,13 @@ class BasePipeline(object):
     def _resume_checkpoint(self, resume_path):
         resume_path = str(resume_path)
         print("Loading checkpoint: {} ...".format(resume_path))
-        checkpoint = torch.load(resume_path)
+        map_location = next(
+            self.model.parameters()
+        ).device
+        checkpoint = torch.load(
+            resume_path,
+            map_location=map_location,
+        )
         self.start_epoch = checkpoint['epoch'] + 1
         self.mnt_best = checkpoint['monitor_best']
         resume_strict = self.cfgs["stat"].get(
@@ -630,22 +694,37 @@ class BasePipeline(object):
         print("Checkpoint loaded. Resume training from epoch {}".format(self.start_epoch))
 
     def _record_best(self, log, result):
-        improved_val = (self.mnt_mode == 'min' and log[self.mnt_metric] <= self.best_recorder['val'][
-            self.mnt_metric]) or \
-                       (self.mnt_mode == 'max' and log[self.mnt_metric] >= self.best_recorder['val'][self.mnt_metric])
-        if improved_val:
-            self.best_recorder['val'].update(log)
-            # save the result from the best model
-            filename = os.path.join(self.monitor.record_dir, 'result.pth')
-            torch.save(result, filename)
+        """
+        Record only the checkpoint selected by validation performance.
 
+        The old code independently tracked the best test epoch, which leaks
+        test-set information into model selection. The `test` record below
+        is now the test result paired with the validation-best checkpoint.
+        """
+        improved_val = (
+            (
+                self.mnt_mode == "min"
+                and log[self.mnt_metric]
+                <= self.best_recorder["val"][self.mnt_metric]
+            )
+            or (
+                self.mnt_mode == "max"
+                and log[self.mnt_metric]
+                >= self.best_recorder["val"][self.mnt_metric]
+            )
+        )
 
-        improved_test = (self.mnt_mode == 'min' and log[self.mnt_metric_test] <= self.best_recorder['test'][
-            self.mnt_metric_test]) or \
-                        (self.mnt_mode == 'max' and log[self.mnt_metric_test] >= self.best_recorder['test'][
-                            self.mnt_metric_test])
-        if improved_test:
-            self.best_recorder['test'].update(log)
+        if not improved_val:
+            return
+
+        self.best_recorder["val"].update(log)
+        self.best_recorder["test"].update(log)
+
+        filename = os.path.join(
+            self.monitor.record_dir,
+            "result.pth",
+        )
+        torch.save(result, filename)
 
     def _print_best(self):
         # print('Best results (w.r.t {}) in validation set:'.format(self.args["monitor_metric"]))
@@ -653,6 +732,11 @@ class BasePipeline(object):
         for key, value in self.best_recorder['val'].items():
             print('\t{:15s}: {}'.format(str(key), value))
 
-        print('Best results (w.r.t {}) in test set:'.format(self.cfgs["stat"]["monitor"]["metric"]))
+        print(
+            'Test results paired with the validation-best checkpoint '
+            '(w.r.t {}):'.format(
+                self.cfgs["stat"]["monitor"]["metric"]
+            )
+        )
         for key, value in self.best_recorder['test'].items():
             print('\t{:15s}: {}'.format(str(key), value))

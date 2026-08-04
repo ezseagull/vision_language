@@ -5,7 +5,7 @@ dataset:
   features_path: /content/data/nextqa/video_feature/CLIPL
   causal_feature_path: /content/data/nextgqa/causal_feature
   vocab_path: 
-  # Tối ưu cho Colab T4 GPU
+
   batch_size: 64
   num_thread_reader: 4
   qmax_words: 30
@@ -41,29 +41,47 @@ model:
 
   #new module
   gpeb_enabled: true
+  gpeb_version: "1.0"
+  gpeb_require_question_only: true
   gpeb_hidden_dim: 256
   gpeb_num_bins: 4
-  gpeb_use_grounding_prior: true
-  # gpeb_alpha_init: 0.0
-  # gpeb_bridge_loss_weight: 0.05
+  # Learned boundary/event decomposition
   gpeb_dropout: 0.1
+  gpeb_use_grounding_prior: true
   gpeb_grounding_prior_clip: 4.0
   gpeb_grounding_scale_max: 5.0
-
-  gpeb_gate_hidden_dim: 384
-  gpeb_gate_dropout: 0.1
-  gpeb_gate_bias_init: -0.5
-  gpeb_residual_dropout: 0.1
-
-   # New Ver0.5b safeguards
+  gpeb_boundary_temperature: 0.7
+  gpeb_assignment_temperature: 0.35
+  gpeb_boundary_bias_init: -2.0
+  gpeb_min_event_mass: 0.25
+  gpeb_counterfactual_temperature: 0.15
+  gpeb_merge_strength: 1.0
+  gpeb_split_strength: 0.9
+  gpeb_concurrent_temperature: 0.5
+  gpeb_concurrent_bias_init: -2.0
+  gpeb_concurrent_context_scale: 0.1
+  gpeb_concurrent_degree_max: 1.0
   gpeb_detach_backbone_inputs: true
-  gpeb_detach_gate_context: true
-  gpeb_residual_max_ratio: 0.15
-
-  # Ver0.5 losses
-  gpeb_bridge_loss_weight: 0.02
-  gpeb_aux_qa_weight: 0.1
+  gpeb_residual_dropout: 0.1
+  gpeb_residual_max_ratio: 0.1
+  gpeb_enable_ground_refinement: true
+  gpeb_ground_refine_max: 0.05
   gpeb_aux_detach_answer: true
+  gpeb_aux_logit_scale: 10.0
+  gpeb_aux_qa_weight: 0.05
+  gpeb_merge_necessity_weight: 0.1
+  gpeb_split_invariance_weight: 0.05
+  gpeb_ground_consistency_weight: 0.1
+  gpeb_boundary_sparsity_weight: 0.005
+  gpeb_min_event_weight: 0.01
+  gpeb_concurrent_sparsity_weight: 0.002
+  gpeb_min_effective_events: 1.5
+  gpeb_necessity_temperature: 0.25
+  gpeb_merge_ground_harm_scale: 1.0
+  gpeb_split_ground_weight: 1.0
+  gpeb_split_distill_temperature: 1.0
+  gpeb_counterfactual_start_epoch: 2
+  gpeb_counterfactual_ramp_epochs: 3
 
 optim:
   pipeline: cra
@@ -95,7 +113,7 @@ stat:
   resume: 
 
 misc:
-  running_name: 'CRA/NextGQA/GPEB_v0_5b_seed2024'
+  running_name: 'CRA/NextGQA/GPEB_v1_seed2024'
   info: "Temp[CLIP] (CRA)"
   # Đổi ID GPU về 0 cho Colab
   cuda: "0"
