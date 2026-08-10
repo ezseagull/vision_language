@@ -167,6 +167,9 @@ class Decoder(nn.Module):
         )
 
         model_cfg = self.cfgs["model"]
+        qbound_cfg = model_cfg.get("qbound", {})
+        if not isinstance(qbound_cfg, dict):
+            raise ValueError("model.qbound must be a mapping/dict.")
 
         self.grounding_module = GroundingModule(
             d_model=embed_dim,
@@ -183,18 +186,24 @@ class Decoder(nn.Module):
         # the first V1.1 run does not require an immediate full YAML rewrite.
         # ------------------------------------------------------------------
         self.qbound_enabled = bool(
-            model_cfg.get(
-                "qbound_enabled",
-                model_cfg.get("gpeb_enabled", False),
+            qbound_cfg.get(
+                "enabled",
+                model_cfg.get(
+                    "qbound_enabled",
+                    model_cfg.get("gpeb_enabled", False),
+                ),
             )
         )
 
         self.qbound_require_question_only = bool(
-            model_cfg.get(
-                "qbound_require_question_only",
+            qbound_cfg.get(
+                "require_question_only",
                 model_cfg.get(
-                    "gpeb_require_question_only",
-                    True,
+                    "qbound_require_question_only",
+                    model_cfg.get(
+                        "gpeb_require_question_only",
+                        True,
+                    ),
                 ),
             )
         )
@@ -202,95 +211,125 @@ class Decoder(nn.Module):
         if self.qbound_enabled:
             self.qbound = QBoundCore(
                 input_dim=embed_dim,
-                hidden_dim=model_cfg.get(
-                    "qbound_hidden_dim",
-                    model_cfg.get("gpeb_hidden_dim", 256),
-                ),
-                max_events=model_cfg.get(
-                    "qbound_max_events",
+                hidden_dim=qbound_cfg.get(
+                    "hidden_dim",
                     model_cfg.get(
-                        "gpeb_max_events",
-                        model_cfg.get("gpeb_num_bins", 4),
+                        "qbound_hidden_dim",
+                        model_cfg.get("gpeb_hidden_dim", 256),
                     ),
                 ),
-                use_temporal_prior=model_cfg.get(
-                    "qbound_use_temporal_prior",
+                max_events=qbound_cfg.get(
+                    "max_events",
                     model_cfg.get(
-                        "gpeb_use_grounding_prior",
-                        True,
+                        "qbound_max_events",
+                        model_cfg.get(
+                            "gpeb_max_events",
+                            model_cfg.get("gpeb_num_bins", 4),
+                        ),
                     ),
                 ),
-                dropout=model_cfg.get(
-                    "qbound_dropout",
-                    model_cfg.get("gpeb_dropout", dropout),
-                ),
-                boundary_temperature=model_cfg.get(
-                    "qbound_boundary_temperature",
+                use_temporal_prior=qbound_cfg.get(
+                    "use_temporal_prior",
                     model_cfg.get(
-                        "gpeb_boundary_temperature",
-                        0.7,
+                        "qbound_use_temporal_prior",
+                        model_cfg.get(
+                            "gpeb_use_grounding_prior",
+                            False,
+                        ),
                     ),
                 ),
-                assignment_temperature=model_cfg.get(
-                    "qbound_assignment_temperature",
+                dropout=qbound_cfg.get(
+                    "dropout",
                     model_cfg.get(
-                        "gpeb_assignment_temperature",
-                        0.35,
+                        "qbound_dropout",
+                        model_cfg.get("gpeb_dropout", dropout),
                     ),
                 ),
-                boundary_bias_init=model_cfg.get(
-                    "qbound_boundary_bias_init",
+                boundary_temperature=qbound_cfg.get(
+                    "boundary_temperature",
                     model_cfg.get(
-                        "gpeb_boundary_bias_init",
-                        -2.0,
+                        "qbound_boundary_temperature",
+                        model_cfg.get(
+                            "gpeb_boundary_temperature",
+                            0.7,
+                        ),
                     ),
                 ),
-                counterfactual_temperature=model_cfg.get(
-                    "qbound_counterfactual_temperature",
+                assignment_temperature=qbound_cfg.get(
+                    "assignment_temperature",
                     model_cfg.get(
-                        "gpeb_counterfactual_temperature",
-                        0.15,
+                        "qbound_assignment_temperature",
+                        model_cfg.get(
+                            "gpeb_assignment_temperature",
+                            0.35,
+                        ),
                     ),
                 ),
-                merge_strength=model_cfg.get(
-                    "qbound_merge_strength",
-                    model_cfg.get("gpeb_merge_strength", 1.0),
+                boundary_bias_init=qbound_cfg.get(
+                    "boundary_bias_init",
+                    model_cfg.get(
+                        "qbound_boundary_bias_init",
+                        model_cfg.get(
+                            "gpeb_boundary_bias_init",
+                            -2.0,
+                        ),
+                    ),
                 ),
-                split_strength=model_cfg.get(
-                    "qbound_split_strength",
-                    model_cfg.get("gpeb_split_strength", 0.9),
+                counterfactual_temperature=qbound_cfg.get(
+                    "counterfactual_temperature",
+                    model_cfg.get(
+                        "qbound_counterfactual_temperature",
+                        model_cfg.get(
+                            "gpeb_counterfactual_temperature",
+                            0.15,
+                        ),
+                    ),
                 ),
-                min_event_mass=model_cfg.get(
-                    "qbound_min_event_mass",
-                    model_cfg.get("gpeb_min_event_mass", 0.25),
+                merge_strength=qbound_cfg.get(
+                    "merge_strength",
+                    model_cfg.get(
+                        "qbound_merge_strength",
+                        model_cfg.get("gpeb_merge_strength", 1.0),
+                    ),
+                ),
+                split_strength=qbound_cfg.get(
+                    "split_strength",
+                    model_cfg.get(
+                        "qbound_split_strength",
+                        model_cfg.get("gpeb_split_strength", 0.9),
+                    ),
+                ),
+                min_event_mass=qbound_cfg.get(
+                    "min_event_mass",
+                    model_cfg.get(
+                        "qbound_min_event_mass",
+                        model_cfg.get("gpeb_min_event_mass", 0.25),
+                    ),
                 ),
             )
 
             self.qbound_adapter = CRAQBoundAdapter(
                 embed_dim=embed_dim,
-                dropout=model_cfg.get(
-                    "qbound_adapter_dropout",
-                    model_cfg.get(
-                        "gpeb_residual_dropout",
-                        dropout,
-                    ),
+                dropout=0.0,
+                event_scale_init=qbound_cfg.get(
+                    "event_scale_init",
+                    model_cfg.get("qbound_event_scale_init", 0.0),
                 ),
-                event_scale_init=model_cfg.get(
-                    "qbound_event_scale_init",
-                    0.0,
-                ),
-                temporal_scale_init=model_cfg.get(
-                    "qbound_temporal_scale_init",
-                    0.0,
+                temporal_scale_init=qbound_cfg.get(
+                    "temporal_scale_init",
+                    model_cfg.get("qbound_temporal_scale_init", 0.0),
                 ),
             )
 
             self.qbound_detach_backbone_inputs = bool(
-                model_cfg.get(
-                    "qbound_detach_backbone_inputs",
+                qbound_cfg.get(
+                    "detach_backbone_inputs",
                     model_cfg.get(
-                        "gpeb_detach_backbone_inputs",
-                        True,
+                        "qbound_detach_backbone_inputs",
+                        model_cfg.get(
+                            "gpeb_detach_backbone_inputs",
+                            True,
+                        ),
                     ),
                 )
             )

@@ -29,35 +29,47 @@ class CRA(nn.Module):
         model_cfg = cfgs["model"]
         dataset_cfg = cfgs["dataset"]
 
+        qbound_cfg = model_cfg.get("qbound", {})
+        if not isinstance(qbound_cfg, dict):
+            raise ValueError("model.qbound must be a mapping/dict.")
+
         self.baseline = model_cfg["baseline"]
         self.qmax_words = dataset_cfg["qmax_words"]
         self.max_feats = dataset_cfg["max_feats"]
         self.n_negs = model_cfg["n_negs"]
 
         self.qbound_enabled = bool(
-            model_cfg.get(
-                "qbound_enabled",
-                model_cfg.get("gpeb_enabled", False),
+            qbound_cfg.get(
+                "enabled",
+                model_cfg.get(
+                    "qbound_enabled",
+                    model_cfg.get("gpeb_enabled", False),
+                ),
             )
         )
         self.qbound_version = str(
-            model_cfg.get(
-                "qbound_version",
-                model_cfg.get("gpeb_version", "1.1"),
+            qbound_cfg.get(
+                "version",
+                model_cfg.get(
+                    "qbound_version",
+                    model_cfg.get("gpeb_version", "1.1"),
+                ),
             )
         )
         self.qbound_require_question_only = bool(
-            model_cfg.get(
-                "qbound_require_question_only",
+            qbound_cfg.get(
+                "require_question_only",
                 model_cfg.get(
-                    "gpeb_require_question_only",
-                    True,
+                    "qbound_require_question_only",
+                    model_cfg.get(
+                        "gpeb_require_question_only",
+                        True,
+                    ),
                 ),
             )
         )
 
-        # Temporary compatibility aliases.  Remove them after the training
-        # pipeline/config has fully migrated to qbound_* naming.
+        # Temporary compatibility aliases for old checkpoints/logging only.
         self.gpeb_enabled = self.qbound_enabled
         self.gpeb_version = self.qbound_version
         self.gpeb_require_question_only = (
