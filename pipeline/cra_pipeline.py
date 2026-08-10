@@ -21,25 +21,34 @@ from utils.misc.misc import (
 
 class CRAPipeline(BasePipeline):
     """
-    CRA training pipeline with Q-Bound GPEB Ver1.0.
+    CRA training pipeline with Q-Bound Version 1.1.
 
-    Ver1.0 removes the fixed-bin middle/end reconstruction objective.
-    Learned boundaries are trained by counterfactual necessity:
+    V1.1 removes the Ver1.0 auxiliary QA head, CRA-grounding consistency,
+    global boundary sparsity, minimum-event protection, concurrent sparsity,
+    and epoch-based counterfactual ramp.
 
-        A boundary should be strong only when removing it naturally harms
-        answer discrimination or grounding agreement.
+    The main principle is:
 
-    The counterfactual harm is detached before it becomes a supervision
-    target. This prevents the model from gaming the objective by
-    deliberately making the merged counterfactual worse.
+        original / merge / split
+            -> the SAME CRA-QBound integration
+            -> the SAME main answer scorer
 
-    Split counterfactuals are trained to preserve answer and grounding
-    predictions, encouraging stability inside an event.
+    Merge necessity is measured by the increase in the actual VQA CE after
+    removing the selected boundary.  The observed harm is detached before
+    supervising boundary strength, so the model cannot reduce the objective by
+    intentionally damaging the merge branch.
+
+    Minimality only penalizes a selected boundary when its detached task-level
+    necessity is low.
+
+    Both structural verification and minimality are activated by the detached
+    main-task usage strength of Q-Bound.  This is essential at initialization:
+    alpha=beta=0 preserves the CRA baseline, and Q-Bound is not sparsified
+    before the main task has started to use it.
     """
 
     def __init__(self, cfgs) -> None:
         super().__init__(cfgs)
-        self._active_epoch = 0
 
     # ------------------------------------------------------------------
     # General helpers
@@ -47,9 +56,23 @@ class CRAPipeline(BasePipeline):
     def _model_device(self):
         return next(self.model.parameters()).device
 
-    def _get_gpeb_aux(self, gqa_output):
-        """Safely extract Q-Bound outputs from a CRA VQA forward."""
-        if not self.cfgs["model"].get("gpeb_enabled", False):
+    def _qbound_enabled(self):
+        model_cfg = self.cfgs.get("model", {})
+        qbound_cfg = model_cfg.get("qbound", {})
+
+        if isinstance(qbound_cfg, dict) and "enabled" in qbound_cfg:
+            return bool(qbound_cfg["enabled"])
+
+        return bool(
+            model_cfg.get(
+                "qbound_enabled",
+                model_cfg.get("gpeb_enabled", False),
+            )
+        )
+
+    def _get_qbound_aux(self, gqa_output):
+        """Safely extract Q-Bound V1.1 outputs from a CRA VQA forward."""
+        if not self._qbound_enabled():
             return None
 
         if gqa_output is None or len(gqa_output) < 3:
@@ -60,19 +83,22 @@ class CRAPipeline(BasePipeline):
             return None
 
         time_param = model_outputs.get("time_param")
-        if time_param is None:
+        if not isinstance(time_param, dict):
             return None
 
-        return time_param.get("gpeb_aux")
+        # V1.1 name first; legacy alias is temporary.
+        return time_param.get(
+            "qbound_aux",
+            time_param.get("gpeb_aux"),
+        )
 
     @staticmethod
     def _prepare_labels(answer_id, device):
-        labels = answer_id.to(
+        return answer_id.to(
             device=device,
             dtype=torch.long,
             non_blocking=True,
         ).reshape(-1)
-        return labels
 
     def _score_answer_candidates(
         self,
@@ -83,18 +109,20 @@ class CRAPipeline(BasePipeline):
         logit_scale=1.0,
     ):
         """
-        Score answer candidates with one or more representations.
+        Score answer candidates with the repository's main dot-product rule.
 
-        Args:
-            answer_proj:
-                [B, C_total, D]. C_total may include proposal copies.
+        answer_proj:
+            [B, C_total, D]
 
-            representation:
-                [B, D] or [B, M, D].
+        representation:
+            [B, D] or [B, M, D]
 
         Returns:
-            [B, C] for a single representation.
-            [B, M, C] for M counterfactual representations.
+            [B, C] or [B, M, C]
+
+        `prop_num` aggregation is exactly the same operation used by the main
+        VQA path.  V1.1 counterfactuals therefore do not use a separate
+        auxiliary answer head.
         """
         if answer_proj.ndim != 3:
             raise ValueError(
@@ -103,6 +131,7 @@ class CRAPipeline(BasePipeline):
             )
 
         squeeze_counterfactual_dim = False
+
         if representation.ndim == 2:
             representation = representation.unsqueeze(1)
             squeeze_counterfactual_dim = True
@@ -145,18 +174,12 @@ class CRAPipeline(BasePipeline):
             )
 
         if logit_scale <= 0.0:
-            raise ValueError(
-                "logit_scale must be positive."
-            )
+            raise ValueError("logit_scale must be positive.")
 
-        # [B, M, C_total]
-        logits = (
-            float(logit_scale)
-            * torch.einsum(
-                "bcd,bmd->bmc",
-                candidate_features,
-                representation,
-            )
+        logits = float(logit_scale) * torch.einsum(
+            "bcd,bmd->bmc",
+            candidate_features,
+            representation,
         )
 
         prop_num = int(
@@ -211,11 +234,9 @@ class CRAPipeline(BasePipeline):
         eps=1e-8,
     ):
         """
-        Jensen-Shannon divergence along the last dimension.
+        Diagnostic only in V1.1.
 
-        Broadcasting is allowed, e.g.:
-            first:  [B, M, T]
-            second: [B, 1, T]
+        There is NO CRA-event grounding consistency loss.
         """
         first = cls._normalize_distribution(
             first,
@@ -249,103 +270,61 @@ class CRAPipeline(BasePipeline):
 
         return 0.5 * (first_kl + second_kl)
 
-    def _counterfactual_scale(self):
-        """
-        Warm up ordinary CRA/GPEB learning before activating structural
-        counterfactual supervision.
-        """
-        model_cfg = self.cfgs["model"]
-
-        start_epoch = int(
-            model_cfg.get(
-                "gpeb_counterfactual_start_epoch",
-                2,
-            )
-        )
-        ramp_epochs = int(
-            model_cfg.get(
-                "gpeb_counterfactual_ramp_epochs",
-                3,
-            )
-        )
-
-        if self._active_epoch <= start_epoch:
-            return 0.0
-
-        if ramp_epochs <= 0:
-            return 1.0
-
-        return min(
-            1.0,
-            float(self._active_epoch - start_epoch)
-            / float(ramp_epochs),
-        )
-
     # ------------------------------------------------------------------
-    # Q-Bound Ver1.0 losses
+    # Q-Bound V1.1 losses
     # ------------------------------------------------------------------
-    def _compute_gpeb_v1_losses(
+    def _compute_qbound_v11_losses(
         self,
         gqa_output,
         answer_proj,
         answer_id,
+        main_logits,
     ):
         """
-        Compute Ver1.0 objectives.
+        Compute the two V1.1 objectives:
 
-        The boundary-necessity target is derived from the *observed*
-        counterfactual harm and then detached:
+            L_struct = 0.5 * (L_merge + L_split)
 
-            harm = answer degradation + grounding degradation
+            L_min = b_selected * (1 - stopgrad(n_selected))
 
-        Boundary strength is calibrated to this target with BCE. Therefore,
-        the objective does not explicitly push the merged branch to become
-        worse; it only preserves boundaries whose removal is already harmful.
+        where selected-boundary necessity is derived from the ACTUAL main VQA
+        risk:
+
+            harm = CE_merge - CE_original
+            n    = 1 - exp(-relu(harm))
+
+        No extra necessity-temperature hyperparameter is required.
+
+        Only one boundary is counterfactually removed by QBoundCore V1.1.
+        Therefore minimality is applied to the selected boundary. Across
+        iterations, an unnecessary strongest boundary is pushed down and the
+        selector can move to the next one.
+
+        Structural/minimality weights are applied outside this method.
         """
-        gpeb_aux = self._get_gpeb_aux(gqa_output)
-        if gpeb_aux is None:
+        qbound_aux = self._get_qbound_aux(gqa_output)
+        if qbound_aux is None:
             return {}, {}
 
-        required_keys = [
-            "bridge_repr",
-            "merge_bridge_repr",
-            "split_bridge_repr",
-            "event_key",
-            "cra_key",
-            "merge_frame_relevance",
-            "split_frame_relevance",
+        required_keys = {
+            "merge_fused_video_proj",
+            "split_fused_video_proj",
             "boundary_mass",
             "merge_selector",
-            "boundary_count",
-            "effective_event_count",
-            "concurrent_degree_mean",
-        ]
-        missing = [
-            key for key in required_keys
-            if key not in gpeb_aux
-        ]
+            "qbound_use_strength",
+            "cra_video_proj",
+            "event_delta",
+            "cra_key",
+            "event_key",
+            "final_key",
+        }
+        missing = sorted(
+            required_keys.difference(qbound_aux)
+        )
         if missing:
             raise KeyError(
-                "Missing Q-Bound Ver1.0 outputs: "
+                "Missing Q-Bound V1.1 outputs: "
                 + ", ".join(missing)
-            )
-
-        model_cfg = self.cfgs["model"]
-        detach_answer = bool(
-            model_cfg.get(
-                "gpeb_aux_detach_answer",
-                True,
-            )
-        )
-        auxiliary_logit_scale = float(
-            model_cfg.get(
-                "gpeb_aux_logit_scale",
-                10.0,
-            )
-        )
-        if auxiliary_logit_scale <= 0.0:
-            raise ValueError(
-                "gpeb_aux_logit_scale must be positive."
             )
 
         labels = self._prepare_labels(
@@ -353,52 +332,31 @@ class CRAPipeline(BasePipeline):
             answer_proj.device,
         )
 
-        original_logits = self._score_answer_candidates(
-            answer_proj=answer_proj,
-            representation=gpeb_aux["bridge_repr"],
-            detach_answer=detach_answer,
-            normalize=True,
-            logit_scale=auxiliary_logit_scale,
-        )
+        if main_logits.size(0) != labels.numel():
+            raise ValueError(
+                "answer_id size does not match main VQA logits."
+            )
+
+        # Counterfactuals use the same answer-scoring rule as the main path.
+        # Candidate features are detached ONLY to keep structural regularizers
+        # from modifying the language encoder; there is no auxiliary scorer.
         merge_logits = self._score_answer_candidates(
             answer_proj=answer_proj,
-            representation=gpeb_aux["merge_bridge_repr"],
-            detach_answer=detach_answer,
-            normalize=True,
-            logit_scale=auxiliary_logit_scale,
+            representation=qbound_aux[
+                "merge_fused_video_proj"
+            ],
+            detach_answer=True,
         )
         split_logits = self._score_answer_candidates(
             answer_proj=answer_proj,
-            representation=gpeb_aux["split_bridge_repr"],
-            detach_answer=detach_answer,
-            normalize=True,
-            logit_scale=auxiliary_logit_scale,
+            representation=qbound_aux[
+                "split_fused_video_proj"
+            ],
+            detach_answer=True,
         )
 
-        if original_logits.size(0) != labels.numel():
-            raise ValueError(
-                "answer_id size does not match GPEB logits."
-            )
-
-        # --------------------------------------------------------------
-        # 1. Original bridge answer supervision
-        # --------------------------------------------------------------
-        auxiliary_qa_loss = F.cross_entropy(
-            original_logits,
-            labels,
-        )
-        auxiliary_prediction = original_logits.argmax(
-            dim=-1
-        )
-        auxiliary_accuracy = (
-            auxiliary_prediction == labels
-        ).float().mean()
-
-        # --------------------------------------------------------------
-        # 2. Counterfactual merge necessity
-        # --------------------------------------------------------------
         original_ce = F.cross_entropy(
-            original_logits,
+            main_logits,
             labels,
             reduction="none",
         )
@@ -408,6 +366,7 @@ class CRAPipeline(BasePipeline):
             -1,
             num_merge,
         )
+
         merge_ce = F.cross_entropy(
             merge_logits.reshape(
                 -1,
@@ -420,63 +379,26 @@ class CRAPipeline(BasePipeline):
             num_merge,
         ).mean(dim=1)
 
-        cra_key = gpeb_aux["cra_key"].detach()
-        event_key = gpeb_aux["event_key"]
-
-        original_ground_distance = self._js_divergence(
-            event_key,
-            cra_key,
-        )
-
-        merge_frame_relevance = gpeb_aux[
-            "merge_frame_relevance"
-        ]
-        merge_ground_distance = self._js_divergence(
-            merge_frame_relevance,
-            cra_key.unsqueeze(1),
-        ).mean(dim=1)
-
         answer_harm = merge_ce - original_ce
-        grounding_harm = (
-            merge_ground_distance
-            - original_ground_distance
-        )
 
-        grounding_harm_scale = float(
-            model_cfg.get(
-                "gpeb_merge_ground_harm_scale",
-                1.0,
-            )
-        )
-        total_harm = (
-            answer_harm
-            + grounding_harm_scale * grounding_harm
-        )
-
-        harm_temperature = float(
-            model_cfg.get(
-                "gpeb_necessity_temperature",
-                0.25,
-            )
-        )
-        if harm_temperature <= 0.0:
-            raise ValueError(
-                "gpeb_necessity_temperature must be positive."
-            )
-
-        # Zero harm -> target 0. Increasing positive harm approaches 1.
+        # Parameter-free [0,1) necessity mapping.
         necessity_target = (
             1.0
             - torch.exp(
-                -F.relu(total_harm)
-                / harm_temperature
+                -F.relu(answer_harm)
             )
         ).detach()
 
-        merge_selector = gpeb_aux[
+        # Do not allow the straight-through selector to move merely to reduce
+        # the calibration/minimality objective.  The selected intervention is
+        # fixed for these two losses; gradients act on boundary strength.
+        merge_selector = qbound_aux[
             "merge_selector"
-        ].squeeze(1)
-        boundary_mass = gpeb_aux["boundary_mass"]
+        ].squeeze(1).detach()
+
+        boundary_mass = qbound_aux[
+            "boundary_mass"
+        ]
 
         selected_boundary_strength = torch.sum(
             merge_selector * boundary_mass,
@@ -486,244 +408,221 @@ class CRAPipeline(BasePipeline):
             max=1.0 - 1e-6,
         )
 
+        # Merge component: calibrate the selected boundary to observed
+        # task-level necessity; do NOT deliberately make merge predictions bad.
         merge_necessity_loss = F.binary_cross_entropy(
             selected_boundary_strength,
             necessity_target,
         )
 
-        # --------------------------------------------------------------
-        # 3. Counterfactual split invariance
-        # --------------------------------------------------------------
-        distill_temperature = float(
-            model_cfg.get(
-                "gpeb_split_distill_temperature",
-                1.0,
-            )
-        )
-        if distill_temperature <= 0.0:
-            raise ValueError(
-                "gpeb_split_distill_temperature must be positive."
-            )
-
+        # Split component: adding an unnecessary within-event boundary should
+        # preserve the ACTUAL main answer distribution.
         original_distribution = F.softmax(
-            original_logits.detach()
-            / distill_temperature,
-            dim=-1,
-        )
-        split_log_distribution = F.log_softmax(
-            split_logits
-            / distill_temperature,
+            main_logits.detach(),
             dim=-1,
         )
 
-        split_answer_kl = F.kl_div(
+        split_log_distribution = F.log_softmax(
+            split_logits,
+            dim=-1,
+        )
+
+        split_invariance_loss = F.kl_div(
             split_log_distribution,
             original_distribution.unsqueeze(1).expand_as(
                 split_log_distribution
             ),
             reduction="none",
-        ).sum(dim=-1).mean() * (
-            distill_temperature ** 2
+        ).sum(dim=-1).mean()
+
+        structural_loss = 0.5 * (
+            merge_necessity_loss
+            + split_invariance_loss
         )
 
-        split_ground_distance = self._js_divergence(
-            gpeb_aux["split_frame_relevance"],
-            event_key.detach().unsqueeze(1),
+        # Necessity-aware minimality for the currently selected boundary.
+        minimality_loss = (
+            selected_boundary_strength
+            * (
+                1.0
+                - necessity_target
+            )
         ).mean()
 
-        split_ground_weight = float(
-            model_cfg.get(
-                "gpeb_split_ground_weight",
-                1.0,
+        # Q-Bound must first become useful to the main path.  Gating BOTH
+        # structural and minimality objectives avoids reproducing Ver1.0's
+        # one-event collapse when alpha=beta=0.
+        use_strength = qbound_aux[
+            "qbound_use_strength"
+        ].detach().float().clamp(
+            min=0.0,
+            max=1.0,
+        )
+
+        # Diagnostics: all use the same answer candidate embeddings/scorer.
+        with torch.no_grad():
+            original_pred = main_logits.argmax(
+                dim=-1
             )
-        )
-        split_invariance_loss = (
-            split_answer_kl
-            + split_ground_weight
-            * split_ground_distance
-        )
+            merge_pred = merge_logits.mean(
+                dim=1
+            ).argmax(dim=-1)
+            split_pred = split_logits.mean(
+                dim=1
+            ).argmax(dim=-1)
 
-        # --------------------------------------------------------------
-        # 4. Grounding preservation
-        # --------------------------------------------------------------
-        ground_consistency_loss = (
-            original_ground_distance.mean()
-        )
-
-        # --------------------------------------------------------------
-        # 5. Minimum sufficient event structure
-        # --------------------------------------------------------------
-        max_events = int(
-            model_cfg.get(
-                "gpeb_num_bins",
-                model_cfg.get(
-                    "gpeb_max_events",
-                    4,
-                ),
+            base_logits = self._score_answer_candidates(
+                answer_proj=answer_proj,
+                representation=qbound_aux[
+                    "cra_video_proj"
+                ],
+                detach_answer=True,
             )
-        )
-        max_boundaries = max(max_events - 1, 1)
-
-        boundary_sparsity_loss = (
-            gpeb_aux["boundary_count"].float().mean()
-            / float(max_boundaries)
-        )
-
-        minimum_effective_events = float(
-            model_cfg.get(
-                "gpeb_min_effective_events",
-                1.5,
+            event_only_logits = self._score_answer_candidates(
+                answer_proj=answer_proj,
+                representation=qbound_aux[
+                    "event_delta"
+                ],
+                detach_answer=True,
             )
-        )
-        effective_event_count = gpeb_aux[
-            "effective_event_count"
-        ].float()
 
-        minimum_event_loss = F.relu(
-            minimum_effective_events
-            - effective_event_count
-        ).pow(2).mean()
+            base_pred = base_logits.argmax(dim=-1)
+            event_pred = event_only_logits.argmax(dim=-1)
 
-        # Concurrent evidence is taxed so it is used only when the primary
-        # monotonic chain cannot explain the useful context.
-        concurrent_sparsity_loss = gpeb_aux[
-            "concurrent_degree_mean"
-        ].float().mean()
+            cra_event_js = self._js_divergence(
+                qbound_aux["cra_key"],
+                qbound_aux["event_key"],
+            ).mean()
+
+            cra_final_js = self._js_divergence(
+                qbound_aux["cra_key"],
+                qbound_aux["final_key"],
+            ).mean()
 
         losses = {
-            "gpeb_aux_qa_loss": auxiliary_qa_loss,
-            "gpeb_merge_necessity_loss": (
-                merge_necessity_loss
-            ),
-            "gpeb_split_invariance_loss": (
-                split_invariance_loss
-            ),
-            "gpeb_ground_consistency_loss": (
-                ground_consistency_loss
-            ),
-            "gpeb_boundary_sparsity_loss": (
-                boundary_sparsity_loss
-            ),
-            "gpeb_min_event_loss": minimum_event_loss,
-            "gpeb_concurrent_sparsity_loss": (
-                concurrent_sparsity_loss
-            ),
+            "qbound_structural_loss": structural_loss,
+            "qbound_minimality_loss": minimality_loss,
         }
 
         logs = {
-            "gpeb_aux_acc": (
-                auxiliary_accuracy.detach().item()
+            "qbound_use_weight": float(
+                use_strength.item()
             ),
-            "gpeb_original_aux_ce": (
+            "qbound_original_acc": (
+                (original_pred == labels)
+                .float().mean().item()
+            ),
+            "qbound_base_only_acc": (
+                (base_pred == labels)
+                .float().mean().item()
+            ),
+            "qbound_event_only_acc": (
+                (event_pred == labels)
+                .float().mean().item()
+            ),
+            "qbound_merge_acc": (
+                (merge_pred == labels)
+                .float().mean().item()
+            ),
+            "qbound_split_acc": (
+                (split_pred == labels)
+                .float().mean().item()
+            ),
+            "qbound_original_ce": (
                 original_ce.detach().mean().item()
             ),
-            "gpeb_merge_aux_ce": (
+            "qbound_merge_ce": (
                 merge_ce.detach().mean().item()
             ),
-            "gpeb_answer_harm": (
+            "qbound_answer_harm": (
                 answer_harm.detach().mean().item()
             ),
-            "gpeb_original_ground_js": (
-                original_ground_distance.detach().mean().item()
-            ),
-            "gpeb_merge_ground_js": (
-                merge_ground_distance.detach().mean().item()
-            ),
-            "gpeb_grounding_harm": (
-                grounding_harm.detach().mean().item()
-            ),
-            "gpeb_necessity_target": (
+            "qbound_necessity": (
                 necessity_target.mean().item()
             ),
-            "gpeb_selected_boundary_strength": (
-                selected_boundary_strength.detach().mean().item()
+            "qbound_selected_boundary_strength": (
+                selected_boundary_strength.detach()
+                .mean().item()
             ),
-            "gpeb_split_answer_kl": (
-                split_answer_kl.detach().item()
+            "qbound_merge_necessity_loss_raw": (
+                merge_necessity_loss.detach().item()
             ),
-            "gpeb_split_ground_js": (
-                split_ground_distance.detach().item()
+            "qbound_split_invariance_loss_raw": (
+                split_invariance_loss.detach().item()
             ),
-            "gpeb_counterfactual_scale": (
-                self._counterfactual_scale()
+            "qbound_cra_event_js": (
+                cra_event_js.detach().item()
             ),
-            "gpeb_aux_logit_scale": auxiliary_logit_scale,
+            "qbound_cra_final_js": (
+                cra_final_js.detach().item()
+            ),
         }
 
         return losses, logs
 
-    def _weighted_add_gpeb_losses(
+    def _weighted_add_qbound_losses(
         self,
         loss,
-        gpeb_losses,
+        qbound_losses,
+        qbound_logs,
     ):
-        if not gpeb_losses:
+        if not qbound_losses:
             return
 
-        model_cfg = self.cfgs["model"]
-        counterfactual_scale = self._counterfactual_scale()
+        optim_cfg = self.cfgs.get("optim", {})
 
-        weights = {
-            "gpeb_aux_qa_loss": float(
-                model_cfg.get(
-                    "gpeb_aux_qa_weight",
-                    0.05,
-                )
-            ),
-            "gpeb_merge_necessity_loss": (
-                counterfactual_scale
-                * float(
-                    model_cfg.get(
-                        "gpeb_merge_necessity_weight",
-                        0.10,
-                    )
-                )
-            ),
-            "gpeb_split_invariance_loss": (
-                counterfactual_scale
-                * float(
-                    model_cfg.get(
-                        "gpeb_split_invariance_weight",
-                        0.05,
-                    )
-                )
-            ),
-            "gpeb_ground_consistency_loss": float(
-                model_cfg.get(
-                    "gpeb_ground_consistency_weight",
-                    0.10,
-                )
-            ),
-            "gpeb_boundary_sparsity_loss": (
-                counterfactual_scale
-                * float(
-                    model_cfg.get(
-                        "gpeb_boundary_sparsity_weight",
-                        0.005,
-                    )
-                )
-            ),
-            # Active from the beginning to prevent one-event collapse.
-            "gpeb_min_event_loss": float(
-                model_cfg.get(
-                    "gpeb_min_event_weight",
-                    0.01,
-                )
-            ),
-            "gpeb_concurrent_sparsity_loss": float(
-                model_cfg.get(
-                    "gpeb_concurrent_sparsity_weight",
-                    0.002,
-                )
-            ),
-        }
-
-        for name, value in gpeb_losses.items():
-            loss[name] = value
-            loss["total_loss"] = (
-                loss["total_loss"]
-                + weights[name] * value
+        structural_weight = float(
+            optim_cfg.get(
+                "qbound_structural_weight",
+                0.10,
             )
+        )
+        minimality_weight = float(
+            optim_cfg.get(
+                "qbound_minimality_weight",
+                0.01,
+            )
+        )
+
+        if structural_weight < 0.0:
+            raise ValueError(
+                "optim.qbound_structural_weight must be >= 0."
+            )
+        if minimality_weight < 0.0:
+            raise ValueError(
+                "optim.qbound_minimality_weight must be >= 0."
+            )
+
+        use_weight = torch.as_tensor(
+            float(
+                qbound_logs.get(
+                    "qbound_use_weight",
+                    0.0,
+                )
+            ),
+            device=loss["total_loss"].device,
+            dtype=loss["total_loss"].dtype,
+        )
+
+        structural = qbound_losses[
+            "qbound_structural_loss"
+        ]
+        minimality = qbound_losses[
+            "qbound_minimality_loss"
+        ]
+
+        # Keep the raw losses visible in the training table.
+        loss["qbound_structural_loss"] = structural
+        loss["qbound_minimality_loss"] = minimality
+
+        loss["total_loss"] = (
+            loss["total_loss"]
+            + use_weight
+            * (
+                structural_weight * structural
+                + minimality_weight * minimality
+            )
+        )
 
     # ------------------------------------------------------------------
     # Diagnostics
@@ -754,7 +653,7 @@ class CRAPipeline(BasePipeline):
             dim=dim,
         )
 
-    def _collect_gpeb_stats(
+    def _collect_qbound_stats(
         self,
         gqa_output,
         extra_logs=None,
@@ -764,45 +663,49 @@ class CRAPipeline(BasePipeline):
         if extra_logs:
             stats.update(extra_logs)
 
-        gpeb_aux = self._get_gpeb_aux(gqa_output)
-        if gpeb_aux is None:
+        qbound_aux = self._get_qbound_aux(
+            gqa_output
+        )
+        if qbound_aux is None:
             return stats
 
         scalar_keys = [
-            "residual_ratio_mean",
-            "residual_ratio_unclipped_mean",
-            "residual_scale_mean",
-            "residual_max_ratio",
-            "branch_cosine_mean",
-            "cra_branch_cosine_mean",
-            "grounding_scale_used",
+            "alpha",
+            "beta",
+            "qbound_use_strength",
             "boundary_prob_mean",
             "boundary_count",
             "assignment_entropy",
             "effective_event_count",
             "token_entropy",
-            "concurrent_degree_mean",
-            "concurrent_frame_fraction",
-            "concurrent_logit_scale_used",
-            "concurrent_bias_used",
-            "concurrent_context_scale_used",
-            "grounding_agreement_mean",
-            "ground_refine_mix_mean",
-            "grounding_shift_mean",
-            "ground_refinement_enabled",
-            "ground_refine_max",
             "question_only_conditioning",
         ]
 
         for key in scalar_keys:
             scalar = self._scalar_mean(
-                gpeb_aux.get(key)
+                qbound_aux.get(key)
             )
             if scalar is not None:
-                stats[f"gpeb_{key}"] = scalar
+                stats[f"qbound_{key}"] = scalar
 
-        boundary_prob = gpeb_aux.get("boundary_prob")
-        boundary_mask = gpeb_aux.get("boundary_mask")
+        temporal_bias = qbound_aux.get(
+            "temporal_bias"
+        )
+        if torch.is_tensor(temporal_bias):
+            stats[
+                "qbound_temporal_bias_abs_mean"
+            ] = (
+                temporal_bias.detach()
+                .float().abs().mean().item()
+            )
+
+        boundary_prob = qbound_aux.get(
+            "boundary_prob"
+        )
+        boundary_mask = qbound_aux.get(
+            "boundary_mask"
+        )
+
         if (
             torch.is_tensor(boundary_prob)
             and torch.is_tensor(boundary_mask)
@@ -810,48 +713,54 @@ class CRAPipeline(BasePipeline):
             valid_boundary = boundary_prob[
                 boundary_mask.bool()
             ]
+
             if valid_boundary.numel() > 0:
-                stats["gpeb_boundary_prob_min"] = (
-                    valid_boundary.detach().float().min().item()
+                stats[
+                    "qbound_boundary_prob_min"
+                ] = (
+                    valid_boundary.detach()
+                    .float().min().item()
                 )
-                stats["gpeb_boundary_prob_max"] = (
-                    valid_boundary.detach().float().max().item()
+                stats[
+                    "qbound_boundary_prob_max"
+                ] = (
+                    valid_boundary.detach()
+                    .float().max().item()
                 )
 
-        event_mass = gpeb_aux.get("event_mass")
+        event_mass = qbound_aux.get(
+            "event_mass"
+        )
         if torch.is_tensor(event_mass):
-            stats["gpeb_event_mass_min"] = (
-                event_mass.detach().float().min(dim=-1)
-                .values.mean().item()
+            stats["qbound_event_mass_min"] = (
+                event_mass.detach().float()
+                .min(dim=-1).values.mean().item()
             )
-            stats["gpeb_event_mass_max"] = (
-                event_mass.detach().float().max(dim=-1)
-                .values.mean().item()
-            )
-
-        fusion_delta = gpeb_aux.get("fusion_delta")
-        if torch.is_tensor(fusion_delta):
-            stats["gpeb_fusion_delta_norm"] = (
-                fusion_delta.detach().float()
-                .norm(dim=-1).mean().item()
+            stats["qbound_event_mass_max"] = (
+                event_mass.detach().float()
+                .max(dim=-1).values.mean().item()
             )
 
-        merge_selector = gpeb_aux.get(
+        merge_selector = qbound_aux.get(
             "merge_selector"
         )
         if torch.is_tensor(merge_selector):
-            stats["gpeb_merge_selector_entropy"] = (
+            stats[
+                "qbound_merge_selector_entropy"
+            ] = (
                 self._entropy(
                     merge_selector.squeeze(1),
                     dim=-1,
                 ).detach().float().mean().item()
             )
 
-        split_selector = gpeb_aux.get(
+        split_selector = qbound_aux.get(
             "split_selector"
         )
         if torch.is_tensor(split_selector):
-            stats["gpeb_split_selector_entropy"] = (
+            stats[
+                "qbound_split_selector_entropy"
+            ] = (
                 self._entropy(
                     split_selector.squeeze(1),
                     dim=-1,
@@ -861,63 +770,46 @@ class CRAPipeline(BasePipeline):
         return stats
 
     @staticmethod
-    def _gpeb_loss_keys():
+    def _qbound_loss_keys():
         return [
-            "gpeb_aux_qa_loss",
-            "gpeb_merge_necessity_loss",
-            "gpeb_split_invariance_loss",
-            "gpeb_ground_consistency_loss",
-            "gpeb_boundary_sparsity_loss",
-            "gpeb_min_event_loss",
-            "gpeb_concurrent_sparsity_loss",
+            "qbound_structural_loss",
+            "qbound_minimality_loss",
         ]
 
     @staticmethod
-    def _gpeb_monitor_keys():
+    def _qbound_monitor_keys():
         return [
-            "gpeb_aux_acc",
-            "gpeb_original_aux_ce",
-            "gpeb_merge_aux_ce",
-            "gpeb_answer_harm",
-            "gpeb_original_ground_js",
-            "gpeb_merge_ground_js",
-            "gpeb_grounding_harm",
-            "gpeb_necessity_target",
-            "gpeb_selected_boundary_strength",
-            "gpeb_split_answer_kl",
-            "gpeb_split_ground_js",
-            "gpeb_counterfactual_scale",
-            "gpeb_aux_logit_scale",
-            "gpeb_residual_ratio_mean",
-            "gpeb_residual_ratio_unclipped_mean",
-            "gpeb_residual_scale_mean",
-            "gpeb_residual_max_ratio",
-            "gpeb_branch_cosine_mean",
-            "gpeb_cra_branch_cosine_mean",
-            "gpeb_grounding_scale_used",
-            "gpeb_boundary_prob_mean",
-            "gpeb_boundary_count",
-            "gpeb_boundary_prob_min",
-            "gpeb_boundary_prob_max",
-            "gpeb_assignment_entropy",
-            "gpeb_effective_event_count",
-            "gpeb_token_entropy",
-            "gpeb_event_mass_min",
-            "gpeb_event_mass_max",
-            "gpeb_concurrent_degree_mean",
-            "gpeb_concurrent_frame_fraction",
-            "gpeb_concurrent_logit_scale_used",
-            "gpeb_concurrent_bias_used",
-            "gpeb_concurrent_context_scale_used",
-            "gpeb_grounding_agreement_mean",
-            "gpeb_ground_refine_mix_mean",
-            "gpeb_grounding_shift_mean",
-            "gpeb_ground_refinement_enabled",
-            "gpeb_ground_refine_max",
-            "gpeb_question_only_conditioning",
-            "gpeb_fusion_delta_norm",
-            "gpeb_merge_selector_entropy",
-            "gpeb_split_selector_entropy",
+            "qbound_use_weight",
+            "qbound_original_acc",
+            "qbound_base_only_acc",
+            "qbound_event_only_acc",
+            "qbound_merge_acc",
+            "qbound_split_acc",
+            "qbound_original_ce",
+            "qbound_merge_ce",
+            "qbound_answer_harm",
+            "qbound_necessity",
+            "qbound_selected_boundary_strength",
+            "qbound_merge_necessity_loss_raw",
+            "qbound_split_invariance_loss_raw",
+            "qbound_cra_event_js",
+            "qbound_cra_final_js",
+            "qbound_alpha",
+            "qbound_beta",
+            "qbound_qbound_use_strength",
+            "qbound_temporal_bias_abs_mean",
+            "qbound_boundary_prob_mean",
+            "qbound_boundary_count",
+            "qbound_boundary_prob_min",
+            "qbound_boundary_prob_max",
+            "qbound_assignment_entropy",
+            "qbound_effective_event_count",
+            "qbound_token_entropy",
+            "qbound_event_mass_min",
+            "qbound_event_mass_max",
+            "qbound_question_only_conditioning",
+            "qbound_merge_selector_entropy",
+            "qbound_split_selector_entropy",
         ]
 
     # ------------------------------------------------------------------
@@ -1004,7 +896,7 @@ class CRAPipeline(BasePipeline):
                 vq_output[2]["align_gt"]
             )
 
-        # Ver1.0 explicitly passes question-only tokens to Q-Bound.
+        # Question-only tokens are passed explicitly to Q-Bound.
         gqa_output = self.model(
             video_frames,
             video_mask,
@@ -1024,7 +916,13 @@ class CRAPipeline(BasePipeline):
         )
 
         prediction_dict["vqa_pred"] = predicts
-        target_dict["vqa_target"] = answer_id_device
+        target_dict["vqa_target"] = (
+            answer_id_device
+        )
+
+        # Preserve the repository's original CRA alignment objective.
+        # V1.1 does not invent a pseudo temporal-label loss here because this
+        # training batch currently contains no ground-truth temporal segment.
         prediction_dict["vqa_align_pred"] = (
             gqa_output[2]["time_param"][
                 "grounding_feature"
@@ -1034,21 +932,26 @@ class CRAPipeline(BasePipeline):
             gqa_output[2]["align_gt"]
         )
 
+        # L_task: all original CRA task losses.
         loss = self.criterion(
             prediction_dict,
             target_dict,
         )
 
-        gpeb_losses, gpeb_logs = (
-            self._compute_gpeb_v1_losses(
+        # Two new Q-Bound losses only.
+        qbound_losses, qbound_logs = (
+            self._compute_qbound_v11_losses(
                 gqa_output=gqa_output,
                 answer_proj=answer_proj,
                 answer_id=answer_id,
+                main_logits=predicts,
             )
         )
-        self._weighted_add_gpeb_losses(
+
+        self._weighted_add_qbound_losses(
             loss,
-            gpeb_losses,
+            qbound_losses,
+            qbound_logs,
         )
 
         predicted = predicts.argmax(
@@ -1056,19 +959,22 @@ class CRAPipeline(BasePipeline):
         ).detach().cpu()
 
         running_accuracy = (
-            predicted == answer_id.reshape(-1).cpu()
+            predicted
+            == answer_id.reshape(-1).cpu()
         ).float().mean().item()
 
-        gpeb_stats = self._collect_gpeb_stats(
+        qbound_stats = self._collect_qbound_stats(
             gqa_output,
-            extra_logs=gpeb_logs,
+            extra_logs=qbound_logs,
         )
 
-        return loss, running_accuracy, gpeb_stats
+        return (
+            loss,
+            running_accuracy,
+            qbound_stats,
+        )
 
     def _train_epoch(self, epoch):
-        self._active_epoch = int(epoch)
-
         self.monitor.log_info(
             f"\n{'#' * 20} Epoch "
             f"{epoch}/{self.cfgs['optim']['epochs']} "
@@ -1088,13 +994,10 @@ class CRAPipeline(BasePipeline):
                 continue
             self.monitor.reset_kv(f"{key}_loss")
 
-        if self.cfgs["model"].get(
-            "gpeb_enabled",
-            False,
-        ):
-            for key in self._gpeb_loss_keys():
+        if self._qbound_enabled():
+            for key in self._qbound_loss_keys():
                 self.monitor.reset_kv(key)
-            for key in self._gpeb_monitor_keys():
+            for key in self._qbound_monitor_keys():
                 self.monitor.reset_kv(key)
 
         for index, batch in enumerate(
@@ -1102,7 +1005,7 @@ class CRAPipeline(BasePipeline):
         ):
             start_time = time.time()
 
-            loss, monitor_metric, gpeb_stats = (
+            loss, monitor_metric, qbound_stats = (
                 self.get_loss(batch)
             )
 
@@ -1110,7 +1013,7 @@ class CRAPipeline(BasePipeline):
                 "acc",
                 monitor_metric,
             )
-            for name, value in gpeb_stats.items():
+            for name, value in qbound_stats.items():
                 self.monitor.logkv_mean(
                     name,
                     value,
@@ -1299,18 +1202,18 @@ class CRAPipeline(BasePipeline):
             )
             _print_score(score["test_merge"])
 
-        gpeb_keys = [
+        qbound_keys = [
             key for key in score
-            if key.startswith("val_gpeb_")
-            or key.startswith("test_gpeb_")
+            if key.startswith("val_qbound_")
+            or key.startswith("test_qbound_")
         ]
 
-        if gpeb_keys:
+        if qbound_keys:
             self.monitor.log_info(
                 "\n================ Q-Bound diagnostics "
                 "================"
             )
-            for key in sorted(gpeb_keys):
+            for key in sorted(qbound_keys):
                 self.monitor.log_info(
                     f"{key}: {score[key]:.6f}"
                 )
@@ -1434,12 +1337,10 @@ class CRAPipeline(BasePipeline):
         keyframe = {}
         ori_keyframe = {}
 
-        gpeb_aux_correct = 0
-        gpeb_aux_count = 0
-        gpeb_stat_sums = collections.defaultdict(
+        qbound_stat_sums = collections.defaultdict(
             float
         )
-        gpeb_stat_count = 0
+        qbound_stat_count = 0
 
         saw_time_param = False
 
@@ -1492,15 +1393,17 @@ class CRAPipeline(BasePipeline):
                 batch_size = answer_id.size(0)
                 count += batch_size
 
-                fusion_proj, answer_proj, model_outputs = (
-                    self.model(
-                        video_frames,
-                        video_mask,
-                        answer=answer,
-                        answer_id=answer_id,
-                        mode="VQA",
-                        question=question,
-                    )
+                (
+                    fusion_proj,
+                    answer_proj,
+                    model_outputs,
+                ) = self.model(
+                    video_frames,
+                    video_mask,
+                    answer=answer,
+                    answer_id=answer_id,
+                    mode="VQA",
+                    question=question,
                 )
 
                 predicts = self._score_answer_candidates(
@@ -1521,69 +1424,49 @@ class CRAPipeline(BasePipeline):
                 time_param = model_outputs.get(
                     "time_param"
                 )
-                eval_wrapper = None
 
                 if time_param is not None:
                     saw_time_param = True
+
                     eval_wrapper = (
                         None,
                         None,
                         {"time_param": time_param},
                     )
 
-                    gpeb_aux = time_param.get(
-                        "gpeb_aux"
+                    qbound_aux = time_param.get(
+                        "qbound_aux",
+                        time_param.get("gpeb_aux"),
                     )
                 else:
-                    gpeb_aux = None
+                    eval_wrapper = None
+                    qbound_aux = None
 
-                if gpeb_aux is not None:
-                    bridge_repr = gpeb_aux.get(
-                        "bridge_repr"
-                    )
-                    if bridge_repr is not None:
-                        auxiliary_logits = (
-                            self._score_answer_candidates(
-                                answer_proj=answer_proj,
-                                representation=bridge_repr,
-                                detach_answer=True,
-                                normalize=True,
-                                logit_scale=float(
-                                    self.cfgs["model"].get(
-                                        "gpeb_aux_logit_scale",
-                                        10.0,
-                                    )
-                                ),
-                            )
-                        )
-                        auxiliary_predicted = (
-                            auxiliary_logits.argmax(
-                                dim=-1
-                            ).cpu()
-                        )
-                        gpeb_aux_correct += (
-                            auxiliary_predicted
-                            == answer_id.reshape(-1).cpu()
-                        ).sum().item()
-                        gpeb_aux_count += batch_size
-
+                if qbound_aux is not None:
                     _, counterfactual_logs = (
-                        self._compute_gpeb_v1_losses(
+                        self._compute_qbound_v11_losses(
                             gqa_output=eval_wrapper,
                             answer_proj=answer_proj,
                             answer_id=answer_id,
+                            main_logits=predicts,
                         )
                     )
-                    batch_stats = self._collect_gpeb_stats(
-                        eval_wrapper,
-                        extra_logs=counterfactual_logs,
+
+                    batch_stats = (
+                        self._collect_qbound_stats(
+                            eval_wrapper,
+                            extra_logs=(
+                                counterfactual_logs
+                            ),
+                        )
                     )
 
                     for name, value in batch_stats.items():
-                        gpeb_stat_sums[name] += (
+                        qbound_stat_sums[name] += (
                             float(value) * batch_size
                         )
-                    gpeb_stat_count += batch_size
+
+                    qbound_stat_count += batch_size
 
                 video_attention = model_outputs[
                     "fatt"
@@ -1596,6 +1479,7 @@ class CRAPipeline(BasePipeline):
                     video_attention = (
                         video_attention.squeeze(-1)
                     )
+
                 if video_attention.ndim == 1:
                     video_attention = (
                         video_attention[None, :]
@@ -1608,6 +1492,7 @@ class CRAPipeline(BasePipeline):
                     end_time = time_param[
                         "end"
                     ].detach().cpu().numpy()
+
                     batch_ground_pre = np.column_stack(
                         (start_time, end_time)
                     )
@@ -1615,6 +1500,7 @@ class CRAPipeline(BasePipeline):
                     batch_keyframe = time_param[
                         "key"
                     ].detach().cpu().numpy()
+
                     batch_ori_keyframe = time_param[
                         "ori_key"
                     ].detach().cpu().numpy()
@@ -1633,6 +1519,7 @@ class CRAPipeline(BasePipeline):
                                 .numpy()[batch_index]
                             ),
                         }
+
                         ground_res[qid] = (
                             video_attention[
                                 batch_index
@@ -1690,16 +1577,12 @@ class CRAPipeline(BasePipeline):
 
         score["acc"] /= count
 
-        if gpeb_aux_count > 0:
-            score["gpeb_aux_acc"] = (
-                gpeb_aux_correct
-                / gpeb_aux_count
-            )
-
-        if gpeb_stat_count > 0:
-            for name, total in gpeb_stat_sums.items():
+        if qbound_stat_count > 0:
+            for name, total in (
+                qbound_stat_sums.items()
+            ):
                 score[name] = (
-                    total / gpeb_stat_count
+                    total / qbound_stat_count
                 )
 
         split = data_loader.dataset.split
@@ -1725,11 +1608,14 @@ class CRAPipeline(BasePipeline):
         )
         questions = load_file(qa_file)
 
-        post_hoc_ground = self.metric.generate_ground(
-            ground_res,
-            segments,
-            questions,
+        post_hoc_ground = (
+            self.metric.generate_ground(
+                ground_res,
+                segments,
+                questions,
+            )
         )
+
         score["post-hoc"] = self.metric(
             post_hoc_ground,
             ground_truth,
@@ -1751,17 +1637,20 @@ class CRAPipeline(BasePipeline):
                 results,
                 gs=True,
             )
+
             merge_ground = self.metric.combine(
                 ground_pre,
                 post_hoc_ground,
                 ground_truth,
             )
+
             score["merge"] = self.metric(
                 merge_ground,
                 ground_truth,
                 results,
                 gs=False,
             )
+
             result.update(
                 {
                     "tg": ground_pre,

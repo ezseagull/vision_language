@@ -47,10 +47,10 @@ class BasePipeline(object):
         #
         # Build the repository's original optimizer first so that all
         # existing optimizer options remain unchanged. Then move the
-        # Ver1.0 GPEB parameters to their own parameter group.
+        # Q-Bound V1.1 parameters to their own parameter group.
         self.optimizer = build_optimizer(cfgs, self.model)
-        self._configure_gpeb_optimizer_groups()
-        self._check_gpeb_optimizer()
+        self._configure_qbound_optimizer_groups()
+        self._check_qbound_optimizer()
         self._check_optimizer_coverage()
 
         # Build the scheduler only after the parameter groups are final.
@@ -59,7 +59,7 @@ class BasePipeline(object):
             self.optimizer,
             len(self.train_dataloader),
         )
-        self._check_gpeb_scheduler()
+        self._check_qbound_scheduler()
 
         self.epochs = self.cfgs["optim"]["epochs"]
         self.save_period = self.cfgs["optim"]["save_period"]
@@ -90,87 +90,86 @@ class BasePipeline(object):
         self.monitor = Monitor(cfgs)
         self.monitor.log_info(json.dumps(cfgs,sort_keys=True,indent=4), end='\n')
 
-    @staticmethod
-    def _is_gpeb_parameter_name(name):
-        """
-        Return True for all Ver1.0 GPEB-related parameters.
-
-        This matches:
-            decoder.gpeb.*
-            decoder.gpeb_gate.*
-            decoder.gpeb_*_norm.*
-            decoder.gpeb_qa_proj.*
-
-        It also works when DataParallel prefixes names with "module.".
-        """
-        return "gpeb" in name.lower()
-
-    def _configure_gpeb_optimizer_groups(self):
-        """
-        Move trainable GPEB parameters to a dedicated optimizer group.
-
-        Why this is done after build_optimizer:
-            - The repository may already configure Adam/AdamW, amsgrad,
-              weight decay, or other optimizer-specific options.
-            - Reusing build_optimizer preserves those settings.
-            - The new group only overrides the learning rate (and,
-              optionally, weight decay) for GPEB.
-
-        Expected config:
-            optim:
-              lr: 1.e-5
-              gpeb_lr: 1.e-4
-              # Optional:
-              # gpeb_weight_decay: 0
-
-        Notes:
-            - This method must run before build_lr_scheduler.
-            - It is safe here because no optimizer step has occurred yet.
-        """
+    def _qbound_enabled(self):
         model_cfg = self.cfgs.get("model", {})
-        optim_cfg = self.cfgs.get("optim", {})
+        qbound_cfg = model_cfg.get("qbound", {})
 
-        if not model_cfg.get("gpeb_enabled", False):
+        if isinstance(qbound_cfg, dict) and "enabled" in qbound_cfg:
+            return bool(qbound_cfg["enabled"])
+
+        return bool(
+            model_cfg.get(
+                "qbound_enabled",
+                model_cfg.get("gpeb_enabled", False),
+            )
+        )
+
+    @staticmethod
+    def _is_qbound_parameter_name(name):
+        """
+        Q-Bound V1.1 parameters live under:
+            decoder.qbound.*
+            decoder.qbound_adapter.*
+
+        DataParallel may prefix names with ``module.``; substring matching is
+        therefore intentional.
+        """
+        return "qbound" in name.lower()
+
+    def _configure_qbound_optimizer_groups(self):
+        """
+        Move all trainable Q-Bound core/adapter parameters into one dedicated
+        optimizer group while preserving the repository's original optimizer.
+
+        Required only when Q-Bound is enabled:
+            optim.qbound_lr
+
+        The grounding module remains a CRA/base parameter.  Only QBoundCore and
+        CRAQBoundAdapter use the Q-Bound learning rate.
+        """
+        if not self._qbound_enabled():
             return
 
-        if "gpeb_lr" not in optim_cfg:
+        optim_cfg = self.cfgs.get("optim", {})
+
+        qbound_lr = float(
+            optim_cfg.get(
+                "qbound_lr",
+                optim_cfg.get("gpeb_lr", 0.0),
+            )
+        )
+
+        if qbound_lr <= 0.0:
             raise ValueError(
-                "model.gpeb_enabled=True requires optim.gpeb_lr. "
-                "For Q-Bound Ver1.0, use gpeb_lr: 5.e-5."
+                "Q-Bound is enabled but optim.qbound_lr is missing or "
+                "non-positive."
             )
 
-        gpeb_lr = float(optim_cfg["gpeb_lr"])
-        if gpeb_lr <= 0:
-            raise ValueError(
-                "optim.gpeb_lr must be positive, "
-                f"got {gpeb_lr}."
-            )
-
-        named_gpeb_parameters = [
+        named_qbound_parameters = [
             (name, parameter)
-            for name, parameter in self.model.named_parameters()
+            for name, parameter
+            in self.model.named_parameters()
             if (
                 parameter.requires_grad
-                and self._is_gpeb_parameter_name(name)
+                and self._is_qbound_parameter_name(name)
             )
         ]
 
-        if not named_gpeb_parameters:
+        if not named_qbound_parameters:
             raise RuntimeError(
-                "model.gpeb_enabled=True, but no trainable parameter "
-                "whose name contains 'gpeb' was found. Check whether "
-                "the Ver1.0 refine decoder is actually instantiated."
+                "Q-Bound is enabled, but no trainable parameter whose "
+                "name contains 'qbound' was found. Check that the V1.1 "
+                "refine decoder is instantiated."
             )
 
-        gpeb_param_ids = {
+        qbound_param_ids = {
             id(parameter)
-            for _, parameter in named_gpeb_parameters
+            for _, parameter
+            in named_qbound_parameters
         }
 
-        # Remove GPEB tensors from every group created by build_optimizer.
-        # They will be re-added exactly once in the dedicated group.
         retained_groups = []
-        extracted_gpeb_parameters = []
+        extracted_qbound_parameters = []
         extracted_ids = set()
 
         for group_index, group in enumerate(
@@ -181,12 +180,18 @@ class BasePipeline(object):
             for parameter in group["params"]:
                 parameter_id = id(parameter)
 
-                if parameter_id in gpeb_param_ids:
+                if parameter_id in qbound_param_ids:
                     if parameter_id not in extracted_ids:
-                        extracted_gpeb_parameters.append(parameter)
-                        extracted_ids.add(parameter_id)
+                        extracted_qbound_parameters.append(
+                            parameter
+                        )
+                        extracted_ids.add(
+                            parameter_id
+                        )
                 else:
-                    retained_parameters.append(parameter)
+                    retained_parameters.append(
+                        parameter
+                    )
 
             if retained_parameters:
                 group["params"] = retained_parameters
@@ -196,41 +201,50 @@ class BasePipeline(object):
                 )
                 retained_groups.append(group)
 
-        self.optimizer.param_groups = retained_groups
+        self.optimizer.param_groups = (
+            retained_groups
+        )
 
-        missing_ids = gpeb_param_ids - extracted_ids
+        missing_ids = (
+            qbound_param_ids
+            - extracted_ids
+        )
         if missing_ids:
             missing_names = [
                 name
-                for name, parameter in named_gpeb_parameters
+                for name, parameter
+                in named_qbound_parameters
                 if id(parameter) in missing_ids
             ]
             raise RuntimeError(
-                "Some trainable GPEB parameters were not present in "
-                "the optimizer returned by build_optimizer:\n"
+                "Some Q-Bound parameters were not present in the "
+                "optimizer returned by build_optimizer:\n"
                 + "\n".join(missing_names)
             )
 
-        gpeb_group = {
-            "params": extracted_gpeb_parameters,
-            "lr": gpeb_lr,
-            "name": "gpeb",
+        qbound_group = {
+            "params": extracted_qbound_parameters,
+            "lr": qbound_lr,
+            "name": "qbound",
         }
 
-        if "gpeb_weight_decay" in optim_cfg:
-            gpeb_group["weight_decay"] = float(
-                optim_cfg["gpeb_weight_decay"]
+        if "qbound_weight_decay" in optim_cfg:
+            qbound_group["weight_decay"] = float(
+                optim_cfg["qbound_weight_decay"]
             )
 
-        self.optimizer.add_param_group(gpeb_group)
-
-        total_gpeb_params = sum(
-            parameter.numel()
-            for parameter in extracted_gpeb_parameters
+        self.optimizer.add_param_group(
+            qbound_group
         )
 
-        print("\n[GPEB Optimizer Group Created]")
-        print(f"  lr: {gpeb_lr}")
+        total_qbound_params = sum(
+            parameter.numel()
+            for parameter
+            in extracted_qbound_parameters
+        )
+
+        print("\n[Q-Bound Optimizer Group Created]")
+        print(f"  lr: {qbound_lr}")
         print(
             "  weight_decay:",
             self.optimizer.param_groups[-1].get(
@@ -242,20 +256,20 @@ class BasePipeline(object):
             ),
         )
         print(
-            f"  trainable parameters: "
-            f"{total_gpeb_params:,}"
+            "  trainable parameters: "
+            f"{total_qbound_params:,}"
         )
         print(
-            f"  tensors: "
-            f"{len(extracted_gpeb_parameters)}\n"
+            "  tensors: "
+            f"{len(extracted_qbound_parameters)}\n"
         )
 
-    def _check_gpeb_optimizer(self):
+    def _check_qbound_optimizer(self):
         """
-        Verify that all trainable GPEB parameters are registered exactly
-        once and report the actual optimizer learning rates.
+        Verify that every trainable Q-Bound parameter is registered exactly
+        once and that the dedicated learning rate is correct.
         """
-        if not self.cfgs["model"].get("gpeb_enabled", False):
+        if not self._qbound_enabled():
             return
 
         optimizer_parameter_counts = {}
@@ -263,7 +277,9 @@ class BasePipeline(object):
         for group in self.optimizer.param_groups:
             for parameter in group["params"]:
                 parameter_id = id(parameter)
-                optimizer_parameter_counts[parameter_id] = (
+                optimizer_parameter_counts[
+                    parameter_id
+                ] = (
                     optimizer_parameter_counts.get(
                         parameter_id,
                         0,
@@ -271,24 +287,30 @@ class BasePipeline(object):
                     + 1
                 )
 
-        gpeb_parameters = []
+        qbound_parameters = []
         missing_parameters = []
         duplicated_parameters = []
 
-        for name, parameter in self.model.named_parameters():
-            if not self._is_gpeb_parameter_name(name):
+        for name, parameter in (
+            self.model.named_parameters()
+        ):
+            if not self._is_qbound_parameter_name(
+                name
+            ):
                 continue
 
             if not parameter.requires_grad:
                 continue
 
-            gpeb_parameters.append(
+            qbound_parameters.append(
                 (name, parameter.numel())
             )
 
-            registration_count = optimizer_parameter_counts.get(
-                id(parameter),
-                0,
+            registration_count = (
+                optimizer_parameter_counts.get(
+                    id(parameter),
+                    0,
+                )
             )
 
             if registration_count == 0:
@@ -296,26 +318,27 @@ class BasePipeline(object):
             elif registration_count > 1:
                 duplicated_parameters.append(name)
 
-        total_gpeb_params = sum(
+        total_qbound_params = sum(
             numel
-            for _, numel in gpeb_parameters
+            for _, numel
+            in qbound_parameters
         )
 
-        print("\n[GPEB Optimizer Check]")
+        print("\n[Q-Bound Optimizer Check]")
         print(
-            f"Trainable GPEB parameters: "
-            f"{total_gpeb_params:,}"
+            "Trainable Q-Bound parameters: "
+            f"{total_qbound_params:,}"
         )
         print(
-            "GPEB tensors registered:",
-            len(gpeb_parameters),
+            "Q-Bound tensors registered:",
+            len(qbound_parameters),
         )
         print(
             "Optimizer parameter groups:",
             len(self.optimizer.param_groups),
         )
 
-        gpeb_group_indices = []
+        qbound_group_indices = []
 
         for group_index, group in enumerate(
             self.optimizer.param_groups
@@ -325,13 +348,14 @@ class BasePipeline(object):
                 for parameter in group["params"]
             }
 
-            num_gpeb_tensors = sum(
-                id(parameter) in group_parameter_ids
+            num_qbound_tensors = sum(
+                id(parameter)
+                in group_parameter_ids
                 for parameter_name, parameter
                 in self.model.named_parameters()
                 if (
                     parameter.requires_grad
-                    and self._is_gpeb_parameter_name(
+                    and self._is_qbound_parameter_name(
                         parameter_name
                     )
                 )
@@ -347,69 +371,76 @@ class BasePipeline(object):
                 f"({group_name}): "
                 f"lr={group.get('lr')}, "
                 f"num_tensors={len(group['params'])}, "
-                f"gpeb_tensors={num_gpeb_tensors}"
+                f"qbound_tensors={num_qbound_tensors}"
             )
 
-            if num_gpeb_tensors > 0:
-                gpeb_group_indices.append(group_index)
+            if num_qbound_tensors > 0:
+                qbound_group_indices.append(
+                    group_index
+                )
 
         if missing_parameters:
             raise RuntimeError(
-                "The following GPEB parameters are missing "
+                "The following Q-Bound parameters are missing "
                 "from the optimizer:\n"
                 + "\n".join(missing_parameters)
             )
 
         if duplicated_parameters:
             raise RuntimeError(
-                "The following GPEB parameters occur more than once "
+                "The following Q-Bound parameters occur more than once "
                 "in the optimizer:\n"
                 + "\n".join(duplicated_parameters)
             )
 
-        if len(gpeb_group_indices) != 1:
+        if len(qbound_group_indices) != 1:
             raise RuntimeError(
-                "Expected all GPEB tensors to be in exactly one "
-                "optimizer group, but found GPEB tensors in groups: "
-                f"{gpeb_group_indices}."
+                "Expected all Q-Bound tensors in exactly one optimizer "
+                "group, but found them in groups: "
+                f"{qbound_group_indices}."
             )
 
-        actual_gpeb_lr = self.optimizer.param_groups[
-            gpeb_group_indices[0]
-        ]["lr"]
+        actual_qbound_lr = (
+            self.optimizer.param_groups[
+                qbound_group_indices[0]
+            ]["lr"]
+        )
 
-        expected_gpeb_lr = float(
+        expected_qbound_lr = float(
             self.cfgs["optim"].get(
-                "gpeb_lr",
-                actual_gpeb_lr,
+                "qbound_lr",
+                self.cfgs["optim"].get(
+                    "gpeb_lr",
+                    actual_qbound_lr,
+                ),
             )
         )
 
         if not math.isclose(
-            float(actual_gpeb_lr),
-            expected_gpeb_lr,
+            float(actual_qbound_lr),
+            expected_qbound_lr,
             rel_tol=1e-9,
             abs_tol=0.0,
         ):
             raise RuntimeError(
-                "GPEB optimizer LR mismatch: "
-                f"expected {expected_gpeb_lr}, "
-                f"got {actual_gpeb_lr}."
+                "Q-Bound optimizer LR mismatch: "
+                f"expected {expected_qbound_lr}, "
+                f"got {actual_qbound_lr}."
             )
 
         print(
-            "All GPEB parameters are registered exactly once."
+            "All Q-Bound parameters are registered exactly once."
         )
         print(
-            f"Verified GPEB learning rate: "
-            f"{actual_gpeb_lr}\n"
+            "Verified Q-Bound learning rate: "
+            f"{actual_qbound_lr}\n"
         )
 
     def _check_optimizer_coverage(self):
         """
         Verify that every trainable model parameter appears exactly once.
 
-        The GPEB-specific check is necessary but not sufficient: mutating
+        The Q-Bound-specific check is necessary but not sufficient: mutating
         optimizer groups must not accidentally drop or duplicate ordinary
         CRA, language, video, or grounding parameters.
         """
@@ -453,70 +484,77 @@ class BasePipeline(object):
             "Every trainable parameter is registered exactly once.\n"
         )
 
-    def _check_gpeb_scheduler(self):
+    def _check_qbound_scheduler(self):
         """
-        Check that the scheduler was built after the GPEB optimizer
-        group and can see every optimizer parameter group.
+        Verify that the scheduler was constructed after the dedicated Q-Bound
+        optimizer group and sees the same number of parameter groups.
         """
-        if not self.cfgs["model"].get("gpeb_enabled", False):
+        if not self._qbound_enabled():
             return
 
-        gpeb_group_index = None
+        qbound_group_index = None
 
         for group_index, group in enumerate(
             self.optimizer.param_groups
         ):
-            if group.get("name") == "gpeb":
-                gpeb_group_index = group_index
+            if group.get("name") == "qbound":
+                qbound_group_index = group_index
                 break
 
-        if gpeb_group_index is None:
-            # This can occur only when no separate gpeb_lr was set.
-            return
+        if qbound_group_index is None:
+            raise RuntimeError(
+                "Q-Bound is enabled but optimizer group 'qbound' "
+                "does not exist."
+            )
 
         if hasattr(self.lr_scheduler, "base_lrs"):
-            base_lrs = list(self.lr_scheduler.base_lrs)
+            base_lrs = list(
+                self.lr_scheduler.base_lrs
+            )
 
             if len(base_lrs) != len(
                 self.optimizer.param_groups
             ):
                 raise RuntimeError(
-                    "The LR scheduler does not contain the same "
-                    "number of parameter groups as the optimizer: "
+                    "Scheduler/optimizer parameter-group mismatch: "
                     f"scheduler={len(base_lrs)}, "
                     f"optimizer={len(self.optimizer.param_groups)}."
                 )
 
             expected_lr = float(
-                self.cfgs["optim"]["gpeb_lr"]
+                self.cfgs["optim"].get(
+                    "qbound_lr",
+                    self.cfgs["optim"].get(
+                        "gpeb_lr",
+                    ),
+                )
             )
-            scheduler_gpeb_lr = float(
-                base_lrs[gpeb_group_index]
+            scheduler_qbound_lr = float(
+                base_lrs[qbound_group_index]
             )
 
             if not math.isclose(
-                scheduler_gpeb_lr,
+                scheduler_qbound_lr,
                 expected_lr,
                 rel_tol=1e-9,
                 abs_tol=0.0,
             ):
                 raise RuntimeError(
-                    "The scheduler registered an unexpected GPEB "
+                    "Scheduler registered an unexpected Q-Bound "
                     f"base LR: expected {expected_lr}, "
-                    f"got {scheduler_gpeb_lr}."
+                    f"got {scheduler_qbound_lr}."
                 )
 
             print(
-                "[GPEB Scheduler Check] "
-                f"base_lr={scheduler_gpeb_lr}, "
-                f"group_index={gpeb_group_index}\n"
+                "[Q-Bound Scheduler Check] "
+                f"base_lr={scheduler_qbound_lr}, "
+                f"group_index={qbound_group_index}\n"
             )
         else:
             print(
-                "[GPEB Scheduler Check] Scheduler has no "
-                "'base_lrs' attribute; optimizer groups were created "
-                "before scheduler construction, but verify the LR "
-                "values during the first training iterations.\n"
+                "[Q-Bound Scheduler Check] Scheduler has no "
+                "'base_lrs' attribute. Parameter groups were still "
+                "created before scheduler construction.\n"
             )
 
     def train(self):

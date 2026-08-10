@@ -13,8 +13,8 @@ from modules.m_cra.only_trans import (
 )
 from modules.m_cra.grounding import GroundingModule
 from modules.m_cra.causal_module import VisualIntervention
-from modules.m_cra.event_bridge import GroundedPredictiveEventBridge
-
+from modules.qbound import QBoundCore
+from modules.m_cra.qbound_adapter import CRAQBoundAdapter
 
 class RefineMHA(MultiHeadedAttention):
     def __init__(self, h, d_model, dropout=0.1):
@@ -109,19 +109,25 @@ class DecoderLayer(nn.Module):
 
 class Decoder(nn.Module):
     """
-    CRA refinement decoder with Q-Bound GPEB Version 1.0.
+    CRA refinement decoder with Q-Bound Version 1.1.
 
-    Version 1.0 keeps CRA as the grounding backbone and uses GPEB as a
-    minimum-sufficient event reasoning branch. Compared with Version 0.5b:
+    Responsibilities are deliberately separated:
 
-      * the saturated D-dimensional fusion gate is removed;
-      * event selection happens inside event_bridge.py at the interpretable
-        event/transition level;
-      * the GPEB residual is fused directly but smoothly norm-bounded;
-      * optional temporal-grounding refinement uses a parameter-free,
-        agreement-calibrated geometric interpolation;
-      * original CRA grounding/alignment features are preserved separately;
-      * a question-only feature can be passed explicitly for boundary learning.
+      * ``QBoundCore`` learns question-conditioned event topology/evidence.
+      * ``GroundingModule`` remains the CRA temporal grounding backbone.
+      * ``CRAQBoundAdapter`` owns the two backbone-specific scalar fusions:
+
+            z_final = z_grounded + alpha * A(z_event)
+            l_final = l_CRA      + beta  * l_event
+
+    Q-Bound temporal evidence is fused BEFORE the final key/start/end are
+    generated.  Merge/split counterfactuals pass through the same grounding
+    path and the same event adapter as the original path, so the training
+    pipeline can evaluate all of them with the same main VQA scorer.
+
+    At initialization alpha=beta=0 by default, therefore enabling Q-Bound
+    preserves the CRA prediction path while still allowing the two scalar
+    parameters to learn whether event evidence is useful.
     """
 
     def __init__(
@@ -170,143 +176,124 @@ class Decoder(nn.Module):
         )
         self.do = VisualIntervention(self.cfgs)
 
-        # -------------------------------------------------------------
-        # Q-Bound GPEB Version 1.0
-        # -------------------------------------------------------------
-        self.gpeb_enabled = bool(
-            model_cfg.get("gpeb_enabled", False)
-        )
-        self.gpeb_require_question_only = bool(
+        # ------------------------------------------------------------------
+        # Q-Bound V1.1
+        #
+        # New qbound_* names are preferred. gpeb_* fallbacks are retained so
+        # the first V1.1 run does not require an immediate full YAML rewrite.
+        # ------------------------------------------------------------------
+        self.qbound_enabled = bool(
             model_cfg.get(
-                "gpeb_require_question_only",
-                str(model_cfg.get("gpeb_version", "0.0")).startswith("1"),
+                "qbound_enabled",
+                model_cfg.get("gpeb_enabled", False),
             )
         )
 
-        if self.gpeb_enabled:
-            self.gpeb = GroundedPredictiveEventBridge(
+        self.qbound_require_question_only = bool(
+            model_cfg.get(
+                "qbound_require_question_only",
+                model_cfg.get(
+                    "gpeb_require_question_only",
+                    True,
+                ),
+            )
+        )
+
+        if self.qbound_enabled:
+            self.qbound = QBoundCore(
                 input_dim=embed_dim,
                 hidden_dim=model_cfg.get(
-                    "gpeb_hidden_dim",
-                    256,
+                    "qbound_hidden_dim",
+                    model_cfg.get("gpeb_hidden_dim", 256),
                 ),
-                # Retained constructor name. In Ver1.0 this is the maximum
-                # number of latent events, not a fixed-bin count.
-                num_bins=model_cfg.get(
-                    "gpeb_num_bins",
-                    model_cfg.get("gpeb_max_events", 4),
+                max_events=model_cfg.get(
+                    "qbound_max_events",
+                    model_cfg.get(
+                        "gpeb_max_events",
+                        model_cfg.get("gpeb_num_bins", 4),
+                    ),
                 ),
-                use_grounding_prior=model_cfg.get(
-                    "gpeb_use_grounding_prior",
-                    True,
+                use_temporal_prior=model_cfg.get(
+                    "qbound_use_temporal_prior",
+                    model_cfg.get(
+                        "gpeb_use_grounding_prior",
+                        True,
+                    ),
                 ),
                 dropout=model_cfg.get(
-                    "gpeb_dropout",
-                    dropout,
-                ),
-                grounding_prior_clip=model_cfg.get(
-                    "gpeb_grounding_prior_clip",
-                    4.0,
-                ),
-                grounding_scale_max=model_cfg.get(
-                    "gpeb_grounding_scale_max",
-                    5.0,
+                    "qbound_dropout",
+                    model_cfg.get("gpeb_dropout", dropout),
                 ),
                 boundary_temperature=model_cfg.get(
-                    "gpeb_boundary_temperature",
-                    0.7,
+                    "qbound_boundary_temperature",
+                    model_cfg.get(
+                        "gpeb_boundary_temperature",
+                        0.7,
+                    ),
                 ),
                 assignment_temperature=model_cfg.get(
-                    "gpeb_assignment_temperature",
-                    0.35,
+                    "qbound_assignment_temperature",
+                    model_cfg.get(
+                        "gpeb_assignment_temperature",
+                        0.35,
+                    ),
                 ),
                 boundary_bias_init=model_cfg.get(
-                    "gpeb_boundary_bias_init",
-                    -2.0,
+                    "qbound_boundary_bias_init",
+                    model_cfg.get(
+                        "gpeb_boundary_bias_init",
+                        -2.0,
+                    ),
                 ),
                 counterfactual_temperature=model_cfg.get(
-                    "gpeb_counterfactual_temperature",
-                    0.15,
+                    "qbound_counterfactual_temperature",
+                    model_cfg.get(
+                        "gpeb_counterfactual_temperature",
+                        0.15,
+                    ),
                 ),
                 merge_strength=model_cfg.get(
-                    "gpeb_merge_strength",
-                    1.0,
+                    "qbound_merge_strength",
+                    model_cfg.get("gpeb_merge_strength", 1.0),
                 ),
                 split_strength=model_cfg.get(
-                    "gpeb_split_strength",
-                    0.9,
+                    "qbound_split_strength",
+                    model_cfg.get("gpeb_split_strength", 0.9),
                 ),
                 min_event_mass=model_cfg.get(
-                    "gpeb_min_event_mass",
-                    0.25,
-                ),
-                concurrent_temperature=model_cfg.get(
-                    "gpeb_concurrent_temperature",
-                    0.5,
-                ),
-                concurrent_bias_init=model_cfg.get(
-                    "gpeb_concurrent_bias_init",
-                    -2.0,
-                ),
-                concurrent_context_scale=model_cfg.get(
-                    "gpeb_concurrent_context_scale",
-                    0.10,
-                ),
-                concurrent_degree_max=model_cfg.get(
-                    "gpeb_concurrent_degree_max",
-                    1.0,
+                    "qbound_min_event_mass",
+                    model_cfg.get("gpeb_min_event_mass", 0.25),
                 ),
             )
 
-            self.gpeb_detach_backbone_inputs = bool(
-                model_cfg.get(
-                    "gpeb_detach_backbone_inputs",
-                    True,
-                )
+            self.qbound_adapter = CRAQBoundAdapter(
+                embed_dim=embed_dim,
+                dropout=model_cfg.get(
+                    "qbound_adapter_dropout",
+                    model_cfg.get(
+                        "gpeb_residual_dropout",
+                        dropout,
+                    ),
+                ),
+                event_scale_init=model_cfg.get(
+                    "qbound_event_scale_init",
+                    0.0,
+                ),
+                temporal_scale_init=model_cfg.get(
+                    "qbound_temporal_scale_init",
+                    0.0,
+                ),
             )
 
-            self.gpeb_residual_dropout = nn.Dropout(
+            self.qbound_detach_backbone_inputs = bool(
                 model_cfg.get(
-                    "gpeb_residual_dropout",
-                    dropout,
+                    "qbound_detach_backbone_inputs",
+                    model_cfg.get(
+                        "gpeb_detach_backbone_inputs",
+                        True,
+                    ),
                 )
             )
-
-            # Ver1.0 removes the learned channel-wise gate. GPEB can only
-            # change the CRA representation through a smoothly norm-bounded
-            # residual. The default is deliberately below Ver0.5b's 0.15.
-            self.gpeb_residual_max_ratio = float(
-                model_cfg.get(
-                    "gpeb_residual_max_ratio",
-                    0.10,
-                )
-            )
-            if self.gpeb_residual_max_ratio <= 0.0:
-                raise ValueError(
-                    "gpeb_residual_max_ratio must be positive."
-                )
-
-            # Grounding refinement is optional during the first smoke-test
-            # stage. When enabled, no extra gate network is introduced.
-            # The event evidence is mixed with CRA in log-probability space,
-            # and its influence is automatically reduced when the two
-            # distributions disagree.
-            self.gpeb_enable_ground_refinement = bool(
-                model_cfg.get(
-                    "gpeb_enable_ground_refinement",
-                    False,
-                )
-            )
-            self.gpeb_ground_refine_max = float(
-                model_cfg.get(
-                    "gpeb_ground_refine_max",
-                    0.05,
-                )
-            )
-            if not 0.0 <= self.gpeb_ground_refine_max < 1.0:
-                raise ValueError(
-                    "gpeb_ground_refine_max must be in [0, 1)."
-                )
 
     @staticmethod
     def _normalize_video_mask(
@@ -364,8 +351,6 @@ class Decoder(nn.Module):
         )
         normalized = values / denominator.clamp_min(eps)
 
-        # Avoid an all-zero distribution entering log-space refinement.
-        # The fallback is uniform only over valid timesteps.
         fallback = valid_mask.to(values.dtype)
         fallback = fallback / fallback.sum(
             dim=-1,
@@ -403,8 +388,6 @@ class Decoder(nn.Module):
         projected = self.video_proj(pooled)
 
         if do:
-            # Masked mean avoids allowing padded frames to affect the
-            # intervention representation while preserving CRA semantics.
             x_star = self._masked_mean_video(
                 x_bar,
                 valid_mask,
@@ -414,113 +397,66 @@ class Decoder(nn.Module):
 
         return projected
 
-    def _agreement_calibrated_grounding_refinement(
+    def _build_temporal_bias(
         self,
-        cra_key,
-        event_key,
+        event_temporal_logits,
+    ):
+        """
+        CRA-specific temporal contribution.
+
+        QBoundCore produces scale-normalized event evidence.  The adapter
+        contributes a single scalar beta; no per-frame gate or hard cap is
+        introduced in V1.1.
+        """
+        return (
+            self.qbound_adapter.beta
+            * event_temporal_logits
+        )
+
+    def _finalize_counterfactual(
+        self,
+        base_temporal,
+        x_bar,
         valid_mask,
+        do,
+        event_repr,
+        event_temporal_logits,
+        window_sizes,
     ):
         """
-        Parameter-free bounded grounding refinement.
+        Run a merge/split topology through the SAME grounding and fusion
+        machinery used by the original topology.
 
-        CRA and event evidence are geometrically interpolated. The mixing
-        coefficient is the configured upper bound multiplied by the
-        detached Bhattacharyya agreement between the two distributions.
-        Thus GPEB cannot strongly overwrite CRA when its evidence conflicts
-        with the grounding backbone, and no new saturating gate is added.
+        event_repr:
+            [B, D]
+        event_temporal_logits:
+            [B, T]
         """
-        eps = 1e-6
-        cra_key = self._normalize_temporal_distribution(
-            cra_key,
-            valid_mask,
-            eps=eps,
-        )
-        event_key = self._normalize_temporal_distribution(
-            event_key,
-            valid_mask,
-            eps=eps,
+        temporal_bias = self._build_temporal_bias(
+            event_temporal_logits
         )
 
-        agreement = torch.sum(
-            torch.sqrt(
-                cra_key.detach().clamp_min(eps)
-                * event_key.detach().clamp_min(eps)
-            ),
-            dim=-1,
-        ).clamp(min=0.0, max=1.0)
-
-        ground_mix = (
-            self.gpeb_ground_refine_max
-            * agreement
-        )
-
-        mix = ground_mix.unsqueeze(-1)
-        log_refined = (
-            (1.0 - mix) * torch.log(cra_key.clamp_min(eps))
-            + mix * torch.log(event_key.clamp_min(eps))
-        )
-
-        refined_key = torch.exp(log_refined)
-        refined_key = self._normalize_temporal_distribution(
-            refined_key,
-            valid_mask,
-            eps=eps,
-        )
-
-        grounding_shift = 0.5 * torch.sum(
-            torch.abs(refined_key - cra_key),
-            dim=-1,
-        )
-
-        return refined_key, agreement, ground_mix, grounding_shift
-
-    def _smoothly_bound_residual(
-        self,
-        residual,
-        base_feature,
-    ):
-        """
-        Smoothly constrain ||residual|| / ||base|| below max_ratio.
-
-        A tanh saturation is used instead of a hard clip. This preserves a
-        magnitude gradient when the raw residual is too large. At exactly
-        zero residual the scale is explicitly set to one, so the
-        zero-initialized fusion adapter can start learning.
-        """
-        eps = 1e-6
-        base_norm = base_feature.norm(
-            p=2,
-            dim=-1,
-            keepdim=True,
-        ).clamp_min(eps)
-        residual_norm = residual.norm(
-            p=2,
-            dim=-1,
-            keepdim=True,
-        )
-
-        raw_ratio = residual_norm / base_norm
-        bounded_ratio = (
-            self.gpeb_residual_max_ratio
-            * torch.tanh(
-                raw_ratio
-                / self.gpeb_residual_max_ratio
+        cf_time_param = (
+            self.grounding_module.finalize_grounding(
+                base_temporal,
+                temporal_bias=temporal_bias,
+                window_sizes=window_sizes,
             )
         )
 
-        scale = torch.where(
-            raw_ratio > eps,
-            bounded_ratio / raw_ratio.clamp_min(eps),
-            torch.ones_like(raw_ratio),
+        grounded_proj = self._project_grounded_video(
+            x_bar=x_bar,
+            temporal_weights=cf_time_param["key"],
+            valid_mask=valid_mask,
+            do=do,
         )
-        bounded_residual = residual * scale
 
-        return (
-            bounded_residual,
-            raw_ratio.squeeze(-1),
-            bounded_ratio.squeeze(-1),
-            scale.squeeze(-1),
+        fused_proj, _ = self.qbound_adapter.fuse_video(
+            grounded_proj,
+            event_repr,
         )
+
+        return fused_proj, cf_time_param, temporal_bias
 
     def forward(
         self,
@@ -530,10 +466,17 @@ class Decoder(nn.Module):
         gsub=None,
         do=False,
         window_sizes=(1, 3, 5),
-        use_gpeb=False,
+        use_qbound=False,
         question_feature=None,
+        # Compatibility alias for an older direct Decoder caller.
+        use_gpeb=None,
     ):
-        # Preserve pre-refinement features for Q-Bound local change cues.
+        del gsub
+
+        if use_gpeb is not None:
+            use_qbound = bool(use_qbound or use_gpeb)
+
+        # Preserve pre-refinement video tokens for local-change cues.
         x_raw = x
 
         for layer in self.layers:
@@ -548,25 +491,24 @@ class Decoder(nn.Module):
             x_bar.device,
         )
 
-        # CRA remains the grounding backbone. Candidate-conditioned `qa`
-        # is intentionally retained here for baseline compatibility.
-        time_param = self.grounding_module(
-            x_bar,
-            qa,
-            window_sizes=window_sizes,
+        # --------------------------------------------------------------
+        # 1) Compute CRA temporal evidence ONCE, before final grounding.
+        # --------------------------------------------------------------
+        base_temporal = (
+            self.grounding_module.compute_base_temporal(
+                x_bar,
+                qa,
+                valid_mask=valid_mask,
+            )
         )
 
         cra_key = self._normalize_temporal_distribution(
-            time_param["key"],
+            base_temporal["cra_key"],
             valid_mask,
         )
 
-        # Preserve every baseline grounding signal before any Ver1.0
-        # refinement. Current evaluation code expects ori_key to exist.
-        if "ori_key" not in time_param:
-            time_param["ori_key"] = cra_key
-        time_param["cra_key"] = cra_key
-
+        # CRA-only grounded representation is retained for diagnostics and
+        # the original CRA alignment loss.
         cra_video_proj = self._project_grounded_video(
             x_bar=x_bar,
             temporal_weights=cra_key,
@@ -574,214 +516,240 @@ class Decoder(nn.Module):
             do=do,
         )
 
-        # Alignment keeps using the original CRA feature. This prevents
-        # Q-Bound auxiliary/counterfactual objectives from silently changing
-        # the old CRA alignment target.
-        time_param["grounding_feature"] = cra_video_proj
+        qbound_aux = None
+        temporal_bias = torch.zeros_like(
+            base_temporal["cra_temporal_logits"]
+        )
 
-        gpeb_aux = None
-        final_key = cra_key
-        fusion_base_proj = cra_video_proj
-        video_proj = cra_video_proj
-
-        if self.gpeb_enabled and use_gpeb:
+        # --------------------------------------------------------------
+        # 2) Q-Bound learns topology/evidence independently from CRA.
+        # --------------------------------------------------------------
+        if self.qbound_enabled and use_qbound:
             if (
                 question_feature is None
-                and self.gpeb_require_question_only
+                and self.qbound_require_question_only
             ):
                 raise ValueError(
-                    "Q-Bound Ver1.0 requires question_feature=[B, D]. "
-                    "Check models/cra.py and cra_pipeline.py."
+                    "Q-Bound V1.1 requires question_feature=[B,D]. "
+                    "Pass question-only tokens through CRA.forward(..., "
+                    "question=...)."
                 )
 
-            # Compatibility fallback is allowed only when explicitly
-            # configured for an older experiment.
-            gpeb_language = (
+            qbound_language = (
                 question_feature
                 if question_feature is not None
                 else qa
             )
 
-            if self.gpeb_detach_backbone_inputs:
-                raw_for_gpeb = x_raw.detach()
-                contextual_for_gpeb = x_bar.detach()
-                language_for_gpeb = gpeb_language.detach()
-                grounding_for_gpeb = cra_key.detach()
+            if self.qbound_detach_backbone_inputs:
+                video_for_qbound = x_raw.detach()
+                contextual_for_qbound = x_bar.detach()
+                language_for_qbound = qbound_language.detach()
             else:
-                raw_for_gpeb = x_raw
-                contextual_for_gpeb = x_bar
-                language_for_gpeb = gpeb_language
-                grounding_for_gpeb = cra_key
+                video_for_qbound = x_raw
+                contextual_for_qbound = x_bar
+                language_for_qbound = qbound_language
 
-            gpeb_aux = self.gpeb(
-                raw_video=raw_for_gpeb,
-                contextual_video=contextual_for_gpeb,
-                qa_features=language_for_gpeb,
+            qbound_aux = self.qbound(
+                video_tokens=video_for_qbound,
+                question_features=language_for_qbound,
                 video_mask=valid_mask,
-                grounding_weights=grounding_for_gpeb,
+                contextual_tokens=contextual_for_qbound,
+                # QBoundCore detaches the prior internally.  If prior use is
+                # disabled in the core, it becomes an all-zero input feature.
+                temporal_prior=cra_key,
             )
 
-            required_gpeb_keys = {
+            required_keys = {
                 "bridge_repr",
-                "fusion_delta",
+                "event_temporal_logits",
                 "frame_event_relevance",
+                "merge_bridge_repr",
+                "merge_event_temporal_logits",
+                "split_bridge_repr",
+                "split_event_temporal_logits",
             }
-            missing_gpeb_keys = sorted(
-                required_gpeb_keys.difference(gpeb_aux)
+            missing = sorted(
+                required_keys.difference(qbound_aux)
             )
-            if missing_gpeb_keys:
+            if missing:
                 raise KeyError(
-                    "Event Bridge output is missing: "
-                    + ", ".join(missing_gpeb_keys)
+                    "Q-Bound output is missing: "
+                    + ", ".join(missing)
                 )
 
-            bridge_repr = gpeb_aux["bridge_repr"]
-            raw_residual = self.gpeb_residual_dropout(
-                gpeb_aux["fusion_delta"]
+            temporal_bias = self._build_temporal_bias(
+                qbound_aux["event_temporal_logits"]
             )
 
+        # --------------------------------------------------------------
+        # 3) FINAL grounding.  Q-Bound acts BEFORE key/start/end.
+        # --------------------------------------------------------------
+        time_param = self.grounding_module.finalize_grounding(
+            base_temporal,
+            temporal_bias=temporal_bias,
+            window_sizes=window_sizes,
+        )
+
+        final_key = self._normalize_temporal_distribution(
+            time_param["key"],
+            valid_mask,
+        )
+        time_param["key"] = final_key
+        time_param["refined_key"] = final_key
+
+        grounding_base_proj = self._project_grounded_video(
+            x_bar=x_bar,
+            temporal_weights=final_key,
+            valid_mask=valid_mask,
+            do=do,
+        )
+
+        # Preserve the original CRA alignment target as in V1.0.
+        time_param["grounding_feature"] = cra_video_proj
+
+        video_proj = grounding_base_proj
+
+        # --------------------------------------------------------------
+        # 4) Main representation fusion + full main-path counterfactuals.
+        # --------------------------------------------------------------
+        if qbound_aux is not None:
+            video_proj, fusion_info = (
+                self.qbound_adapter.fuse_video(
+                    grounding_base_proj,
+                    qbound_aux["bridge_repr"],
+                )
+            )
+
+            # Event-only distribution is diagnostic only.  It is NOT forced
+            # to agree with CRA and it is never used as a consistency target.
             event_key = self._normalize_temporal_distribution(
-                gpeb_aux["frame_event_relevance"],
+                qbound_aux["frame_event_relevance"],
                 valid_mask,
             )
-            time_param["event_key"] = event_key
 
-            if self.gpeb_enable_ground_refinement:
-                (
-                    final_key,
-                    ground_agreement,
-                    ground_mix,
-                    grounding_shift,
-                ) = self._agreement_calibrated_grounding_refinement(
-                    cra_key=cra_key,
-                    event_key=event_key,
-                    valid_mask=valid_mask,
-                )
-
-                fusion_base_proj = self._project_grounded_video(
+            merge_video_proj, merge_time_param, merge_bias = (
+                self._finalize_counterfactual(
+                    base_temporal=base_temporal,
                     x_bar=x_bar,
-                    temporal_weights=final_key,
                     valid_mask=valid_mask,
                     do=do,
-                )
-            else:
-                ground_agreement = torch.sum(
-                    torch.sqrt(
-                        cra_key.detach().clamp_min(1e-6)
-                        * event_key.detach().clamp_min(1e-6)
+                    event_repr=(
+                        qbound_aux["merge_bridge_repr"][:, 0]
                     ),
-                    dim=-1,
-                ).clamp(min=0.0, max=1.0)
-                ground_mix = torch.zeros_like(
-                    ground_agreement
+                    event_temporal_logits=(
+                        qbound_aux[
+                            "merge_event_temporal_logits"
+                        ][:, 0]
+                    ),
+                    window_sizes=window_sizes,
                 )
-                grounding_shift = torch.zeros_like(
-                    ground_agreement
+            )
+
+            split_video_proj, split_time_param, split_bias = (
+                self._finalize_counterfactual(
+                    base_temporal=base_temporal,
+                    x_bar=x_bar,
+                    valid_mask=valid_mask,
+                    do=do,
+                    event_repr=(
+                        qbound_aux["split_bridge_repr"][:, 0]
+                    ),
+                    event_temporal_logits=(
+                        qbound_aux[
+                            "split_event_temporal_logits"
+                        ][:, 0]
+                    ),
+                    window_sizes=window_sizes,
                 )
-
-            (
-                bounded_residual,
-                residual_ratio_unclipped,
-                residual_ratio,
-                residual_scale,
-            ) = self._smoothly_bound_residual(
-                residual=raw_residual,
-                base_feature=fusion_base_proj,
             )
 
-            video_proj = fusion_base_proj + bounded_residual
+            alpha = self.qbound_adapter.alpha
+            beta = self.qbound_adapter.beta
 
-            branch_cosine = F.cosine_similarity(
-                fusion_base_proj,
-                bridge_repr,
-                dim=-1,
-                eps=1e-6,
-            )
-            cra_branch_cosine = F.cosine_similarity(
-                cra_video_proj,
-                bridge_repr,
-                dim=-1,
-                eps=1e-6,
+            # One diagnostic for when topology-dependent structural training
+            # should become meaningful.  The pipeline may detach/use this
+            # rather than relying on an epoch schedule.
+            qbound_use_strength = 0.5 * (
+                alpha.abs() + beta.abs()
             )
 
-            gpeb_aux.update(
+            qbound_aux.update(
                 {
-                    # Fusion diagnostics. `gated_residual` is retained only
-                    # as a compatibility alias; no learned gate exists.
-                    "bounded_residual": bounded_residual,
-                    "gated_residual": bounded_residual,
-                    "residual_ratio": residual_ratio,
-                    "residual_ratio_mean": residual_ratio.mean(),
-                    "residual_ratio_unclipped": (
-                        residual_ratio_unclipped
+                    # Main-path scalar integration.
+                    "event_scale": (
+                        self.qbound_adapter.event_scale
                     ),
-                    "residual_ratio_unclipped_mean": (
-                        residual_ratio_unclipped.mean()
+                    "temporal_scale": (
+                        self.qbound_adapter.temporal_scale
                     ),
-                    "residual_scale": residual_scale,
-                    "residual_scale_mean": residual_scale.mean(),
-                    # Compatibility alias for the Ver0.5b logger.
-                    "residual_clip_scale": residual_scale,
-                    "residual_clip_scale_mean": (
-                        residual_scale.mean()
-                    ),
-                    "residual_max_ratio": torch.as_tensor(
-                        self.gpeb_residual_max_ratio,
-                        device=video_proj.device,
-                        dtype=video_proj.dtype,
-                    ),
-                    "branch_cosine_similarity": branch_cosine,
-                    "branch_cosine_mean": branch_cosine.mean(),
-                    "cra_branch_cosine_similarity": (
-                        cra_branch_cosine
-                    ),
-                    "cra_branch_cosine_mean": (
-                        cra_branch_cosine.mean()
+                    "alpha": alpha,
+                    "beta": beta,
+                    "qbound_use_strength": (
+                        qbound_use_strength
                     ),
 
-                    # Grounding diagnostics and live distributions used by
-                    # the Ver1.0 consistency/counterfactual losses.
+                    # Original/main path.
                     "cra_key": cra_key,
                     "event_key": event_key,
+                    "final_key": final_key,
                     "refined_key": final_key,
-                    "grounding_agreement": ground_agreement,
-                    "grounding_agreement_mean": (
-                        ground_agreement.mean()
+                    "temporal_bias": temporal_bias,
+                    "cra_video_proj": cra_video_proj,
+                    "grounding_base_proj": (
+                        grounding_base_proj
                     ),
-                    "ground_refine_mix": ground_mix,
-                    "ground_refine_mix_mean": ground_mix.mean(),
-                    "grounding_shift": grounding_shift,
-                    "grounding_shift_mean": (
-                        grounding_shift.mean()
+                    "event_delta": fusion_info[
+                        "event_delta"
+                    ],
+                    "fused_video_proj": video_proj,
+
+                    # Merge counterfactual through the same main path.
+                    "merge_temporal_bias": merge_bias,
+                    "merge_final_key": (
+                        merge_time_param["key"].unsqueeze(1)
                     ),
-                    "ground_refinement_enabled": torch.as_tensor(
-                        float(self.gpeb_enable_ground_refinement),
-                        device=video_proj.device,
-                        dtype=video_proj.dtype,
+                    "merge_start": (
+                        merge_time_param["start"].unsqueeze(1)
                     ),
-                    "ground_refine_max": torch.as_tensor(
-                        self.gpeb_ground_refine_max,
-                        device=video_proj.device,
-                        dtype=video_proj.dtype,
+                    "merge_end": (
+                        merge_time_param["end"].unsqueeze(1)
+                    ),
+                    "merge_fused_video_proj": (
+                        merge_video_proj.unsqueeze(1)
                     ),
 
-                    # Features retained for auxiliary losses/diagnostics.
-                    "cra_video_proj": cra_video_proj,
-                    "fusion_base_proj": fusion_base_proj,
-                    "fused_video_proj": video_proj,
-                    "question_only_conditioning": torch.as_tensor(
-                        float(question_feature is not None),
-                        device=video_proj.device,
-                        dtype=video_proj.dtype,
+                    # Split counterfactual through the same main path.
+                    "split_temporal_bias": split_bias,
+                    "split_final_key": (
+                        split_time_param["key"].unsqueeze(1)
+                    ),
+                    "split_start": (
+                        split_time_param["start"].unsqueeze(1)
+                    ),
+                    "split_end": (
+                        split_time_param["end"].unsqueeze(1)
+                    ),
+                    "split_fused_video_proj": (
+                        split_video_proj.unsqueeze(1)
+                    ),
+
+                    "question_only_conditioning": (
+                        torch.as_tensor(
+                            float(question_feature is not None),
+                            device=video_proj.device,
+                            dtype=video_proj.dtype,
+                        )
                     ),
                 }
             )
 
-        time_param["key"] = final_key
-        time_param["refined_key"] = final_key
-        time_param["gpeb_aux"] = gpeb_aux
+        time_param["qbound_aux"] = qbound_aux
+        time_param["qbound_feature"] = video_proj
 
-        # Kept for compatibility with the current pipeline/model wrapper.
+        # Compatibility aliases for old logging/pipeline code.  These can be
+        # removed after cra_pipeline.py is migrated to V1.1 names.
+        time_param["gpeb_aux"] = qbound_aux
         time_param["gpeb_feature"] = video_proj
 
         return video_proj, final_key, time_param

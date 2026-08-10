@@ -11,11 +11,13 @@ from modules.m_cra.causal_module import LinguisticInterventionGraph
 
 class CRA(nn.Module):
     """
-    CRA with optional Q-Bound Ver1.0 event reasoning.
+    CRA with optional Q-Bound Version 1.1 event topology reasoning.
 
     The original CRA path remains candidate-conditioned for compatibility.
-    Q-Bound receives a separate question-only representation so that learned
-    event boundaries do not directly depend on answer choices.
+    Q-Bound receives a separate question-only representation so event
+    topology does not directly depend on answer choices. Q-Bound itself
+    is implemented independently under modules/qbound; CRA only provides
+    a backbone adapter.
     """
 
     def __init__(self, cfgs, tokenizer) -> None:
@@ -32,17 +34,34 @@ class CRA(nn.Module):
         self.max_feats = dataset_cfg["max_feats"]
         self.n_negs = model_cfg["n_negs"]
 
-        self.gpeb_enabled = bool(
-            model_cfg.get("gpeb_enabled", False)
-        )
-        self.gpeb_version = str(
-            model_cfg.get("gpeb_version", "0.0")
-        )
-        self.gpeb_require_question_only = bool(
+        self.qbound_enabled = bool(
             model_cfg.get(
-                "gpeb_require_question_only",
-                self.gpeb_version.startswith("1"),
+                "qbound_enabled",
+                model_cfg.get("gpeb_enabled", False),
             )
+        )
+        self.qbound_version = str(
+            model_cfg.get(
+                "qbound_version",
+                model_cfg.get("gpeb_version", "1.1"),
+            )
+        )
+        self.qbound_require_question_only = bool(
+            model_cfg.get(
+                "qbound_require_question_only",
+                model_cfg.get(
+                    "gpeb_require_question_only",
+                    True,
+                ),
+            )
+        )
+
+        # Temporary compatibility aliases.  Remove them after the training
+        # pipeline/config has fully migrated to qbound_* naming.
+        self.gpeb_enabled = self.qbound_enabled
+        self.gpeb_version = self.qbound_version
+        self.gpeb_require_question_only = (
+            self.qbound_require_question_only
         )
 
         d_model = model_cfg["d_model"]
@@ -244,8 +263,8 @@ class CRA(nn.Module):
         """
         Refined CRA forward.
 
-        `question` is optional for old experiments, but required by default
-        when gpeb_version starts with "1" and Q-Bound is active.
+        `question` is required by default whenever Q-Bound V1.1 is active,
+        because boundary induction must remain question-only.
         """
         mode = mode.upper()
 
@@ -292,19 +311,19 @@ class CRA(nn.Module):
                     answer_indices,
                 )
 
-        use_gpeb = (
-            self.gpeb_enabled
+        use_qbound = (
+            self.qbound_enabled
             and mode == "VQA"
         )
 
         question_g = None
         question_tokens = None
 
-        if use_gpeb:
+        if use_qbound:
             if question is None:
-                if self.gpeb_require_question_only:
+                if self.qbound_require_question_only:
                     raise ValueError(
-                        "Q-Bound Ver1.0 requires question-only token ids. "
+                        "Q-Bound V1.1 requires question-only token ids. "
                         "Pass them through CRA.forward(..., question=...). "
                         "Do not silently reuse candidate answer features, "
                         "because that would leak answer-choice semantics "
@@ -334,12 +353,13 @@ class CRA(nn.Module):
                 "window_sizes",
                 [1, 3, 5],
             ),
-            use_gpeb=use_gpeb,
+            use_qbound=use_qbound,
             question_feature=question_g,
         )
 
-        # Candidate embeddings are shared by the main scorer and the
-        # bridge-only auxiliary/counterfactual scorers in the pipeline.
+        # Candidate embeddings are used by the main scorer. V1.1
+        # counterfactual video features exposed by the decoder must be
+        # evaluated by this same scorer in cra_pipeline.py.
         answer_proj = answer_g
 
         outs = {
@@ -354,7 +374,9 @@ class CRA(nn.Module):
                 device=video_proj.device,
                 dtype=video_proj.dtype,
             ),
-            "gpeb_active": use_gpeb,
+            "qbound_active": use_qbound,
+            # Compatibility alias for the current V1.0 pipeline.
+            "gpeb_active": use_qbound,
         }
 
         return video_proj, answer_proj, outs

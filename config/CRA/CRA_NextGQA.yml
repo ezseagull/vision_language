@@ -1,10 +1,9 @@
 dataset:
   name: nextgqa
-  # Cập nhật đường dẫn tuyệt đối
   csv_path: /content/data/nextgqa
   features_path: /content/data/nextqa/video_feature/CLIPL
   causal_feature_path: /content/data/nextgqa/causal_feature
-  vocab_path: 
+  vocab_path: null
 
   batch_size: 64
   num_thread_reader: 4
@@ -12,109 +11,90 @@ dataset:
   amax_words: 38
   max_feats: 32
   mc: 5
-  a2id: 
+  a2id: null
   feat_type: CLIPL
 
 model:
   name: CRA
   baseline: refine
+
   lan: RoBERTa
-  lan_weight_path: "roberta-base"
+  lan_weight_path: roberta-base
+
   feature_dim: 768
   word_dim: 768
-  num_layers: 2
-  num_heads: 8
   d_model: 768
   d_ff: 768
+  num_layers: 2
+  num_heads: 8
   dropout: 0.3
   vocab_size: 50265
+
   n_negs: 1
   prop_num: 1
+
   sigma: 3.0
   gamma: 1
   lamb: 0.15
-  window_sizes: [1,3,5]
-  time_penalty: 
-  do: true 
+  window_sizes: [1, 3, 5]
+  time_penalty: null
+
+  do: true
   vg_loss: 1
   vote: 0
 
-  #new module
-  gpeb_enabled: true
-  gpeb_version: "1.0"
-  gpeb_require_question_only: true
-  gpeb_hidden_dim: 256
-  gpeb_num_bins: 4
-  # Learned boundary/event decomposition
-  gpeb_dropout: 0.1
-  gpeb_use_grounding_prior: true
-  gpeb_grounding_prior_clip: 4.0
-  gpeb_grounding_scale_max: 5.0
-  gpeb_boundary_temperature: 0.7
-  gpeb_assignment_temperature: 0.35
-  gpeb_boundary_bias_init: -2.0
-  gpeb_min_event_mass: 0.25
-  gpeb_counterfactual_temperature: 0.15
-  gpeb_merge_strength: 1.0
-  gpeb_split_strength: 0.9
-  gpeb_concurrent_temperature: 0.5
-  gpeb_concurrent_bias_init: -2.0
-  gpeb_concurrent_context_scale: 0.1
-  gpeb_concurrent_degree_max: 1.0
-  gpeb_detach_backbone_inputs: true
-  gpeb_residual_dropout: 0.1
-  gpeb_residual_max_ratio: 0.1
-  gpeb_enable_ground_refinement: true
-  gpeb_ground_refine_max: 0.05
-  gpeb_aux_detach_answer: true
-  gpeb_aux_logit_scale: 10.0
-  gpeb_aux_qa_weight: 0.05
-  gpeb_merge_necessity_weight: 0.1
-  gpeb_split_invariance_weight: 0.05
-  gpeb_ground_consistency_weight: 0.1
-  gpeb_boundary_sparsity_weight: 0.005
-  gpeb_min_event_weight: 0.01
-  gpeb_concurrent_sparsity_weight: 0.002
-  gpeb_min_effective_events: 1.5
-  gpeb_necessity_temperature: 0.25
-  gpeb_merge_ground_harm_scale: 1.0
-  gpeb_split_ground_weight: 1.0
-  gpeb_split_distill_temperature: 1.0
-  gpeb_counterfactual_start_epoch: 2
-  gpeb_counterfactual_ramp_epochs: 3
+  # Q-Bound V1.1.
+  # Defaults for temperatures / merge / split remain inside QBoundCore.
+  qbound:
+    enabled: true
+    version: "1.1"
+    hidden_dim: 256
+    max_events: 4
+
+    # Main V1.1 run: do not feed CRA grounding back into Q-Bound.
+    # This prevents the event topology from learning to copy CRA key.
+    use_temporal_prior: false
 
 optim:
   pipeline: cra
   optimizer: Adam
-  loss: {"ce": {"vq":1, "vqa":1}, "align": {"g": 0.5}}
+
+  # Original CRA objectives stay unchanged.
+  loss:
+    ce:
+      vq: 1
+      vqa: 1
+    align:
+      g: 0.5
+
   clip: 12
   lr: 1.e-5
-  #new module lr
-  gpeb_lr: 5.e-5
-  gpeb_weight_decay: 0
-
-  # gpeb_alpha_lr: 1.e-3
   weight_decay: 0
+  amsgrad: true
+
+  # Only three new optimization hyperparameters in V1.1.
+  qbound_lr: 5.e-5
+  qbound_structural_weight: 0.10
+  qbound_minimality_weight: 0.01
+
   epochs: 30
   save_period: 1
   lr_scheduler: warmup
   step_size: 1
-  amsgrad: true
 
 stat:
   monitor:
     mode: max
     metric: acc
     early_stop: 30
-    vis: false
-    display_port: 8099
-  # Thư mục lưu kết quả / weights
+
+  vis: false
+  display_port: 8099
   record_dir: ./output
-  resume: 
+  resume: null
 
 misc:
-  running_name: 'CRA/NextGQA/GPEB_v1_seed2024'
-  info: "Temp[CLIP] (CRA)"
-  # Đổi ID GPU về 0 cho Colab
+  running_name: CRA/NextGQA/QBound_v1.1_seed2024
+  info: "CRA + Q-Bound V1.1"
   cuda: "0"
   seed: 2024
