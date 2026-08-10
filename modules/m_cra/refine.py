@@ -14,7 +14,6 @@ from modules.m_cra.only_trans import (
 from modules.m_cra.grounding import GroundingModule
 from modules.m_cra.causal_module import VisualIntervention
 from modules.qbound import QBoundCore
-from modules.m_cra.qbound_adapter import CRAQBoundAdapter
 
 class RefineMHA(MultiHeadedAttention):
     def __init__(self, h, d_model, dropout=0.1):
@@ -109,25 +108,31 @@ class DecoderLayer(nn.Module):
 
 class Decoder(nn.Module):
     """
-    CRA refinement decoder with Q-Bound Version 1.1.
+    CRA refinement decoder with Q-Bound Version 1.1.1.
 
-    Responsibilities are deliberately separated:
+    V1.1.1 removes the two shortcut gates used in V1.1:
 
-      * ``QBoundCore`` learns question-conditioned event topology/evidence.
-      * ``GroundingModule`` remains the CRA temporal grounding backbone.
-      * ``CRAQBoundAdapter`` owns the two backbone-specific scalar fusions:
+        z_final = z_grounded + alpha * A(z_event)   [removed]
+        l_final = l_CRA + beta * l_event            [removed]
 
-            z_final = z_grounded + alpha * A(z_event)
-            l_final = l_CRA      + beta  * l_event
+    Q-Bound now has exactly one route into the main task:
 
-    Q-Bound temporal evidence is fused BEFORE the final key/start/end are
-    generated.  Merge/split counterfactuals pass through the same grounding
-    path and the same event adapter as the original path, so the training
-    pipeline can evaluate all of them with the same main VQA scorer.
+        question + video
+            -> Q-Bound event topology
+            -> event temporal evidence
+            -> CRA temporal logits + Q-Bound temporal logits
+            -> final grounding key
+            -> grounded video representation
+            -> main VQA scorer
 
-    At initialization alpha=beta=0 by default, therefore enabling Q-Bound
-    preserves the CRA prediction path while still allowing the two scalar
-    parameters to learn whether event evidence is useful.
+    This prevents the model from improving VQA through a global event
+    representation while ignoring the learned topology, and prevents beta
+    from collapsing to zero.
+
+    Counterfactual training uses only transition-level MERGE from QBoundCore
+    V1.1.1.  Original and merge paths share the same CRA projection dropout
+    realization and the same visual-intervention reference, so measured task
+    harm reflects the topology intervention rather than stochastic dropout.
     """
 
     def __init__(
@@ -161,6 +166,8 @@ class Decoder(nn.Module):
             nn.Softmax(dim=-2),
         )
 
+        # Keep the original parameter names (video_proj.1.weight/bias) so
+        # existing CRA checkpoints remain load-compatible.
         self.video_proj = nn.Sequential(
             nn.Dropout(dropout),
             nn.Linear(embed_dim, embed_dim),
@@ -180,10 +187,7 @@ class Decoder(nn.Module):
         self.do = VisualIntervention(self.cfgs)
 
         # ------------------------------------------------------------------
-        # Q-Bound V1.1
-        #
-        # New qbound_* names are preferred. gpeb_* fallbacks are retained so
-        # the first V1.1 run does not require an immediate full YAML rewrite.
+        # Q-Bound V1.1.1
         # ------------------------------------------------------------------
         self.qbound_enabled = bool(
             qbound_cfg.get(
@@ -209,6 +213,9 @@ class Decoder(nn.Module):
         )
 
         if self.qbound_enabled:
+            # Constructor matches QBoundCore V1.1.1 exactly.
+            # V1.1 parameters counterfactual_temperature / merge_strength /
+            # split_strength no longer exist.
             self.qbound = QBoundCore(
                 input_dim=embed_dim,
                 hidden_dim=qbound_cfg.get(
@@ -275,49 +282,12 @@ class Decoder(nn.Module):
                         ),
                     ),
                 ),
-                counterfactual_temperature=qbound_cfg.get(
-                    "counterfactual_temperature",
-                    model_cfg.get(
-                        "qbound_counterfactual_temperature",
-                        model_cfg.get(
-                            "gpeb_counterfactual_temperature",
-                            0.15,
-                        ),
-                    ),
-                ),
-                merge_strength=qbound_cfg.get(
-                    "merge_strength",
-                    model_cfg.get(
-                        "qbound_merge_strength",
-                        model_cfg.get("gpeb_merge_strength", 1.0),
-                    ),
-                ),
-                split_strength=qbound_cfg.get(
-                    "split_strength",
-                    model_cfg.get(
-                        "qbound_split_strength",
-                        model_cfg.get("gpeb_split_strength", 0.9),
-                    ),
-                ),
                 min_event_mass=qbound_cfg.get(
                     "min_event_mass",
                     model_cfg.get(
                         "qbound_min_event_mass",
                         model_cfg.get("gpeb_min_event_mass", 0.25),
                     ),
-                ),
-            )
-
-            self.qbound_adapter = CRAQBoundAdapter(
-                embed_dim=embed_dim,
-                dropout=0.0,
-                event_scale_init=qbound_cfg.get(
-                    "event_scale_init",
-                    model_cfg.get("qbound_event_scale_init", 0.0),
-                ),
-                temporal_scale_init=qbound_cfg.get(
-                    "temporal_scale_init",
-                    model_cfg.get("qbound_temporal_scale_init", 0.0),
                 ),
             )
 
@@ -413,43 +383,108 @@ class Decoder(nn.Module):
             / weights.sum(dim=1).clamp_min(1.0)
         )
 
+    def _sample_projection_dropout_mask(
+        self,
+        reference,
+    ):
+        """
+        Sample ONE CRA video-projection dropout realization.
+
+        The same mask is reused for original and merge representations.
+        This preserves the marginal behavior of nn.Dropout while preventing
+        counterfactual task harm from being caused by different random masks.
+        """
+        dropout_layer = self.video_proj[0]
+
+        if (
+            not self.training
+            or dropout_layer.p <= 0.0
+        ):
+            return torch.ones_like(reference)
+
+        keep_prob = 1.0 - float(dropout_layer.p)
+        if keep_prob <= 0.0:
+            raise ValueError(
+                "video projection dropout must be < 1."
+            )
+
+        mask = torch.empty_like(reference).bernoulli_(keep_prob)
+        return mask / keep_prob
+
+    def _apply_video_projection(
+        self,
+        pooled,
+        dropout_mask,
+    ):
+        """
+        Apply the original Dropout -> Linear projection with an externally
+        supplied dropout realization. Parameter names/checkpoint layout stay
+        unchanged because the Linear remains self.video_proj[1].
+        """
+        if pooled.shape != dropout_mask.shape:
+            raise ValueError(
+                "pooled representation and dropout mask must have the "
+                f"same shape, got {tuple(pooled.shape)} and "
+                f"{tuple(dropout_mask.shape)}."
+            )
+
+        return self.video_proj[1](
+            pooled * dropout_mask
+        )
+
     def _project_grounded_video(
         self,
         x_bar,
         temporal_weights,
         valid_mask,
         do,
+        projection_dropout_mask,
+        x_star_proj=None,
     ):
         pooled = torch.sum(
             x_bar * temporal_weights.unsqueeze(-1),
             dim=1,
         )
-        projected = self.video_proj(pooled)
+
+        projected = self._apply_video_projection(
+            pooled,
+            projection_dropout_mask,
+        )
 
         if do:
-            x_star = self._masked_mean_video(
-                x_bar,
-                valid_mask,
+            if x_star_proj is None:
+                raise ValueError(
+                    "x_star_proj is required when visual intervention is on."
+                )
+            projected = self.do(
+                x_star_proj,
+                projected,
             )
-            x_star = self.video_proj(x_star)
-            projected = self.do(x_star, projected)
 
         return projected
 
+    @staticmethod
     def _build_temporal_bias(
-        self,
         event_temporal_logits,
+        valid_mask,
     ):
         """
-        CRA-specific temporal contribution.
+        Direct Q-Bound temporal contribution in V1.1.1.
 
-        QBoundCore produces scale-normalized event evidence.  The adapter
-        contributes a single scalar beta; no per-frame gate or hard cap is
-        introduced in V1.1.
+        There is deliberately NO beta gate. QBoundCore initializes its final
+        temporal scorer near zero, so the correction starts small but receives
+        main-task gradient directly.
         """
+        if event_temporal_logits.shape != valid_mask.shape:
+            raise ValueError(
+                "event_temporal_logits must be [B,T] and match valid_mask. "
+                f"Got {tuple(event_temporal_logits.shape)} and "
+                f"{tuple(valid_mask.shape)}."
+            )
+
         return (
-            self.qbound_adapter.beta
-            * event_temporal_logits
+            event_temporal_logits
+            * valid_mask.to(event_temporal_logits.dtype)
         )
 
     def _finalize_counterfactual(
@@ -458,44 +493,45 @@ class Decoder(nn.Module):
         x_bar,
         valid_mask,
         do,
-        event_repr,
         event_temporal_logits,
         window_sizes,
+        projection_dropout_mask,
+        x_star_proj,
     ):
         """
-        Run a merge/split topology through the SAME grounding and fusion
-        machinery used by the original topology.
+        Run the transition-level merge through exactly the same grounding and
+        video-projection path as the original topology.
 
-        event_repr:
-            [B, D]
-        event_temporal_logits:
-            [B, T]
+        No bridge representation and no alpha residual are used.
         """
         temporal_bias = self._build_temporal_bias(
-            event_temporal_logits
+            event_temporal_logits,
+            valid_mask,
         )
 
-        cf_time_param = (
-            self.grounding_module.finalize_grounding(
-                base_temporal,
-                temporal_bias=temporal_bias,
-                window_sizes=window_sizes,
-            )
+        cf_time_param = self.grounding_module.finalize_grounding(
+            base_temporal,
+            temporal_bias=temporal_bias,
+            window_sizes=window_sizes,
         )
 
-        grounded_proj = self._project_grounded_video(
+        cf_key = self._normalize_temporal_distribution(
+            cf_time_param["key"],
+            valid_mask,
+        )
+        cf_time_param["key"] = cf_key
+        cf_time_param["refined_key"] = cf_key
+
+        projected = self._project_grounded_video(
             x_bar=x_bar,
-            temporal_weights=cf_time_param["key"],
+            temporal_weights=cf_key,
             valid_mask=valid_mask,
             do=do,
+            projection_dropout_mask=projection_dropout_mask,
+            x_star_proj=x_star_proj,
         )
 
-        fused_proj, _ = self.qbound_adapter.fuse_video(
-            grounded_proj,
-            event_repr,
-        )
-
-        return fused_proj, cf_time_param, temporal_bias
+        return projected, cf_time_param, temporal_bias
 
     def forward(
         self,
@@ -507,13 +543,15 @@ class Decoder(nn.Module):
         window_sizes=(1, 3, 5),
         use_qbound=False,
         question_feature=None,
-        # Compatibility alias for an older direct Decoder caller.
+        # Temporary compatibility alias for an older direct Decoder caller.
         use_gpeb=None,
     ):
         del gsub
 
         if use_gpeb is not None:
-            use_qbound = bool(use_qbound or use_gpeb)
+            use_qbound = bool(
+                use_qbound or use_gpeb
+            )
 
         # Preserve pre-refinement video tokens for local-change cues.
         x_raw = x
@@ -531,14 +569,12 @@ class Decoder(nn.Module):
         )
 
         # --------------------------------------------------------------
-        # 1) Compute CRA temporal evidence ONCE, before final grounding.
+        # 1) CRA temporal evidence, computed once.
         # --------------------------------------------------------------
-        base_temporal = (
-            self.grounding_module.compute_base_temporal(
-                x_bar,
-                qa,
-                valid_mask=valid_mask,
-            )
+        base_temporal = self.grounding_module.compute_base_temporal(
+            x_bar,
+            qa,
+            valid_mask=valid_mask,
         )
 
         cra_key = self._normalize_temporal_distribution(
@@ -546,13 +582,40 @@ class Decoder(nn.Module):
             valid_mask,
         )
 
-        # CRA-only grounded representation is retained for diagnostics and
-        # the original CRA alignment loss.
+        # One shared stochastic projection context for CRA / original / merge.
+        projection_reference = self._masked_mean_video(
+            x_bar,
+            valid_mask,
+        )
+        projection_dropout_mask = (
+            self._sample_projection_dropout_mask(
+                projection_reference
+            )
+        )
+
+        x_star_proj = None
+        if do:
+            # x_star is topology-independent, so compute it exactly once and
+            # reuse it for CRA, original, and merge intervention paths.
+            x_star_dropout_mask = (
+                self._sample_projection_dropout_mask(
+                    projection_reference
+                )
+            )
+            x_star_proj = self._apply_video_projection(
+                projection_reference,
+                x_star_dropout_mask,
+            )
+
+        # CRA-only representation is retained only for the original CRA
+        # alignment objective and diagnostics.
         cra_video_proj = self._project_grounded_video(
             x_bar=x_bar,
             temporal_weights=cra_key,
             valid_mask=valid_mask,
             do=do,
+            projection_dropout_mask=projection_dropout_mask,
+            x_star_proj=x_star_proj,
         )
 
         qbound_aux = None
@@ -561,7 +624,7 @@ class Decoder(nn.Module):
         )
 
         # --------------------------------------------------------------
-        # 2) Q-Bound learns topology/evidence independently from CRA.
+        # 2) Question-conditioned Q-Bound topology.
         # --------------------------------------------------------------
         if self.qbound_enabled and use_qbound:
             if (
@@ -569,7 +632,7 @@ class Decoder(nn.Module):
                 and self.qbound_require_question_only
             ):
                 raise ValueError(
-                    "Q-Bound V1.1 requires question_feature=[B,D]. "
+                    "Q-Bound V1.1.1 requires question_feature=[B,D]. "
                     "Pass question-only tokens through CRA.forward(..., "
                     "question=...)."
                 )
@@ -594,35 +657,39 @@ class Decoder(nn.Module):
                 question_features=language_for_qbound,
                 video_mask=valid_mask,
                 contextual_tokens=contextual_for_qbound,
-                # QBoundCore detaches the prior internally.  If prior use is
-                # disabled in the core, it becomes an all-zero input feature.
+                # QBoundCore detaches this internally. With
+                # use_temporal_prior:false it becomes exact zeros.
                 temporal_prior=cra_key,
             )
 
             required_keys = {
-                "bridge_repr",
                 "event_temporal_logits",
                 "frame_event_relevance",
-                "merge_bridge_repr",
                 "merge_event_temporal_logits",
-                "split_bridge_repr",
-                "split_event_temporal_logits",
+                "merge_transition_selector",
+                "selected_transition_strength",
+                "selected_transition_mass",
+                "removed_boundary_mass",
             }
             missing = sorted(
                 required_keys.difference(qbound_aux)
             )
             if missing:
                 raise KeyError(
-                    "Q-Bound output is missing: "
+                    "Q-Bound V1.1.1 output is missing: "
                     + ", ".join(missing)
                 )
 
             temporal_bias = self._build_temporal_bias(
-                qbound_aux["event_temporal_logits"]
+                qbound_aux["event_temporal_logits"],
+                valid_mask,
             )
 
         # --------------------------------------------------------------
-        # 3) FINAL grounding.  Q-Bound acts BEFORE key/start/end.
+        # 3) Final main grounding.
+        #
+        # Q-Bound has ONE route into the task:
+        #   CRA logits + event temporal logits -> final key -> main video.
         # --------------------------------------------------------------
         time_param = self.grounding_module.finalize_grounding(
             base_temporal,
@@ -637,31 +704,23 @@ class Decoder(nn.Module):
         time_param["key"] = final_key
         time_param["refined_key"] = final_key
 
-        grounding_base_proj = self._project_grounded_video(
+        video_proj = self._project_grounded_video(
             x_bar=x_bar,
             temporal_weights=final_key,
             valid_mask=valid_mask,
             do=do,
+            projection_dropout_mask=projection_dropout_mask,
+            x_star_proj=x_star_proj,
         )
 
-        # Preserve the original CRA alignment target as in V1.0.
+        # Preserve the original CRA alignment target. Q-Bound does not alter
+        # the target used by the existing CRA alignment objective.
         time_param["grounding_feature"] = cra_video_proj
 
-        video_proj = grounding_base_proj
-
         # --------------------------------------------------------------
-        # 4) Main representation fusion + full main-path counterfactuals.
+        # 4) Transition-level merge counterfactual through the SAME path.
         # --------------------------------------------------------------
         if qbound_aux is not None:
-            video_proj, fusion_info = (
-                self.qbound_adapter.fuse_video(
-                    grounding_base_proj,
-                    qbound_aux["bridge_repr"],
-                )
-            )
-
-            # Event-only distribution is diagnostic only.  It is NOT forced
-            # to agree with CRA and it is never used as a consistency target.
             event_key = self._normalize_temporal_distribution(
                 qbound_aux["frame_event_relevance"],
                 valid_mask,
@@ -673,61 +732,19 @@ class Decoder(nn.Module):
                     x_bar=x_bar,
                     valid_mask=valid_mask,
                     do=do,
-                    event_repr=(
-                        qbound_aux["merge_bridge_repr"][:, 0]
-                    ),
                     event_temporal_logits=(
                         qbound_aux[
                             "merge_event_temporal_logits"
                         ][:, 0]
                     ),
                     window_sizes=window_sizes,
+                    projection_dropout_mask=projection_dropout_mask,
+                    x_star_proj=x_star_proj,
                 )
-            )
-
-            split_video_proj, split_time_param, split_bias = (
-                self._finalize_counterfactual(
-                    base_temporal=base_temporal,
-                    x_bar=x_bar,
-                    valid_mask=valid_mask,
-                    do=do,
-                    event_repr=(
-                        qbound_aux["split_bridge_repr"][:, 0]
-                    ),
-                    event_temporal_logits=(
-                        qbound_aux[
-                            "split_event_temporal_logits"
-                        ][:, 0]
-                    ),
-                    window_sizes=window_sizes,
-                )
-            )
-
-            alpha = self.qbound_adapter.alpha
-            beta = self.qbound_adapter.beta
-
-            # One diagnostic for when topology-dependent structural training
-            # should become meaningful.  The pipeline may detach/use this
-            # rather than relying on an epoch schedule.
-            qbound_use_strength = 0.5 * (
-                alpha.abs() + beta.abs()
             )
 
             qbound_aux.update(
                 {
-                    # Main-path scalar integration.
-                    "event_scale": (
-                        self.qbound_adapter.event_scale
-                    ),
-                    "temporal_scale": (
-                        self.qbound_adapter.temporal_scale
-                    ),
-                    "alpha": alpha,
-                    "beta": beta,
-                    "qbound_use_strength": (
-                        qbound_use_strength
-                    ),
-
                     # Original/main path.
                     "cra_key": cra_key,
                     "event_key": event_key,
@@ -735,15 +752,9 @@ class Decoder(nn.Module):
                     "refined_key": final_key,
                     "temporal_bias": temporal_bias,
                     "cra_video_proj": cra_video_proj,
-                    "grounding_base_proj": (
-                        grounding_base_proj
-                    ),
-                    "event_delta": fusion_info[
-                        "event_delta"
-                    ],
-                    "fused_video_proj": video_proj,
+                    "main_video_proj": video_proj,
 
-                    # Merge counterfactual through the same main path.
+                    # Transition-level merge through the same main path.
                     "merge_temporal_bias": merge_bias,
                     "merge_final_key": (
                         merge_time_param["key"].unsqueeze(1)
@@ -754,41 +765,30 @@ class Decoder(nn.Module):
                     "merge_end": (
                         merge_time_param["end"].unsqueeze(1)
                     ),
-                    "merge_fused_video_proj": (
+                    "merge_video_proj": (
                         merge_video_proj.unsqueeze(1)
                     ),
 
-                    # Split counterfactual through the same main path.
-                    "split_temporal_bias": split_bias,
-                    "split_final_key": (
-                        split_time_param["key"].unsqueeze(1)
-                    ),
-                    "split_start": (
-                        split_time_param["start"].unsqueeze(1)
-                    ),
-                    "split_end": (
-                        split_time_param["end"].unsqueeze(1)
-                    ),
-                    "split_fused_video_proj": (
-                        split_video_proj.unsqueeze(1)
+                    # Useful direct diagnostic of how much the topology
+                    # intervention changed final temporal grounding.
+                    "merge_key_l1": (
+                        (
+                            merge_time_param["key"]
+                            - final_key
+                        )
+                        .abs()
+                        .mean(dim=-1)
                     ),
 
-                    "question_only_conditioning": (
-                        torch.as_tensor(
-                            float(question_feature is not None),
-                            device=video_proj.device,
-                            dtype=video_proj.dtype,
-                        )
+                    "question_only_conditioning": torch.as_tensor(
+                        float(question_feature is not None),
+                        device=video_proj.device,
+                        dtype=video_proj.dtype,
                     ),
                 }
             )
 
         time_param["qbound_aux"] = qbound_aux
         time_param["qbound_feature"] = video_proj
-
-        # Compatibility aliases for old logging/pipeline code.  These can be
-        # removed after cra_pipeline.py is migrated to V1.1 names.
-        time_param["gpeb_aux"] = qbound_aux
-        time_param["gpeb_feature"] = video_proj
 
         return video_proj, final_key, time_param

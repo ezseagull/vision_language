@@ -21,30 +21,32 @@ from utils.misc.misc import (
 
 class CRAPipeline(BasePipeline):
     """
-    CRA training pipeline with Q-Bound Version 1.1.
+    CRA training pipeline with Q-Bound Version 1.1.1.
 
-    V1.1 removes the Ver1.0 auxiliary QA head, CRA-grounding consistency,
-    global boundary sparsity, minimum-event protection, concurrent sparsity,
-    and epoch-based counterfactual ramp.
+    V1.1.1 deliberately simplifies the Q-Bound objective.
 
-    The main principle is:
+    Main path:
+        question + video
+            -> Q-Bound event topology
+            -> event temporal evidence
+            -> CRA temporal logits + Q-Bound temporal logits
+            -> final grounding
+            -> SAME main VQA scorer
 
-        original / merge / split
-            -> the SAME CRA-QBound integration
-            -> the SAME main answer scorer
+    Counterfactual path:
+        remove the strongest learned EVENT TRANSITION
+            -> recompute Q-Bound temporal evidence
+            -> SAME grounding path
+            -> SAME main VQA scorer
 
-    Merge necessity is measured by the increase in the actual VQA CE after
-    removing the selected boundary.  The observed harm is detached before
-    supervising boundary strength, so the model cannot reduce the objective by
-    intentionally damaging the merge branch.
+    The only Q-Bound training objective is transition-necessity calibration:
 
-    Minimality only penalizes a selected boundary when its detached task-level
-    necessity is low.
+        harm = CE_merge - CE_original
+        necessity = 1 - exp(-relu(harm))
+        L_qbound = BCE(selected_transition_strength, stopgrad(necessity))
 
-    Both structural verification and minimality are activated by the detached
-    main-task usage strength of Q-Bound.  This is essential at initialization:
-    alpha=beta=0 preserves the CRA baseline, and Q-Bound is not sparsified
-    before the main task has started to use it.
+    There is no alpha/beta gate, no split loss, no separate minimality loss,
+    no auxiliary answer head, and no CRA-grounding consistency loss.
     """
 
     def __init__(self, cfgs) -> None:
@@ -71,7 +73,7 @@ class CRAPipeline(BasePipeline):
         )
 
     def _get_qbound_aux(self, gqa_output):
-        """Safely extract Q-Bound V1.1 outputs from a CRA VQA forward."""
+        """Safely extract Q-Bound V1.1.1 outputs from a CRA VQA forward."""
         if not self._qbound_enabled():
             return None
 
@@ -121,7 +123,7 @@ class CRAPipeline(BasePipeline):
             [B, C] or [B, M, C]
 
         `prop_num` aggregation is exactly the same operation used by the main
-        VQA path.  V1.1 counterfactuals therefore do not use a separate
+        VQA path.  V1.1.1 counterfactuals therefore do not use a separate
         auxiliary answer head.
         """
         if answer_proj.ndim != 3:
@@ -234,7 +236,7 @@ class CRAPipeline(BasePipeline):
         eps=1e-8,
     ):
         """
-        Diagnostic only in V1.1.
+        Diagnostic only in V1.1.1.
 
         There is NO CRA-event grounding consistency loss.
         """
@@ -271,9 +273,9 @@ class CRAPipeline(BasePipeline):
         return 0.5 * (first_kl + second_kl)
 
     # ------------------------------------------------------------------
-    # Q-Bound V1.1 losses
+    # Q-Bound V1.1.1 loss
     # ------------------------------------------------------------------
-    def _compute_qbound_v11_losses(
+    def _compute_qbound_v111_loss(
         self,
         gqa_output,
         answer_proj,
@@ -281,49 +283,62 @@ class CRAPipeline(BasePipeline):
         main_logits,
     ):
         """
-        Compute the two V1.1 objectives:
+        Transition-level necessity calibration.
 
-            L_struct = 0.5 * (L_merge + L_split)
+        Let s be the strength of the strongest learned event transition.
+        QBoundCore removes that whole transition and refine.py recomputes the
+        merge representation through the SAME main grounding path.
 
-            L_min = b_selected * (1 - stopgrad(n_selected))
+        Per sample:
 
-        where selected-boundary necessity is derived from the ACTUAL main VQA
-        risk:
+            L_original = CE(main_logits, y)
+            L_merge    = CE(merge_logits, y)
 
-            harm = CE_merge - CE_original
-            n    = 1 - exp(-relu(harm))
+            harm = L_merge - L_original
 
-        No extra necessity-temperature hyperparameter is required.
+            necessity =
+                1 - exp(-relu(harm))
 
-        Only one boundary is counterfactually removed by QBoundCore V1.1.
-        Therefore minimality is applied to the selected boundary. Across
-        iterations, an unnecessary strongest boundary is pushed down and the
-        selector can move to the next one.
+        `necessity` is detached. Therefore the model cannot reduce this
+        objective by intentionally changing the merge risk target itself.
 
-        Structural/minimality weights are applied outside this method.
+        The single Q-Bound objective is:
+
+            BCE(
+                selected_transition_strength,
+                stopgrad(necessity)
+            )
+
+        This replaces V1.1's split invariance + selected-frame minimality.
         """
-        qbound_aux = self._get_qbound_aux(gqa_output)
+        qbound_aux = self._get_qbound_aux(
+            gqa_output
+        )
         if qbound_aux is None:
-            return {}, {}
+            return None, {}
 
         required_keys = {
-            "merge_fused_video_proj",
-            "split_fused_video_proj",
-            "boundary_mass",
-            "merge_selector",
-            "qbound_use_strength",
+            "merge_video_proj",
+            "selected_transition_strength",
+            "selected_transition_mass",
+            "removed_boundary_mass",
+            "merge_transition_selector",
             "cra_video_proj",
-            "event_delta",
             "cra_key",
             "event_key",
             "final_key",
+            "merge_final_key",
+            "merge_key_l1",
         }
+
         missing = sorted(
-            required_keys.difference(qbound_aux)
+            required_keys.difference(
+                qbound_aux
+            )
         )
         if missing:
             raise KeyError(
-                "Missing Q-Bound V1.1 outputs: "
+                "Missing Q-Bound V1.1.1 outputs: "
                 + ", ".join(missing)
             )
 
@@ -337,20 +352,13 @@ class CRAPipeline(BasePipeline):
                 "answer_id size does not match main VQA logits."
             )
 
-        # Counterfactuals use the same answer-scoring rule as the main path.
-        # Candidate features are detached ONLY to keep structural regularizers
-        # from modifying the language encoder; there is no auxiliary scorer.
+        # Same answer candidate embeddings and exact same scoring rule
+        # as the original VQA path. Answer embeddings are detached only
+        # for the counterfactual regularizer.
         merge_logits = self._score_answer_candidates(
             answer_proj=answer_proj,
             representation=qbound_aux[
-                "merge_fused_video_proj"
-            ],
-            detach_answer=True,
-        )
-        split_logits = self._score_answer_candidates(
-            answer_proj=answer_proj,
-            representation=qbound_aux[
-                "split_fused_video_proj"
+                "merge_video_proj"
             ],
             detach_answer=True,
         )
@@ -361,27 +369,48 @@ class CRAPipeline(BasePipeline):
             reduction="none",
         )
 
-        num_merge = merge_logits.size(1)
-        merge_labels = labels.unsqueeze(1).expand(
-            -1,
-            num_merge,
+        if merge_logits.ndim == 2:
+            merge_ce = F.cross_entropy(
+                merge_logits,
+                labels,
+                reduction="none",
+            )
+            merge_pred_logits = merge_logits
+        elif merge_logits.ndim == 3:
+            # Current core emits one transition-level merge [B,1,D].
+            # Keep this robust if later we vectorize several transitions.
+            num_merge = merge_logits.size(1)
+            merge_labels = labels.unsqueeze(1).expand(
+                -1,
+                num_merge,
+            )
+
+            merge_ce = F.cross_entropy(
+                merge_logits.reshape(
+                    -1,
+                    merge_logits.size(-1),
+                ),
+                merge_labels.reshape(-1),
+                reduction="none",
+            ).reshape(
+                labels.size(0),
+                num_merge,
+            ).mean(dim=1)
+
+            merge_pred_logits = merge_logits.mean(
+                dim=1
+            )
+        else:
+            raise ValueError(
+                "merge logits must be [B,C] or [B,M,C], got "
+                f"{tuple(merge_logits.shape)}."
+            )
+
+        answer_harm = (
+            merge_ce - original_ce
         )
 
-        merge_ce = F.cross_entropy(
-            merge_logits.reshape(
-                -1,
-                merge_logits.size(-1),
-            ),
-            merge_labels.reshape(-1),
-            reduction="none",
-        ).reshape(
-            labels.size(0),
-            num_merge,
-        ).mean(dim=1)
-
-        answer_harm = merge_ce - original_ce
-
-        # Parameter-free [0,1) necessity mapping.
+        # Parameter-free [0,1) task-necessity target.
         necessity_target = (
             1.0
             - torch.exp(
@@ -389,125 +418,79 @@ class CRAPipeline(BasePipeline):
             )
         ).detach()
 
-        # Do not allow the straight-through selector to move merely to reduce
-        # the calibration/minimality objective.  The selected intervention is
-        # fixed for these two losses; gradients act on boundary strength.
-        merge_selector = qbound_aux[
-            "merge_selector"
-        ].squeeze(1).detach()
-
-        boundary_mass = qbound_aux[
-            "boundary_mass"
-        ]
-
-        selected_boundary_strength = torch.sum(
-            merge_selector * boundary_mass,
-            dim=-1,
-        ).clamp(
-            min=1e-6,
-            max=1.0 - 1e-6,
+        selected_transition_strength = (
+            qbound_aux[
+                "selected_transition_strength"
+            ]
+            .reshape(-1)
+            .clamp(
+                min=1e-6,
+                max=1.0 - 1e-6,
+            )
         )
 
-        # Merge component: calibrate the selected boundary to observed
-        # task-level necessity; do NOT deliberately make merge predictions bad.
-        merge_necessity_loss = F.binary_cross_entropy(
-            selected_boundary_strength,
+        if (
+            selected_transition_strength.numel()
+            != labels.numel()
+        ):
+            raise ValueError(
+                "selected_transition_strength must contain "
+                "one value per sample."
+            )
+
+        # The selector is deterministic and non-learned. The loss calibrates
+        # the strength of the selected event transition to its observed
+        # task-level necessity.
+        necessity_loss = F.binary_cross_entropy(
+            selected_transition_strength,
             necessity_target,
         )
 
-        # Split component: adding an unnecessary within-event boundary should
-        # preserve the ACTUAL main answer distribution.
-        original_distribution = F.softmax(
-            main_logits.detach(),
-            dim=-1,
-        )
-
-        split_log_distribution = F.log_softmax(
-            split_logits,
-            dim=-1,
-        )
-
-        split_invariance_loss = F.kl_div(
-            split_log_distribution,
-            original_distribution.unsqueeze(1).expand_as(
-                split_log_distribution
-            ),
-            reduction="none",
-        ).sum(dim=-1).mean()
-
-        structural_loss = 0.5 * (
-            merge_necessity_loss
-            + split_invariance_loss
-        )
-
-        # Necessity-aware minimality for the currently selected boundary.
-        minimality_loss = (
-            selected_boundary_strength
-            * (
-                1.0
-                - necessity_target
-            )
-        ).mean()
-
-        # Q-Bound must first become useful to the main path.  Gating BOTH
-        # structural and minimality objectives avoids reproducing Ver1.0's
-        # one-event collapse when alpha=beta=0.
-        use_strength = qbound_aux[
-            "qbound_use_strength"
-        ].detach().float().clamp(
-            min=0.0,
-            max=1.0,
-        )
-
-        # Diagnostics: all use the same answer candidate embeddings/scorer.
         with torch.no_grad():
             original_pred = main_logits.argmax(
                 dim=-1
             )
-            merge_pred = merge_logits.mean(
-                dim=1
-            ).argmax(dim=-1)
-            split_pred = split_logits.mean(
-                dim=1
-            ).argmax(dim=-1)
-
-            base_logits = self._score_answer_candidates(
-                answer_proj=answer_proj,
-                representation=qbound_aux[
-                    "cra_video_proj"
-                ],
-                detach_answer=True,
-            )
-            event_only_logits = self._score_answer_candidates(
-                answer_proj=answer_proj,
-                representation=qbound_aux[
-                    "event_delta"
-                ],
-                detach_answer=True,
+            merge_pred = merge_pred_logits.argmax(
+                dim=-1
             )
 
-            base_pred = base_logits.argmax(dim=-1)
-            event_pred = event_only_logits.argmax(dim=-1)
+            base_logits = (
+                self._score_answer_candidates(
+                    answer_proj=answer_proj,
+                    representation=qbound_aux[
+                        "cra_video_proj"
+                    ],
+                    detach_answer=True,
+                )
+            )
+            base_pred = base_logits.argmax(
+                dim=-1
+            )
 
-            cra_event_js = self._js_divergence(
-                qbound_aux["cra_key"],
-                qbound_aux["event_key"],
-            ).mean()
+            cra_event_js = (
+                self._js_divergence(
+                    qbound_aux["cra_key"],
+                    qbound_aux["event_key"],
+                ).mean()
+            )
 
-            cra_final_js = self._js_divergence(
-                qbound_aux["cra_key"],
-                qbound_aux["final_key"],
-            ).mean()
+            cra_final_js = (
+                self._js_divergence(
+                    qbound_aux["cra_key"],
+                    qbound_aux["final_key"],
+                ).mean()
+            )
 
-        losses = {
-            "qbound_structural_loss": structural_loss,
-            "qbound_minimality_loss": minimality_loss,
-        }
+            merge_final_js = (
+                self._js_divergence(
+                    qbound_aux["final_key"],
+                    qbound_aux[
+                        "merge_final_key"
+                    ].squeeze(1),
+                ).mean()
+            )
 
         logs = {
-            "qbound_use_weight": float(
-                use_strength.item()
-            ),
             "qbound_original_acc": (
                 (original_pred == labels)
                 .float().mean().item()
@@ -516,39 +499,57 @@ class CRAPipeline(BasePipeline):
                 (base_pred == labels)
                 .float().mean().item()
             ),
-            "qbound_event_only_acc": (
-                (event_pred == labels)
-                .float().mean().item()
-            ),
             "qbound_merge_acc": (
                 (merge_pred == labels)
                 .float().mean().item()
             ),
-            "qbound_split_acc": (
-                (split_pred == labels)
-                .float().mean().item()
-            ),
             "qbound_original_ce": (
-                original_ce.detach().mean().item()
-            ),
-            "qbound_merge_ce": (
-                merge_ce.detach().mean().item()
-            ),
-            "qbound_answer_harm": (
-                answer_harm.detach().mean().item()
-            ),
-            "qbound_necessity": (
-                necessity_target.mean().item()
-            ),
-            "qbound_selected_boundary_strength": (
-                selected_boundary_strength.detach()
+                original_ce.detach()
                 .mean().item()
             ),
-            "qbound_merge_necessity_loss_raw": (
-                merge_necessity_loss.detach().item()
+            "qbound_merge_ce": (
+                merge_ce.detach()
+                .mean().item()
             ),
-            "qbound_split_invariance_loss_raw": (
-                split_invariance_loss.detach().item()
+            "qbound_answer_harm": (
+                answer_harm.detach()
+                .mean().item()
+            ),
+            "qbound_positive_harm_ratio": (
+                (answer_harm > 0)
+                .float().mean().item()
+            ),
+            "qbound_necessity": (
+                necessity_target
+                .mean().item()
+            ),
+            "qbound_selected_transition_strength": (
+                selected_transition_strength
+                .detach().mean().item()
+            ),
+            "qbound_selected_transition_mass": (
+                qbound_aux[
+                    "selected_transition_mass"
+                ]
+                .detach().float()
+                .mean().item()
+            ),
+            "qbound_removed_boundary_mass": (
+                qbound_aux[
+                    "removed_boundary_mass"
+                ]
+                .detach().float()
+                .mean().item()
+            ),
+            "qbound_merge_key_l1": (
+                qbound_aux[
+                    "merge_key_l1"
+                ]
+                .detach().float()
+                .mean().item()
+            ),
+            "qbound_necessity_loss_raw": (
+                necessity_loss.detach().item()
             ),
             "qbound_cra_event_js": (
                 cra_event_js.detach().item()
@@ -556,72 +557,51 @@ class CRAPipeline(BasePipeline):
             "qbound_cra_final_js": (
                 cra_final_js.detach().item()
             ),
+            "qbound_original_merge_js": (
+                merge_final_js.detach().item()
+            ),
         }
 
-        return losses, logs
+        return necessity_loss, logs
 
-    def _weighted_add_qbound_losses(
+    def _weighted_add_qbound_loss(
         self,
         loss,
-        qbound_losses,
-        qbound_logs,
+        qbound_loss,
     ):
-        if not qbound_losses:
+        if qbound_loss is None:
             return
 
-        optim_cfg = self.cfgs.get("optim", {})
+        optim_cfg = self.cfgs.get(
+            "optim",
+            {},
+        )
 
-        structural_weight = float(
+        # V1.1.1 exposes only one Q-Bound loss weight.
+        # The fallback lets the code survive until the YAML is updated.
+        qbound_weight = float(
             optim_cfg.get(
-                "qbound_structural_weight",
-                0.10,
-            )
-        )
-        minimality_weight = float(
-            optim_cfg.get(
-                "qbound_minimality_weight",
-                0.01,
+                "qbound_weight",
+                optim_cfg.get(
+                    "qbound_structural_weight",
+                    0.10,
+                ),
             )
         )
 
-        if structural_weight < 0.0:
+        if qbound_weight < 0.0:
             raise ValueError(
-                "optim.qbound_structural_weight must be >= 0."
-            )
-        if minimality_weight < 0.0:
-            raise ValueError(
-                "optim.qbound_minimality_weight must be >= 0."
+                "optim.qbound_weight must be >= 0."
             )
 
-        use_weight = torch.as_tensor(
-            float(
-                qbound_logs.get(
-                    "qbound_use_weight",
-                    0.0,
-                )
-            ),
-            device=loss["total_loss"].device,
-            dtype=loss["total_loss"].dtype,
+        loss["qbound_necessity_loss"] = (
+            qbound_loss
         )
-
-        structural = qbound_losses[
-            "qbound_structural_loss"
-        ]
-        minimality = qbound_losses[
-            "qbound_minimality_loss"
-        ]
-
-        # Keep the raw losses visible in the training table.
-        loss["qbound_structural_loss"] = structural
-        loss["qbound_minimality_loss"] = minimality
 
         loss["total_loss"] = (
             loss["total_loss"]
-            + use_weight
-            * (
-                structural_weight * structural
-                + minimality_weight * minimality
-            )
+            + qbound_weight
+            * qbound_loss
         )
 
     # ------------------------------------------------------------------
@@ -645,14 +625,6 @@ class CRAPipeline(BasePipeline):
             .item()
         )
 
-    @staticmethod
-    def _entropy(weights, dim=-1):
-        weights = weights.clamp_min(1e-8)
-        return -torch.sum(
-            weights * torch.log(weights),
-            dim=dim,
-        )
-
     def _collect_qbound_stats(
         self,
         gqa_output,
@@ -661,7 +633,9 @@ class CRAPipeline(BasePipeline):
         stats = {}
 
         if extra_logs:
-            stats.update(extra_logs)
+            stats.update(
+                extra_logs
+            )
 
         qbound_aux = self._get_qbound_aux(
             gqa_output
@@ -670,14 +644,15 @@ class CRAPipeline(BasePipeline):
             return stats
 
         scalar_keys = [
-            "alpha",
-            "beta",
-            "qbound_use_strength",
             "boundary_prob_mean",
             "boundary_count",
             "assignment_entropy",
             "effective_event_count",
             "token_entropy",
+            "selected_transition_mass",
+            "selected_transition_strength",
+            "removed_boundary_mass",
+            "merge_key_l1",
             "question_only_conditioning",
         ]
 
@@ -686,17 +661,22 @@ class CRAPipeline(BasePipeline):
                 qbound_aux.get(key)
             )
             if scalar is not None:
-                stats[f"qbound_{key}"] = scalar
+                stats[
+                    f"qbound_{key}"
+                ] = scalar
 
         temporal_bias = qbound_aux.get(
             "temporal_bias"
         )
-        if torch.is_tensor(temporal_bias):
+        if torch.is_tensor(
+            temporal_bias
+        ):
             stats[
                 "qbound_temporal_bias_abs_mean"
             ] = (
                 temporal_bias.detach()
-                .float().abs().mean().item()
+                .float().abs()
+                .mean().item()
             )
 
         boundary_prob = qbound_aux.get(
@@ -732,39 +712,118 @@ class CRAPipeline(BasePipeline):
             "event_mass"
         )
         if torch.is_tensor(event_mass):
-            stats["qbound_event_mass_min"] = (
-                event_mass.detach().float()
-                .min(dim=-1).values.mean().item()
+            stats[
+                "qbound_event_mass_min"
+            ] = (
+                event_mass.detach()
+                .float()
+                .min(dim=-1)
+                .values.mean().item()
             )
-            stats["qbound_event_mass_max"] = (
-                event_mass.detach().float()
-                .max(dim=-1).values.mean().item()
+            stats[
+                "qbound_event_mass_max"
+            ] = (
+                event_mass.detach()
+                .float()
+                .max(dim=-1)
+                .values.mean().item()
             )
 
-        merge_selector = qbound_aux.get(
-            "merge_selector"
+        transition_mass = qbound_aux.get(
+            "transition_mass"
         )
-        if torch.is_tensor(merge_selector):
-            stats[
-                "qbound_merge_selector_entropy"
-            ] = (
-                self._entropy(
-                    merge_selector.squeeze(1),
-                    dim=-1,
-                ).detach().float().mean().item()
-            )
+        transition_strength = qbound_aux.get(
+            "transition_strength"
+        )
+        transition_mask = qbound_aux.get(
+            "transition_counterfactual_mask"
+        )
 
-        split_selector = qbound_aux.get(
-            "split_selector"
+        if torch.is_tensor(
+            transition_mass
+        ):
+            if torch.is_tensor(
+                transition_mask
+            ):
+                valid = transition_mask.bool()
+                valid_values = transition_mass[
+                    valid
+                ]
+            else:
+                valid_values = (
+                    transition_mass.reshape(-1)
+                )
+
+            if valid_values.numel() > 0:
+                stats[
+                    "qbound_transition_mass_mean"
+                ] = (
+                    valid_values.detach()
+                    .float().mean().item()
+                )
+                stats[
+                    "qbound_transition_mass_max"
+                ] = (
+                    valid_values.detach()
+                    .float().max().item()
+                )
+
+        if torch.is_tensor(
+            transition_strength
+        ):
+            if torch.is_tensor(
+                transition_mask
+            ):
+                valid = transition_mask.bool()
+                valid_values = (
+                    transition_strength[
+                        valid
+                    ]
+                )
+            else:
+                valid_values = (
+                    transition_strength.reshape(-1)
+                )
+
+            if valid_values.numel() > 0:
+                stats[
+                    "qbound_transition_strength_mean"
+                ] = (
+                    valid_values.detach()
+                    .float().mean().item()
+                )
+                stats[
+                    "qbound_transition_strength_max"
+                ] = (
+                    valid_values.detach()
+                    .float().max().item()
+                )
+
+        # Ratio between removed mass and the full boundary count tells us
+        # whether the counterfactual is actually large enough to change
+        # topology. V1.1's frame-edge merge made this ratio tiny.
+        removed_mass = qbound_aux.get(
+            "removed_boundary_mass"
         )
-        if torch.is_tensor(split_selector):
+        boundary_count = qbound_aux.get(
+            "boundary_count"
+        )
+
+        if (
+            torch.is_tensor(removed_mass)
+            and torch.is_tensor(boundary_count)
+        ):
+            removed_ratio = (
+                removed_mass
+                / boundary_count.clamp_min(
+                    1e-6
+                )
+            )
             stats[
-                "qbound_split_selector_entropy"
+                "qbound_removed_boundary_ratio"
             ] = (
-                self._entropy(
-                    split_selector.squeeze(1),
-                    dim=-1,
-                ).detach().float().mean().item()
+                removed_ratio.detach()
+                .float().mean().item()
             )
 
         return stats
@@ -772,31 +831,29 @@ class CRAPipeline(BasePipeline):
     @staticmethod
     def _qbound_loss_keys():
         return [
-            "qbound_structural_loss",
-            "qbound_minimality_loss",
+            "qbound_necessity_loss",
         ]
 
     @staticmethod
     def _qbound_monitor_keys():
         return [
-            "qbound_use_weight",
             "qbound_original_acc",
             "qbound_base_only_acc",
-            "qbound_event_only_acc",
             "qbound_merge_acc",
-            "qbound_split_acc",
             "qbound_original_ce",
             "qbound_merge_ce",
             "qbound_answer_harm",
+            "qbound_positive_harm_ratio",
             "qbound_necessity",
-            "qbound_selected_boundary_strength",
-            "qbound_merge_necessity_loss_raw",
-            "qbound_split_invariance_loss_raw",
+            "qbound_selected_transition_strength",
+            "qbound_selected_transition_mass",
+            "qbound_removed_boundary_mass",
+            "qbound_removed_boundary_ratio",
+            "qbound_merge_key_l1",
+            "qbound_necessity_loss_raw",
             "qbound_cra_event_js",
             "qbound_cra_final_js",
-            "qbound_alpha",
-            "qbound_beta",
-            "qbound_qbound_use_strength",
+            "qbound_original_merge_js",
             "qbound_temporal_bias_abs_mean",
             "qbound_boundary_prob_mean",
             "qbound_boundary_count",
@@ -807,9 +864,11 @@ class CRAPipeline(BasePipeline):
             "qbound_token_entropy",
             "qbound_event_mass_min",
             "qbound_event_mass_max",
+            "qbound_transition_mass_mean",
+            "qbound_transition_mass_max",
+            "qbound_transition_strength_mean",
+            "qbound_transition_strength_max",
             "qbound_question_only_conditioning",
-            "qbound_merge_selector_entropy",
-            "qbound_split_selector_entropy",
         ]
 
     # ------------------------------------------------------------------
@@ -921,7 +980,7 @@ class CRAPipeline(BasePipeline):
         )
 
         # Preserve the repository's original CRA alignment objective.
-        # V1.1 does not invent a pseudo temporal-label loss here because this
+        # V1.1.1 does not invent a pseudo temporal-label loss here because this
         # training batch currently contains no ground-truth temporal segment.
         prediction_dict["vqa_align_pred"] = (
             gqa_output[2]["time_param"][
@@ -938,9 +997,9 @@ class CRAPipeline(BasePipeline):
             target_dict,
         )
 
-        # Two new Q-Bound losses only.
-        qbound_losses, qbound_logs = (
-            self._compute_qbound_v11_losses(
+        # Single Q-Bound V1.1.1 transition-necessity objective.
+        qbound_loss, qbound_logs = (
+            self._compute_qbound_v111_loss(
                 gqa_output=gqa_output,
                 answer_proj=answer_proj,
                 answer_id=answer_id,
@@ -948,10 +1007,9 @@ class CRAPipeline(BasePipeline):
             )
         )
 
-        self._weighted_add_qbound_losses(
+        self._weighted_add_qbound_loss(
             loss,
-            qbound_losses,
-            qbound_logs,
+            qbound_loss,
         )
 
         predicted = predicts.argmax(
@@ -1444,7 +1502,7 @@ class CRAPipeline(BasePipeline):
 
                 if qbound_aux is not None:
                     _, counterfactual_logs = (
-                        self._compute_qbound_v11_losses(
+                        self._compute_qbound_v111_loss(
                             gqa_output=eval_wrapper,
                             answer_proj=answer_proj,
                             answer_id=answer_id,

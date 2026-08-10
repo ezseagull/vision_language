@@ -74,8 +74,9 @@ optim:
 
   # Only three new optimization hyperparameters in V1.1.
   qbound_lr: 5.e-5
-  qbound_structural_weight: 0.10
-  qbound_minimality_weight: 0.01
+  qbound_weight: 0.02
+  # qbound_structural_weight: 0.10
+  # qbound_minimality_weight: 0.01
 
   epochs: 30
   save_period: 1
@@ -87,14 +88,13 @@ stat:
     mode: max
     metric: acc
     early_stop: 30
-
-  vis: false
-  display_port: 8099
+    vis: false
+    display_port: 8099
   record_dir: ./output
   resume: null
 
 misc:
-  running_name: CRA/NextGQA/QBound_v1.1_seed2024
-  info: "CRA + Q-Bound V1.1"
+  running_name: CRA/NextGQA/QBound_v1.2_seed2024
+  info: "CRA + Q-Bound V1.2"
   cuda: "0"
   seed: 2024

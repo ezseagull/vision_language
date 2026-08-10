@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 class QBoundCore(nn.Module):
     """
-    Q-Bound Version 1.1 core.
+    Q-Bound Version 1.1.1 core.
 
     Backbone-agnostic module for learning a question-conditioned, monotonic
     event decomposition and event-level temporal evidence.
@@ -32,7 +32,12 @@ class QBoundCore(nn.Module):
         event_assignment: [B, T, K]
         event_tokens: [B, K, H]
         transition_tokens: [B, K-1, H]
-        merge_* / split_* counterfactual outputs
+        merge_* transition-level counterfactual outputs
+
+    Version 1.1.1 removes the weak frame-edge merge and the split branch.
+    Counterfactual removal now acts on a whole learned event transition:
+    frame-level boundary mass is first grouped into K-1 ordered transition
+    slots, then the strongest transition slot is removed as one intervention.
 
     The core intentionally contains no CRA-specific fusion, no answer head,
     no grounding-consistency loss, no residual cap, and no concurrent branch.
@@ -49,27 +54,18 @@ class QBoundCore(nn.Module):
         boundary_temperature: float = 0.7,
         assignment_temperature: float = 0.35,
         boundary_bias_init: float = -2.0,
-        counterfactual_temperature: float = 0.15,
-        merge_strength: float = 1.0,
-        split_strength: float = 0.9,
         min_event_mass: float = 0.25,
     ) -> None:
         super().__init__()
 
         if max_events < 2:
-            raise ValueError("Version 1.1 requires max_events >= 2.")
+            raise ValueError("Version 1.1.1 requires max_events >= 2.")
         if not 0.0 <= dropout < 1.0:
             raise ValueError("dropout must be in [0, 1).")
         if boundary_temperature <= 0.0:
             raise ValueError("boundary_temperature must be positive.")
         if assignment_temperature <= 0.0:
             raise ValueError("assignment_temperature must be positive.")
-        if counterfactual_temperature <= 0.0:
-            raise ValueError("counterfactual_temperature must be positive.")
-        if not 0.0 <= merge_strength <= 1.0:
-            raise ValueError("merge_strength must be in [0, 1].")
-        if not 0.0 < split_strength <= 1.0:
-            raise ValueError("split_strength must be in (0, 1].")
         if min_event_mass <= 0.0:
             raise ValueError("min_event_mass must be positive.")
 
@@ -81,9 +77,6 @@ class QBoundCore(nn.Module):
 
         self.boundary_temperature = boundary_temperature
         self.assignment_temperature = assignment_temperature
-        self.counterfactual_temperature = counterfactual_temperature
-        self.merge_strength = merge_strength
-        self.split_strength = split_strength
         self.min_event_mass = min_event_mass
 
         self.raw_proj = nn.Sequential(
@@ -136,6 +129,11 @@ class QBoundCore(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, 1),
         )
+        # V1.1.1 removes the external beta gate. Keep the initial Q-Bound
+        # temporal perturbation naturally small instead of hiding it behind a
+        # learnable scalar that can collapse to zero.
+        nn.init.normal_(self.token_score[-1].weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.token_score[-1].bias)
 
         self.bridge_hidden_norm = nn.LayerNorm(hidden_dim)
         self.output_proj = nn.Sequential(
@@ -220,20 +218,6 @@ class QBoundCore(nn.Module):
         numerator = torch.einsum("btk,btd->bkd", weights, features)
         denominator = weights.sum(dim=1).unsqueeze(-1).clamp_min(1e-6)
         return numerator / denominator
-
-    @staticmethod
-    def _masked_standardize(
-        values: torch.Tensor,
-        mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Per-sample centering/scaling for stable external logit fusion."""
-        valid = mask.to(values.dtype)
-        count = valid.sum(dim=-1, keepdim=True).clamp_min(1.0)
-        mean = (values * valid).sum(dim=-1, keepdim=True) / count
-        centered = (values - mean) * valid
-        var = (centered.pow(2) * valid).sum(dim=-1, keepdim=True) / count
-        std = torch.sqrt(var + 1e-6)
-        return (centered / std) * valid
 
     def _prepare_temporal_prior(
         self,
@@ -419,9 +403,15 @@ class QBoundCore(nn.Module):
         transition_pool_weights = (
             transition_slot_affinity * boundary_mass.unsqueeze(-1)
         )
-        transition_denominator = transition_pool_weights.sum(
-            dim=1, keepdim=True
-        ).clamp_min(1e-6)
+
+        # Total frame-level boundary mass assigned to each ordered event
+        # transition.  This is the correct structural quantity for a
+        # transition-level counterfactual; the previous V1.1 code used a
+        # weighted average of frame-edge probabilities, which stayed near
+        # ~0.05 and made a merge almost ineffectual.
+        transition_mass = transition_pool_weights.sum(dim=1)
+
+        transition_denominator = transition_mass.unsqueeze(1).clamp_min(1e-6)
         normalized_transition_weights = (
             transition_pool_weights / transition_denominator
         )
@@ -431,10 +421,11 @@ class QBoundCore(nn.Module):
             normalized_transition_weights,
             boundary_hidden,
         )
-        transition_strength = torch.sum(
-            normalized_transition_weights * boundary_mass.unsqueeze(-1),
-            dim=1,
-        )
+
+        # Smooth probability-like existence strength for each transition.
+        # If soft boundary masses in one transition accumulate to ~1, the
+        # strength is already substantial (~0.63) without any new hyperparameter.
+        transition_strength = 1.0 - torch.exp(-transition_mass)
 
         left_event = event_tokens[:, :-1]
         right_event = event_tokens[:, 1:]
@@ -459,6 +450,11 @@ class QBoundCore(nn.Module):
         transition_valid_mask = (
             event_valid_mask[:, :-1] & event_valid_mask[:, 1:]
         )
+
+        # Counterfactual selection must not disappear merely because one soft
+        # event fell below min_event_mass.  A transition is structurally
+        # selectable whenever it still owns non-zero boundary mass.
+        transition_counterfactual_mask = transition_mass > 1e-6
 
         # Interleave ordered event and transition tokens:
         # E0, R01, E1, R12, E2, ...
@@ -494,10 +490,10 @@ class QBoundCore(nn.Module):
         bridge_repr = self.output_proj(bridge_hidden)
 
         # ------------------------------------------------------------------
-        # Event temporal logits for early grounding integration in refine.py.
+        # Event temporal logits for direct grounding integration in refine.py.
         # These are generated from Q-Bound's learned event/transition scores,
-        # not copied from CRA grounding. They are standardized per sample so a
-        # learnable external scalar beta can control their contribution.
+        # not copied from CRA grounding. V1.1.1 intentionally uses no external
+        # alpha/beta bypass gate.
         # ------------------------------------------------------------------
         event_token_logits = token_logits[:, 0::2]
         transition_token_logits = token_logits[:, 1::2]
@@ -529,10 +525,14 @@ class QBoundCore(nn.Module):
         frame_transition_logits[:, :-1] += 0.5 * transition_edge_logits
         frame_transition_logits[:, 1:] += 0.5 * transition_edge_logits
 
-        event_temporal_logits = event_frame_logits + frame_transition_logits
-        event_temporal_logits = self._masked_standardize(
-            event_temporal_logits, video_mask
-        )
+        event_temporal_logits = (
+            event_frame_logits + frame_transition_logits
+        ) * video_mask.to(event_frame_logits.dtype)
+
+        # No external beta gate and no per-sample standardization in V1.1.1.
+        # The token scorer is initialized near zero, so Q-Bound starts as a
+        # small direct temporal correction and must earn larger influence from
+        # the main task itself.
         frame_event_relevance = self._masked_softmax(
             event_temporal_logits,
             video_mask,
@@ -579,7 +579,9 @@ class QBoundCore(nn.Module):
             "transition_valid_mask": transition_valid_mask,
             "event_prior_mass": event_prior_mass,
             "transition_slot_affinity": transition_slot_affinity,
+            "transition_mass": transition_mass,
             "transition_strength": transition_strength,
+            "transition_counterfactual_mask": transition_counterfactual_mask,
             "token_mask": token_mask,
             "token_logits": token_logits,
             "token_weights": token_weights,
@@ -592,45 +594,38 @@ class QBoundCore(nn.Module):
             "token_entropy": token_entropy,
         }
 
-    def _build_counterfactual_selector(
-        self,
+    @staticmethod
+    def _build_hard_selector(
         scores: torch.Tensor,
         mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Hard top-1 forward, soft straight-through gradient."""
+        """
+        Deterministic top-1 intervention selector.
+
+        The selector itself is not a learned routing mechanism.  It only
+        chooses which existing transition to ablate, so V1.1.1 removes the
+        straight-through soft selector and its temperature hyperparameter.
+        """
+        if scores.shape != mask.shape:
+            raise ValueError(
+                "scores and mask must have the same shape, got "
+                f"{tuple(scores.shape)} and {tuple(mask.shape)}."
+            )
+
         mask = mask.bool()
         masked_scores = scores.masked_fill(~mask, -1e4)
-        soft_selector = self._masked_softmax(
-            masked_scores / self.counterfactual_temperature,
-            mask,
-            dim=-1,
-        )
         hard_index = torch.argmax(masked_scores, dim=-1, keepdim=True)
-        hard_selector = torch.zeros_like(soft_selector).scatter_(
+
+        selector = torch.zeros_like(scores).scatter_(
             dim=-1,
             index=hard_index,
             value=1.0,
         )
-        hard_selector = hard_selector * mask.to(hard_selector.dtype)
-        return hard_selector - soft_selector.detach() + soft_selector
 
-    def _build_split_mask(
-        self,
-        boundary_mask: torch.Tensor,
-        video_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        time_steps_minus_one = boundary_mask.size(1)
-        position = torch.arange(
-            time_steps_minus_one, device=boundary_mask.device
-        ).view(1, -1)
-        valid_length = video_mask.sum(dim=-1, keepdim=True)
-        interior_mask = (
-            boundary_mask
-            & (position >= 1)
-            & (position < (valid_length - 2))
-        )
-        has_interior = interior_mask.any(dim=-1, keepdim=True)
-        return torch.where(has_interior, interior_mask, boundary_mask)
+        has_valid = mask.any(dim=-1, keepdim=True)
+        selector = selector * mask.to(selector.dtype)
+        selector = selector * has_valid.to(selector.dtype)
+        return selector
 
     def forward(
         self,
@@ -656,7 +651,7 @@ class QBoundCore(nn.Module):
                 f"Expected input_dim={self.input_dim}, got {feature_dim}."
             )
         if time_steps < 2:
-            raise ValueError("Version 1.1 requires at least 2 timesteps.")
+            raise ValueError("Version 1.1.1 requires at least 2 timesteps.")
 
         video_mask = self._normalize_mask(
             video_mask,
@@ -744,14 +739,38 @@ class QBoundCore(nn.Module):
             boundary_mask=boundary_mask,
         )
 
-        # Merge: remove strongest currently predicted structural boundary.
-        merge_selector = self._build_counterfactual_selector(
-            scores=boundary_mass,
-            mask=boundary_mask,
+        # --------------------------------------------------------------
+        # Transition-level counterfactual merge.
+        #
+        # V1.1 removed only one frame edge (~0.05 mass), while the event
+        # coordinate was created by the cumulative mass of many such edges.
+        # That intervention barely changed the partition.  V1.1.1 instead:
+        #   1) groups frame-edge mass into K-1 ordered transition slots,
+        #   2) selects the strongest transition,
+        #   3) removes all boundary mass attributed to that transition.
+        # --------------------------------------------------------------
+        merge_transition_selector = self._build_hard_selector(
+            scores=original["transition_strength"],
+            mask=original["transition_counterfactual_mask"],
         )
+
+        selected_transition_profile = torch.einsum(
+            "bk,btk->bt",
+            merge_transition_selector,
+            original["transition_slot_affinity"],
+        )
+        selected_transition_profile = (
+            selected_transition_profile
+            * boundary_mask.to(selected_transition_profile.dtype)
+        )
+
+        # Because transition_slot_affinity sums to one over transition slots,
+        # this removes exactly the component of boundary_mass attributed to
+        # the selected transition, rather than deleting one arbitrary frame edge.
         merge_boundary_mass = boundary_mass * (
-            1.0 - self.merge_strength * merge_selector
+            1.0 - selected_transition_profile
         )
+
         merge_output = self._encode_partition(
             raw_states=raw_states,
             contextual_states=contextual_states,
@@ -763,38 +782,23 @@ class QBoundCore(nn.Module):
             boundary_mask=boundary_mask,
         )
 
-        # Split is retained in V1.1 as an optional structural regularizer.
-        # Whether it remains in the final paper/core will be decided by ablation.
-        split_mask = self._build_split_mask(boundary_mask, video_mask)
-        split_selector = self._build_counterfactual_selector(
-            scores=-boundary_mass,
-            mask=split_mask,
-        )
-        split_boundary_mass = (
-            boundary_mass
-            + self.split_strength
-            * split_selector
-            * (1.0 - boundary_mass)
-        )
-        split_boundary_mass = self._cap_boundary_mass(
-            split_boundary_mass, boundary_mask
-        )
-        split_output = self._encode_partition(
-            raw_states=raw_states,
-            contextual_states=contextual_states,
-            qa_state=qa_state,
-            video_mask=video_mask,
-            temporal_prior=temporal_prior_used,
-            boundary_mass=split_boundary_mass,
-            boundary_hidden=boundary_hidden,
-            boundary_mask=boundary_mask,
-        )
-
         boundary_count = boundary_mass.sum(dim=-1)
-        merge_positions = torch.argmax(merge_selector, dim=-1).unsqueeze(-1)
-        split_positions = torch.argmax(split_selector, dim=-1).unsqueeze(-1)
-        selected_merge_boundary_mass = torch.sum(
-            merge_selector * boundary_mass, dim=-1
+
+        selected_transition_mass = torch.sum(
+            merge_transition_selector * original["transition_mass"],
+            dim=-1,
+        )
+        selected_transition_strength = torch.sum(
+            merge_transition_selector * original["transition_strength"],
+            dim=-1,
+        )
+        removed_boundary_mass = (
+            boundary_mass - merge_boundary_mass
+        ).sum(dim=-1)
+
+        merge_transition_index = torch.argmax(
+            merge_transition_selector,
+            dim=-1,
         )
 
         return {
@@ -822,7 +826,12 @@ class QBoundCore(nn.Module):
             "event_valid_mask": original["event_valid_mask"],
             "transition_valid_mask": original["transition_valid_mask"],
             "event_prior_mass": original["event_prior_mass"],
+            "transition_slot_affinity": original["transition_slot_affinity"],
+            "transition_mass": original["transition_mass"],
             "transition_strength": original["transition_strength"],
+            "transition_counterfactual_mask": (
+                original["transition_counterfactual_mask"]
+            ),
             "token_mask": original["token_mask"],
             "token_logits": original["token_logits"],
             "token_weights": original["token_weights"],
@@ -830,7 +839,7 @@ class QBoundCore(nn.Module):
             "event_temporal_logits": original["event_temporal_logits"],
             "frame_event_relevance": original["frame_event_relevance"],
 
-            "merge_bridge_repr": merge_output["bridge_repr"].unsqueeze(1),
+            # Transition-level merge counterfactual.
             "merge_event_temporal_logits": (
                 merge_output["event_temporal_logits"].unsqueeze(1)
             ),
@@ -840,22 +849,18 @@ class QBoundCore(nn.Module):
             "merge_boundary_mass": (
                 merge_output["boundary_mass"].unsqueeze(1)
             ),
-            "merge_selector": merge_selector.unsqueeze(1),
-            "merge_positions": merge_positions,
-            "selected_merge_boundary_mass": selected_merge_boundary_mass,
-
-            "split_bridge_repr": split_output["bridge_repr"].unsqueeze(1),
-            "split_event_temporal_logits": (
-                split_output["event_temporal_logits"].unsqueeze(1)
+            "merge_transition_selector": (
+                merge_transition_selector.unsqueeze(1)
             ),
-            "split_frame_relevance": (
-                split_output["frame_event_relevance"].unsqueeze(1)
+            "merge_transition_index": (
+                merge_transition_index.unsqueeze(-1)
             ),
-            "split_boundary_mass": (
-                split_output["boundary_mass"].unsqueeze(1)
+            "selected_transition_profile": (
+                selected_transition_profile.unsqueeze(1)
             ),
-            "split_selector": split_selector.unsqueeze(1),
-            "split_positions": split_positions,
+            "selected_transition_mass": selected_transition_mass,
+            "selected_transition_strength": selected_transition_strength,
+            "removed_boundary_mass": removed_boundary_mass,
 
             "assignment_entropy": original["assignment_entropy"],
             "effective_event_count": original["effective_event_count"],
