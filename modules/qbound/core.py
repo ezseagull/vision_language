@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 class QBoundCore(nn.Module):
     """
-    Q-Bound Version 1.1.1 core.
+    Q-Bound Version 1.1.3 core.
 
     Backbone-agnostic module for learning a question-conditioned, monotonic
     event decomposition and event-level temporal evidence.
@@ -26,21 +26,30 @@ class QBoundCore(nn.Module):
             it contributes exactly zero features.
 
     Core outputs:
-        bridge_repr: [B, D]
         event_temporal_logits: [B, T]
+        event_temporal_prob: [B, T]
         boundary_prob / boundary_mass: [B, T-1]
         event_assignment: [B, T, K]
         event_tokens: [B, K, H]
         transition_tokens: [B, K-1, H]
         merge_* transition-level counterfactual outputs
 
-    Version 1.1.1 removes the weak frame-edge merge and the split branch.
-    Counterfactual removal now acts on a whole learned event transition:
-    frame-level boundary mass is first grouped into K-1 ordered transition
-    slots, then the strongest transition slot is removed as one intervention.
+    Version 1.1.3 keeps the transition-level counterfactual from V1.1.1,
+    but changes the MAIN temporal-evidence path so that useful temporal
+    selectivity must remain coupled to the learned event topology.
 
-    The core intentionally contains no CRA-specific fusion, no answer head,
-    no grounding-consistency loss, no residual cap, and no concurrent branch.
+    Main-path principles:
+      * no CRA-specific fusion and no CRA temporal prior when disabled;
+      * no global bridge representation / residual shortcut;
+      * no hard event-validity mask in the main temporal evidence path;
+      * soft event activity couples event mass to temporal influence;
+      * soft transition activity couples neighboring event existence to
+        transition influence;
+      * bounded semantic token scores prevent tiny topology variations from
+        being amplified by arbitrarily large event/transition logits.
+
+    The core remains backbone-agnostic and exposes a probability-like
+    frame relevance distribution for the Q-Bound grounding branch.
     """
 
 
@@ -59,7 +68,7 @@ class QBoundCore(nn.Module):
         super().__init__()
 
         if max_events < 2:
-            raise ValueError("Version 1.1.1 requires max_events >= 2.")
+            raise ValueError("Version 1.1.3 requires max_events >= 2.")
         if not 0.0 <= dropout < 1.0:
             raise ValueError("dropout must be in [0, 1).")
         if boundary_temperature <= 0.0:
@@ -129,20 +138,15 @@ class QBoundCore(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, 1),
         )
-        # V1.1.1 removes the external beta gate. Keep the initial Q-Bound
+        # V1.1.3 has no external beta gate. Keep the initial Q-Bound
         # temporal perturbation naturally small instead of hiding it behind a
         # learnable scalar that can collapse to zero.
         nn.init.normal_(self.token_score[-1].weight, mean=0.0, std=1e-3)
         nn.init.zeros_(self.token_score[-1].bias)
 
-        self.bridge_hidden_norm = nn.LayerNorm(hidden_dim)
-        self.output_proj = nn.Sequential(
-            nn.Linear(hidden_dim, input_dim),
-            nn.LayerNorm(input_dim),
-        )
 
     def _summarize_qa(self, qa_features: torch.Tensor) -> torch.Tensor:
-        """Compatibility helper. V1.1 should receive question-only [B, D]."""
+        """Compatibility helper. V1.1.3 should receive question-only [B, D]."""
         if qa_features.ndim < 2:
             raise ValueError("qa_features must have at least two dimensions.")
         if qa_features.size(-1) != self.input_dim:
@@ -480,41 +484,93 @@ class QBoundCore(nn.Module):
             )
         ).squeeze(-1)
 
-        # V1.1: NO direct CRA-prior addition here.
-        token_weights = self._masked_softmax(token_logits, token_mask, dim=-1)
-        bridge_hidden = torch.sum(
-            token_weights.unsqueeze(-1) * ordered_tokens,
-            dim=1,
+        # Token weights are retained only for diagnostics (e.g. token entropy).
+        # V1.1.3 deliberately removes the global bridge representation so the
+        # main task cannot bypass temporal topology through a pooled event vector.
+        token_weights = self._masked_softmax(
+            token_logits,
+            token_mask,
+            dim=-1,
         )
-        bridge_hidden = self.bridge_hidden_norm(bridge_hidden)
-        bridge_repr = self.output_proj(bridge_hidden)
 
         # ------------------------------------------------------------------
-        # Event temporal logits for direct grounding integration in refine.py.
-        # These are generated from Q-Bound's learned event/transition scores,
-        # not copied from CRA grounding. V1.1.1 intentionally uses no external
-        # alpha/beta bypass gate.
+        # Topology-coupled temporal evidence (V1.1.3).
+        #
+        # Hard event_valid_mask is NOT used here. A hard threshold makes weak
+        # events disappear abruptly and gives them almost no useful main-task
+        # gradient to recover. Instead we use a smooth activity factor:
+        #
+        #     activity_k = mass_k / (mass_k + min_event_mass)
+        #
+        # We then renormalize the assignment across event slots after applying
+        # these activities. If the learned partition collapses to one effective
+        # event, active_assignment becomes almost constant across time and the
+        # event contribution becomes almost temporally uniform.
         # ------------------------------------------------------------------
-        event_token_logits = token_logits[:, 0::2]
-        transition_token_logits = token_logits[:, 1::2]
-
-        event_token_logits = event_token_logits * event_valid_mask.to(
-            event_token_logits.dtype
+        event_activity = event_mass / (
+            event_mass + float(self.min_event_mass)
         )
-        transition_token_logits = transition_token_logits * (
-            transition_valid_mask.to(transition_token_logits.dtype)
+
+        active_assignment = (
+            event_assignment
+            * event_activity.unsqueeze(1)
+        )
+        active_assignment = (
+            active_assignment
+            / active_assignment.sum(
+                dim=-1,
+                keepdim=True,
+            ).clamp_min(1e-6)
+        )
+        active_assignment = (
+            active_assignment
+            * video_mask.to(active_assignment.dtype).unsqueeze(-1)
+        )
+
+        # A transition should only be semantically influential when both of its
+        # neighboring events are active. The square root keeps this symmetric
+        # and smooth while avoiding a hard validity cutoff.
+        transition_activity = torch.sqrt(
+            (
+                event_activity[:, :-1]
+                * event_activity[:, 1:]
+            ).clamp_min(0.0)
+        )
+
+        raw_event_token_logits = token_logits[:, 0::2]
+        raw_transition_token_logits = token_logits[:, 1::2]
+
+        # IMPORTANT anti-shortcut constraint:
+        # token_score is an unconstrained MLP. Without bounding its output, the
+        # model could amplify tiny residual assignment differences with huge
+        # token logits while keeping the actual boundary topology weak. tanh is
+        # parameter-free and keeps semantic scores in [-1, 1].
+        event_token_scores = (
+            torch.tanh(raw_event_token_logits)
+            * event_activity
+        )
+        transition_token_scores = (
+            torch.tanh(raw_transition_token_logits)
+            * transition_activity
         )
 
         event_frame_logits = torch.einsum(
-            "btk,bk->bt", event_assignment, event_token_logits
+            "btk,bk->bt",
+            active_assignment,
+            event_token_scores,
         )
 
         transition_edge_logits = torch.sum(
             transition_slot_affinity
-            * transition_token_logits.unsqueeze(1),
+            * transition_token_scores.unsqueeze(1),
             dim=-1,
         )
-        transition_edge_logits = transition_edge_logits * boundary_mass
+        # Transition evidence must vanish when the underlying learned boundary
+        # mass vanishes. This preserves a direct topology -> evidence coupling.
+        transition_edge_logits = (
+            transition_edge_logits
+            * boundary_mass
+        )
 
         frame_transition_logits = torch.zeros(
             batch_size,
@@ -522,17 +578,21 @@ class QBoundCore(nn.Module):
             dtype=contextual_states.dtype,
             device=contextual_states.device,
         )
-        frame_transition_logits[:, :-1] += 0.5 * transition_edge_logits
-        frame_transition_logits[:, 1:] += 0.5 * transition_edge_logits
+        frame_transition_logits[:, :-1] += (
+            0.5 * transition_edge_logits
+        )
+        frame_transition_logits[:, 1:] += (
+            0.5 * transition_edge_logits
+        )
 
         event_temporal_logits = (
-            event_frame_logits + frame_transition_logits
+            event_frame_logits
+            + frame_transition_logits
         ) * video_mask.to(event_frame_logits.dtype)
 
-        # No external beta gate and no per-sample standardization in V1.1.1.
-        # The token scorer is initialized near zero, so Q-Bound starts as a
-        # small direct temporal correction and must earn larger influence from
-        # the main task itself.
+        # Exactly ONE temporal softmax is applied inside QBoundCore. The
+        # Q-Bound branch will later use probability-preserving Gaussian
+        # smoothing rather than CRA's second temporal softmax.
         frame_event_relevance = self._masked_softmax(
             event_temporal_logits,
             video_mask,
@@ -585,8 +645,15 @@ class QBoundCore(nn.Module):
             "token_mask": token_mask,
             "token_logits": token_logits,
             "token_weights": token_weights,
-            "bridge_hidden": bridge_hidden,
-            "bridge_repr": bridge_repr,
+            "event_activity": event_activity,
+            "active_assignment": active_assignment,
+            "transition_activity": transition_activity,
+            "raw_event_token_logits": raw_event_token_logits,
+            "raw_transition_token_logits": raw_transition_token_logits,
+            "event_token_scores": event_token_scores,
+            "transition_token_scores": transition_token_scores,
+            "event_frame_logits": event_frame_logits,
+            "frame_transition_logits": frame_transition_logits,
             "event_temporal_logits": event_temporal_logits,
             "frame_event_relevance": frame_event_relevance,
             "assignment_entropy": assignment_entropy,
@@ -603,7 +670,7 @@ class QBoundCore(nn.Module):
         Deterministic top-1 intervention selector.
 
         The selector itself is not a learned routing mechanism.  It only
-        chooses which existing transition to ablate, so V1.1.1 removes the
+        chooses which existing transition to ablate, so V1.1.3 keeps the
         straight-through soft selector and its temperature hyperparameter.
         """
         if scores.shape != mask.shape:
@@ -651,7 +718,7 @@ class QBoundCore(nn.Module):
                 f"Expected input_dim={self.input_dim}, got {feature_dim}."
             )
         if time_steps < 2:
-            raise ValueError("Version 1.1.1 requires at least 2 timesteps.")
+            raise ValueError("Version 1.1.3 requires at least 2 timesteps.")
 
         video_mask = self._normalize_mask(
             video_mask,
@@ -744,7 +811,8 @@ class QBoundCore(nn.Module):
         #
         # V1.1 removed only one frame edge (~0.05 mass), while the event
         # coordinate was created by the cumulative mass of many such edges.
-        # That intervention barely changed the partition.  V1.1.1 instead:
+        # That intervention barely changed the partition. V1.1.3 keeps the
+        # transition-level intervention introduced in V1.1.1:
         #   1) groups frame-edge mass into K-1 ordered transition slots,
         #   2) selects the strongest transition,
         #   3) removes all boundary mass attributed to that transition.
@@ -802,8 +870,6 @@ class QBoundCore(nn.Module):
         )
 
         return {
-            "bridge_repr": original["bridge_repr"],
-            "bridge_hidden": original["bridge_hidden"],
             "qa_state": qa_state,
 
             "boundary_logits": boundary_logits,
@@ -835,13 +901,34 @@ class QBoundCore(nn.Module):
             "token_mask": original["token_mask"],
             "token_logits": original["token_logits"],
             "token_weights": original["token_weights"],
+            "event_activity": original["event_activity"],
+            "active_assignment": original["active_assignment"],
+            "transition_activity": original["transition_activity"],
+            "raw_event_token_logits": original["raw_event_token_logits"],
+            "raw_transition_token_logits": (
+                original["raw_transition_token_logits"]
+            ),
+            "event_token_scores": original["event_token_scores"],
+            "transition_token_scores": (
+                original["transition_token_scores"]
+            ),
+            "event_frame_logits": original["event_frame_logits"],
+            "frame_transition_logits": (
+                original["frame_transition_logits"]
+            ),
 
             "event_temporal_logits": original["event_temporal_logits"],
+            # Preferred V1.1.3 name for the single-softmax Q-Bound temporal
+            # distribution. Keep frame_event_relevance as a compatibility alias.
+            "event_temporal_prob": original["frame_event_relevance"],
             "frame_event_relevance": original["frame_event_relevance"],
 
             # Transition-level merge counterfactual.
             "merge_event_temporal_logits": (
                 merge_output["event_temporal_logits"].unsqueeze(1)
+            ),
+            "merge_event_temporal_prob": (
+                merge_output["frame_event_relevance"].unsqueeze(1)
             ),
             "merge_frame_relevance": (
                 merge_output["frame_event_relevance"].unsqueeze(1)

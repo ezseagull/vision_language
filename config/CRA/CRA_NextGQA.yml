@@ -43,23 +43,43 @@ model:
   vg_loss: 1
   vote: 0
 
-  # Q-Bound V1.1.
-  # Defaults for temperatures / merge / split remain inside QBoundCore.
+  # ------------------------------------------------------------
+  # Q-Bound V1.1.3
+  # ------------------------------------------------------------
   qbound:
     enabled: true
-    version: "1.1"
+    version: "1.1.3"
+
     hidden_dim: 256
     max_events: 4
 
-    # Main V1.1 run: do not feed CRA grounding back into Q-Bound.
-    # This prevents the event topology from learning to copy CRA key.
+    # Q-Bound topology must not consume CRA temporal grounding.
+    # refine_v113.py also passes temporal_prior=None defensively.
     use_temporal_prior: false
+
+    # First controlled V1.1.3 run:
+    # Q-Bound learns its own parameters while the shared CRA backbone
+    # is protected from topology gradients. This can be ablated later.
+    detach_backbone_inputs: true
+
+    # Explicit topology settings for reproducibility.
+    boundary_temperature: 0.7
+    assignment_temperature: 0.35
+    boundary_bias_init: -2.0
+    min_event_mass: 0.25
+
+    # Deterministic CRA -> Q-Bound temporal handover.
+    # Training: lambda goes linearly from 0.2 to 1.0 over 5 epochs.
+    # Validation/test: pipeline always forces lambda = 1.0.
+    handover_start: 0.2
+    handover_epochs: 5
 
 optim:
   pipeline: cra
   optimizer: Adam
 
-  # Original CRA objectives stay unchanged.
+  # Original CRA objectives only.
+  # V1.1.3 has NO Q-Bound auxiliary loss.
   loss:
     ce:
       vq: 1
@@ -72,11 +92,8 @@ optim:
   weight_decay: 0
   amsgrad: true
 
-  # Only three new optimization hyperparameters in V1.1.
+  # Dedicated Q-Bound optimizer group created by BasePipeline.
   qbound_lr: 5.e-5
-  qbound_weight: 0.02
-  # qbound_structural_weight: 0.10
-  # qbound_minimality_weight: 0.01
 
   epochs: 30
   save_period: 1
@@ -90,11 +107,12 @@ stat:
     early_stop: 30
     vis: false
     display_port: 8099
+
   record_dir: ./output
   resume: null
 
 misc:
-  running_name: CRA/NextGQA/QBound_v1.2_seed2024
-  info: "CRA + Q-Bound V1.2"
+  running_name: CRA/NextGQA/QBound_v1.1.3_seed2024
+  info: "CRA + Q-Bound V1.1.3"
   cuda: "0"
   seed: 2024

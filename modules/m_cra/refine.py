@@ -106,33 +106,49 @@ class DecoderLayer(nn.Module):
         return x
 
 
+
 class Decoder(nn.Module):
     """
-    CRA refinement decoder with Q-Bound Version 1.1.1.
+    CRA refinement decoder with Q-Bound Version 1.1.3.
 
-    V1.1.1 removes the two shortcut gates used in V1.1:
+    Design
+    ------
+    CRA is kept as a strong feature backbone and as a TEMPORARY temporal
+    teacher, but CRA temporal grounding is not allowed to remain a permanent
+    VQA bypass.
 
-        z_final = z_grounded + alpha * A(z_event)   [removed]
-        l_final = l_CRA + beta * l_event            [removed]
+    VQ / CRA-only path:
+        CRA temporal grounding -> CRA key -> grounded video
 
-    Q-Bound now has exactly one route into the main task:
+    VQA / Q-Bound path:
+        CRA teacher key (stop-gradient)
+                         \
+                          -> deterministic probability handover -> final key
+                         /
+        Q-Bound topology -> Q-Bound temporal probability
+                         -> probability-preserving Gaussian smoothing
 
-        question + video
-            -> Q-Bound event topology
-            -> event temporal evidence
-            -> CRA temporal logits + Q-Bound temporal logits
-            -> final grounding key
-            -> grounded video representation
-            -> main VQA scorer
+    During training, ``qbound_mix`` is supplied externally by the pipeline.
+    It must follow a fixed schedule and eventually reach 1.0.
 
-    This prevents the model from improving VQA through a global event
-    representation while ignoring the learned topology, and prevents beta
-    from collapsing to zero.
+        final_key =
+            (1 - qbound_mix) * stopgrad(cra_key)
+            + qbound_mix * qbound_key
 
-    Counterfactual training uses only transition-level MERGE from QBoundCore
-    V1.1.1.  Original and merge paths share the same CRA projection dropout
-    realization and the same visual-intervention reference, so measured task
-    harm reflects the topology intervention rather than stochastic dropout.
+    Validation/test should use qbound_mix=1.0 so checkpoint selection never
+    benefits from a permanent CRA temporal shortcut.
+
+    Important V1.1.3 properties
+    ---------------------------
+    * no CRAQBoundAdapter
+    * no alpha/beta gate
+    * no CRA + Q-Bound temporal-logit addition
+    * no bridge/global event residual
+    * no second softmax on the Q-Bound Gaussian branch
+    * CRA sigma is detached on the Q-Bound smoothing branch
+    * VQA alignment uses the FINAL grounded video representation
+    * transition-level merge remains a diagnostic counterfactual
+    * original and merge paths share the same projection dropout realization
     """
 
     def __init__(
@@ -153,12 +169,19 @@ class Decoder(nn.Module):
         self.cfgs = cfgs
 
         self.layers = clones(
-            DecoderLayer(embed_dim, num_heads, ff_dim, dropout),
+            DecoderLayer(
+                embed_dim,
+                num_heads,
+                ff_dim,
+                dropout,
+            ),
             num_layer,
         )
         self.norm = LayerNorm(embed_dim)
 
-        # Kept for compatibility with the original CRA implementation.
+        # Kept only for checkpoint compatibility with the original CRA
+        # implementation. The refine decoder returns its actual final temporal
+        # key directly and does not use this attention head in V1.1.3.
         self.attention_video_feature = nn.Sequential(
             nn.Linear(embed_dim, embed_dim // 2),
             nn.Tanh(),
@@ -166,8 +189,9 @@ class Decoder(nn.Module):
             nn.Softmax(dim=-2),
         )
 
-        # Keep the original parameter names (video_proj.1.weight/bias) so
-        # existing CRA checkpoints remain load-compatible.
+        # Preserve original parameter names:
+        #     video_proj.0 = Dropout
+        #     video_proj.1 = Linear
         self.video_proj = nn.Sequential(
             nn.Dropout(dropout),
             nn.Linear(embed_dim, embed_dim),
@@ -175,8 +199,11 @@ class Decoder(nn.Module):
 
         model_cfg = self.cfgs["model"]
         qbound_cfg = model_cfg.get("qbound", {})
+
         if not isinstance(qbound_cfg, dict):
-            raise ValueError("model.qbound must be a mapping/dict.")
+            raise ValueError(
+                "model.qbound must be a mapping/dict."
+            )
 
         self.grounding_module = GroundingModule(
             d_model=embed_dim,
@@ -184,17 +211,23 @@ class Decoder(nn.Module):
             initial_sigma=model_cfg["sigma"],
             window_sizes=model_cfg["window_sizes"],
         )
-        self.do = VisualIntervention(self.cfgs)
 
-        # ------------------------------------------------------------------
-        # Q-Bound V1.1.1
-        # ------------------------------------------------------------------
+        self.do = VisualIntervention(
+            self.cfgs
+        )
+
+        # --------------------------------------------------------------
+        # Q-Bound V1.1.3
+        # --------------------------------------------------------------
         self.qbound_enabled = bool(
             qbound_cfg.get(
                 "enabled",
                 model_cfg.get(
                     "qbound_enabled",
-                    model_cfg.get("gpeb_enabled", False),
+                    model_cfg.get(
+                        "gpeb_enabled",
+                        False,
+                    ),
                 ),
             )
         )
@@ -213,16 +246,16 @@ class Decoder(nn.Module):
         )
 
         if self.qbound_enabled:
-            # Constructor matches QBoundCore V1.1.1 exactly.
-            # V1.1 parameters counterfactual_temperature / merge_strength /
-            # split_strength no longer exist.
             self.qbound = QBoundCore(
                 input_dim=embed_dim,
                 hidden_dim=qbound_cfg.get(
                     "hidden_dim",
                     model_cfg.get(
                         "qbound_hidden_dim",
-                        model_cfg.get("gpeb_hidden_dim", 256),
+                        model_cfg.get(
+                            "gpeb_hidden_dim",
+                            256,
+                        ),
                     ),
                 ),
                 max_events=qbound_cfg.get(
@@ -231,7 +264,10 @@ class Decoder(nn.Module):
                         "qbound_max_events",
                         model_cfg.get(
                             "gpeb_max_events",
-                            model_cfg.get("gpeb_num_bins", 4),
+                            model_cfg.get(
+                                "gpeb_num_bins",
+                                4,
+                            ),
                         ),
                     ),
                 ),
@@ -249,7 +285,10 @@ class Decoder(nn.Module):
                     "dropout",
                     model_cfg.get(
                         "qbound_dropout",
-                        model_cfg.get("gpeb_dropout", dropout),
+                        model_cfg.get(
+                            "gpeb_dropout",
+                            dropout,
+                        ),
                     ),
                 ),
                 boundary_temperature=qbound_cfg.get(
@@ -286,11 +325,18 @@ class Decoder(nn.Module):
                     "min_event_mass",
                     model_cfg.get(
                         "qbound_min_event_mass",
-                        model_cfg.get("gpeb_min_event_mass", 0.25),
+                        model_cfg.get(
+                            "gpeb_min_event_mass",
+                            0.25,
+                        ),
                     ),
                 ),
             )
 
+            # Keep this True for the first controlled V1.1.3 experiment.
+            # Q-Bound learns its own parameters from VQA, while the shared CRA
+            # backbone is protected from topology gradients until a later
+            # explicit ablation.
             self.qbound_detach_backbone_inputs = bool(
                 qbound_cfg.get(
                     "detach_backbone_inputs",
@@ -304,6 +350,9 @@ class Decoder(nn.Module):
                 )
             )
 
+    # ------------------------------------------------------------------
+    # Shape / normalization helpers
+    # ------------------------------------------------------------------
     @staticmethod
     def _normalize_video_mask(
         mask,
@@ -319,21 +368,31 @@ class Decoder(nn.Module):
                 device=device,
             )
 
-        while mask.ndim > 2 and mask.size(1) == 1:
+        while (
+            mask.ndim > 2
+            and mask.size(1) == 1
+        ):
             mask = mask.squeeze(1)
 
         if mask.ndim != 2:
             raise ValueError(
-                "self_mask must reduce to [B, T], got "
+                "self_mask must reduce to [B,T], got "
                 f"{tuple(mask.shape)}."
             )
-        if mask.shape != (batch_size, time_steps):
+
+        if mask.shape != (
+            batch_size,
+            time_steps,
+        ):
             raise ValueError(
                 "self_mask shape mismatch. Expected "
-                f"{(batch_size, time_steps)}, got {tuple(mask.shape)}."
+                f"{(batch_size, time_steps)}, "
+                f"got {tuple(mask.shape)}."
             )
 
-        return mask.to(device=device).bool()
+        return mask.to(
+            device=device,
+        ).bool()
 
     @staticmethod
     def _normalize_temporal_distribution(
@@ -341,30 +400,46 @@ class Decoder(nn.Module):
         valid_mask,
         eps=1e-6,
     ):
-        if values.ndim == 3 and values.size(-1) == 1:
+        if (
+            values.ndim == 3
+            and values.size(-1) == 1
+        ):
             values = values.squeeze(-1)
 
         if values.shape != valid_mask.shape:
             raise ValueError(
-                "Temporal distribution and valid mask must have the "
-                f"same shape, got {tuple(values.shape)} and "
+                "Temporal distribution and valid mask must have "
+                "the same [B,T] shape. Got "
+                f"{tuple(values.shape)} and "
                 f"{tuple(valid_mask.shape)}."
             )
 
         values = values.clamp_min(0.0)
-        values = values * valid_mask.to(values.dtype)
+        values = (
+            values
+            * valid_mask.to(values.dtype)
+        )
 
         denominator = values.sum(
             dim=-1,
             keepdim=True,
         )
-        normalized = values / denominator.clamp_min(eps)
 
-        fallback = valid_mask.to(values.dtype)
-        fallback = fallback / fallback.sum(
-            dim=-1,
-            keepdim=True,
-        ).clamp_min(1.0)
+        normalized = (
+            values
+            / denominator.clamp_min(eps)
+        )
+
+        fallback = valid_mask.to(
+            values.dtype
+        )
+        fallback = (
+            fallback
+            / fallback.sum(
+                dim=-1,
+                keepdim=True,
+            ).clamp_min(1.0)
+        )
 
         return torch.where(
             denominator > eps,
@@ -373,26 +448,119 @@ class Decoder(nn.Module):
         )
 
     @staticmethod
+    def _normalize_qbound_mix(
+        qbound_mix,
+        batch_size,
+        device,
+        dtype,
+    ):
+        """
+        Return a [B,1] deterministic CRA->Q-Bound handover weight.
+
+        qbound_mix may be:
+            float / int
+            scalar tensor
+            [B] tensor
+            [B,1] tensor
+
+        V1.1.3 intentionally has NO learnable mixing parameter.
+        """
+        if qbound_mix is None:
+            qbound_mix = 1.0
+
+        if torch.is_tensor(qbound_mix):
+            mix = qbound_mix.to(
+                device=device,
+                dtype=dtype,
+            )
+        else:
+            mix = torch.tensor(
+                float(qbound_mix),
+                device=device,
+                dtype=dtype,
+            )
+
+        if mix.ndim == 0:
+            mix = mix.expand(
+                batch_size
+            ).unsqueeze(-1)
+
+        elif mix.ndim == 1:
+            if mix.numel() == 1:
+                mix = mix.expand(
+                    batch_size
+                ).unsqueeze(-1)
+            elif mix.numel() == batch_size:
+                mix = mix.unsqueeze(-1)
+            else:
+                raise ValueError(
+                    "1-D qbound_mix must contain either one value "
+                    f"or B={batch_size} values, got {mix.numel()}."
+                )
+
+        elif mix.ndim == 2:
+            if mix.shape == (1, 1):
+                mix = mix.expand(
+                    batch_size,
+                    1,
+                )
+            elif mix.shape != (
+                batch_size,
+                1,
+            ):
+                raise ValueError(
+                    "2-D qbound_mix must be [B,1]. "
+                    f"Expected {(batch_size, 1)}, "
+                    f"got {tuple(mix.shape)}."
+                )
+
+        else:
+            raise ValueError(
+                "qbound_mix must be scalar, [B], or [B,1]."
+            )
+
+        if (
+            (mix < 0.0).any()
+            or (mix > 1.0).any()
+        ):
+            raise ValueError(
+                "qbound_mix must lie in [0,1]."
+            )
+
+        # It is a schedule value, never a learnable model parameter.
+        return mix.detach()
+
+    @staticmethod
     def _masked_mean_video(
         features,
         valid_mask,
     ):
-        weights = valid_mask.to(features.dtype).unsqueeze(-1)
-        return (
-            (features * weights).sum(dim=1)
-            / weights.sum(dim=1).clamp_min(1.0)
+        weights = (
+            valid_mask.to(features.dtype)
+            .unsqueeze(-1)
         )
 
+        return (
+            (features * weights)
+            .sum(dim=1)
+            / weights.sum(
+                dim=1
+            ).clamp_min(1.0)
+        )
+
+    # ------------------------------------------------------------------
+    # Shared CRA video projection helpers
+    # ------------------------------------------------------------------
     def _sample_projection_dropout_mask(
         self,
         reference,
     ):
         """
-        Sample ONE CRA video-projection dropout realization.
+        Sample one projection-dropout realization.
 
-        The same mask is reused for original and merge representations.
-        This preserves the marginal behavior of nn.Dropout while preventing
-        counterfactual task harm from being caused by different random masks.
+        The SAME realization is reused by CRA diagnostic, main/original,
+        and merge counterfactual paths so task-harm measurements are not
+        contaminated by different random dropout masks.
         """
         dropout_layer = self.video_proj[0]
 
@@ -400,15 +568,25 @@ class Decoder(nn.Module):
             not self.training
             or dropout_layer.p <= 0.0
         ):
-            return torch.ones_like(reference)
+            return torch.ones_like(
+                reference
+            )
 
-        keep_prob = 1.0 - float(dropout_layer.p)
+        keep_prob = (
+            1.0
+            - float(dropout_layer.p)
+        )
+
         if keep_prob <= 0.0:
             raise ValueError(
                 "video projection dropout must be < 1."
             )
 
-        mask = torch.empty_like(reference).bernoulli_(keep_prob)
+        mask = (
+            torch.empty_like(reference)
+            .bernoulli_(keep_prob)
+        )
+
         return mask / keep_prob
 
     def _apply_video_projection(
@@ -416,15 +594,14 @@ class Decoder(nn.Module):
         pooled,
         dropout_mask,
     ):
-        """
-        Apply the original Dropout -> Linear projection with an externally
-        supplied dropout realization. Parameter names/checkpoint layout stay
-        unchanged because the Linear remains self.video_proj[1].
-        """
-        if pooled.shape != dropout_mask.shape:
+        if (
+            pooled.shape
+            != dropout_mask.shape
+        ):
             raise ValueError(
-                "pooled representation and dropout mask must have the "
-                f"same shape, got {tuple(pooled.shape)} and "
+                "pooled representation and dropout mask must "
+                "have the same shape. Got "
+                f"{tuple(pooled.shape)} and "
                 f"{tuple(dropout_mask.shape)}."
             )
 
@@ -441,21 +618,28 @@ class Decoder(nn.Module):
         projection_dropout_mask,
         x_star_proj=None,
     ):
+        del valid_mask
+
         pooled = torch.sum(
-            x_bar * temporal_weights.unsqueeze(-1),
+            x_bar
+            * temporal_weights.unsqueeze(-1),
             dim=1,
         )
 
-        projected = self._apply_video_projection(
-            pooled,
-            projection_dropout_mask,
+        projected = (
+            self._apply_video_projection(
+                pooled,
+                projection_dropout_mask,
+            )
         )
 
         if do:
             if x_star_proj is None:
                 raise ValueError(
-                    "x_star_proj is required when visual intervention is on."
+                    "x_star_proj is required when visual "
+                    "intervention is enabled."
                 )
+
             projected = self.do(
                 x_star_proj,
                 projected,
@@ -463,76 +647,190 @@ class Decoder(nn.Module):
 
         return projected
 
-    @staticmethod
-    def _build_temporal_bias(
-        event_temporal_logits,
+    # ------------------------------------------------------------------
+    # V1.1.3 temporal handover helpers
+    # ------------------------------------------------------------------
+    def _mix_temporal_keys(
+        self,
+        cra_key,
+        qbound_key,
+        qbound_mix,
         valid_mask,
     ):
         """
-        Direct Q-Bound temporal contribution in V1.1.1.
+        Deterministic probability-space handover.
 
-        There is deliberately NO beta gate. QBoundCore initializes its final
-        temporal scorer near zero, so the correction starts small but receives
-        main-task gradient directly.
+        CRA temporal weights are detached here even if a caller accidentally
+        supplies a tensor with gradients.
+
+        final_key =
+            (1-lambda) * stopgrad(cra_key)
+            + lambda * qbound_key
         """
-        if event_temporal_logits.shape != valid_mask.shape:
+        if (
+            cra_key.shape != qbound_key.shape
+            or cra_key.shape != valid_mask.shape
+        ):
             raise ValueError(
-                "event_temporal_logits must be [B,T] and match valid_mask. "
-                f"Got {tuple(event_temporal_logits.shape)} and "
-                f"{tuple(valid_mask.shape)}."
+                "cra_key, qbound_key, and valid_mask must share "
+                "shape [B,T]."
             )
 
-        return (
-            event_temporal_logits
-            * valid_mask.to(event_temporal_logits.dtype)
+        batch_size = cra_key.size(0)
+
+        mix = self._normalize_qbound_mix(
+            qbound_mix,
+            batch_size,
+            cra_key.device,
+            cra_key.dtype,
         )
 
-    def _finalize_counterfactual(
+        mixed = (
+            (1.0 - mix)
+            * cra_key.detach()
+            + mix
+            * qbound_key
+        )
+
+        mixed = (
+            mixed
+            * valid_mask.to(mixed.dtype)
+        )
+
+        mixed = (
+            mixed
+            / mixed.sum(
+                dim=-1,
+                keepdim=True,
+            ).clamp_min(1e-6)
+        )
+
+        return mixed, mix
+
+    def _build_time_param_from_key(
         self,
+        final_key,
         base_temporal,
+        qbound_key,
+        qbound_mix,
+        window_sizes,
+    ):
+        """
+        Create start/end using the repository's unchanged interval extraction.
+        """
+        time_param = (
+            self.grounding_module
+            .gen_grounding(
+                final_key,
+                window_sizes=window_sizes,
+            )
+        )
+
+        # CRA baseline/teacher diagnostics.
+        time_param["ori_key"] = (
+            base_temporal["ori_key"]
+        )
+        time_param["cra_key"] = (
+            base_temporal["cra_key"]
+        )
+
+        # V1.1.3 branch diagnostics.
+        time_param["qbound_key"] = (
+            qbound_key
+        )
+        time_param["refined_key"] = (
+            final_key
+        )
+        time_param["qbound_mix"] = (
+            qbound_mix.squeeze(-1)
+        )
+
+        return time_param
+
+    def _finalize_qbound_counterfactual(
+        self,
+        merge_temporal_prob,
+        cra_key,
+        qbound_mix,
         x_bar,
         valid_mask,
         do,
-        event_temporal_logits,
         window_sizes,
         projection_dropout_mask,
         x_star_proj,
     ):
         """
-        Run the transition-level merge through exactly the same grounding and
-        video-projection path as the original topology.
-
-        No bridge representation and no alpha residual are used.
+        Run transition-level MERGE through exactly the same Q-Bound grounding,
+        handover, video projection, and visual-intervention path as original.
         """
-        temporal_bias = self._build_temporal_bias(
-            event_temporal_logits,
-            valid_mask,
+        merge_qbound_time = (
+            self.grounding_module
+            .finalize_probability_grounding(
+                merge_temporal_prob,
+                valid_mask=valid_mask,
+                window_sizes=window_sizes,
+                detach_sigma=True,
+            )
         )
 
-        cf_time_param = self.grounding_module.finalize_grounding(
-            base_temporal,
-            temporal_bias=temporal_bias,
-            window_sizes=window_sizes,
+        merge_qbound_key = (
+            self._normalize_temporal_distribution(
+                merge_qbound_time["key"],
+                valid_mask,
+            )
         )
 
-        cf_key = self._normalize_temporal_distribution(
-            cf_time_param["key"],
-            valid_mask,
-        )
-        cf_time_param["key"] = cf_key
-        cf_time_param["refined_key"] = cf_key
-
-        projected = self._project_grounded_video(
-            x_bar=x_bar,
-            temporal_weights=cf_key,
-            valid_mask=valid_mask,
-            do=do,
-            projection_dropout_mask=projection_dropout_mask,
-            x_star_proj=x_star_proj,
+        merge_final_key, _ = (
+            self._mix_temporal_keys(
+                cra_key=cra_key,
+                qbound_key=merge_qbound_key,
+                qbound_mix=qbound_mix,
+                valid_mask=valid_mask,
+            )
         )
 
-        return projected, cf_time_param, temporal_bias
+        # Recompute interval from the actually-used mixed key.
+        merge_time_param = (
+            self.grounding_module
+            .gen_grounding(
+                merge_final_key,
+                window_sizes=window_sizes,
+            )
+        )
 
+        merge_time_param["qbound_key"] = (
+            merge_qbound_key
+        )
+        merge_time_param["cra_key"] = (
+            cra_key
+        )
+        merge_time_param["refined_key"] = (
+            merge_final_key
+        )
+
+        merge_video_proj = (
+            self._project_grounded_video(
+                x_bar=x_bar,
+                temporal_weights=merge_final_key,
+                valid_mask=valid_mask,
+                do=do,
+                projection_dropout_mask=(
+                    projection_dropout_mask
+                ),
+                x_star_proj=x_star_proj,
+            )
+        )
+
+        return (
+            merge_video_proj,
+            merge_time_param,
+            merge_qbound_key,
+            merge_final_key,
+        )
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
     def forward(
         self,
         x,
@@ -543,6 +841,7 @@ class Decoder(nn.Module):
         window_sizes=(1, 3, 5),
         use_qbound=False,
         question_feature=None,
+        qbound_mix=1.0,
         # Temporary compatibility alias for an older direct Decoder caller.
         use_gpeb=None,
     ):
@@ -550,43 +849,88 @@ class Decoder(nn.Module):
 
         if use_gpeb is not None:
             use_qbound = bool(
-                use_qbound or use_gpeb
+                use_qbound
+                or use_gpeb
             )
 
-        # Preserve pre-refinement video tokens for local-change cues.
+        # Preserve pre-refinement tokens for Q-Bound local-change features.
         x_raw = x
 
         for layer in self.layers:
-            x = layer(x, self_mask)
+            x = layer(
+                x,
+                self_mask,
+            )
+
         x_bar = self.norm(x)
 
-        batch_size, time_steps, _ = x_bar.shape
-        valid_mask = self._normalize_video_mask(
-            self_mask,
+        (
             batch_size,
             time_steps,
-            x_bar.device,
+            _,
+        ) = x_bar.shape
+
+        valid_mask = (
+            self._normalize_video_mask(
+                self_mask,
+                batch_size,
+                time_steps,
+                x_bar.device,
+            )
+        )
+
+        qbound_active = bool(
+            self.qbound_enabled
+            and use_qbound
         )
 
         # --------------------------------------------------------------
-        # 1) CRA temporal evidence, computed once.
+        # 1) CRA temporal branch.
+        #
+        # For Q-Bound VQA this branch is a DETACHED teacher only.
+        # For VQ / CRA-only mode it remains the original trainable CRA path.
         # --------------------------------------------------------------
-        base_temporal = self.grounding_module.compute_base_temporal(
-            x_bar,
-            qa,
-            valid_mask=valid_mask,
+        if qbound_active:
+            with torch.no_grad():
+                base_temporal = (
+                    self.grounding_module
+                    .compute_base_temporal(
+                        x_bar,
+                        qa,
+                        valid_mask=valid_mask,
+                    )
+                )
+        else:
+            base_temporal = (
+                self.grounding_module
+                .compute_base_temporal(
+                    x_bar,
+                    qa,
+                    valid_mask=valid_mask,
+                )
+            )
+
+        cra_key = (
+            self._normalize_temporal_distribution(
+                base_temporal["cra_key"],
+                valid_mask,
+            )
         )
 
-        cra_key = self._normalize_temporal_distribution(
-            base_temporal["cra_key"],
-            valid_mask,
+        if qbound_active:
+            # Defensive detach in addition to the no-grad teacher block.
+            cra_key = cra_key.detach()
+
+        # --------------------------------------------------------------
+        # 2) One shared stochastic projection context.
+        # --------------------------------------------------------------
+        projection_reference = (
+            self._masked_mean_video(
+                x_bar,
+                valid_mask,
+            )
         )
 
-        # One shared stochastic projection context for CRA / original / merge.
-        projection_reference = self._masked_mean_video(
-            x_bar,
-            valid_mask,
-        )
         projection_dropout_mask = (
             self._sample_projection_dropout_mask(
                 projection_reference
@@ -594,47 +938,51 @@ class Decoder(nn.Module):
         )
 
         x_star_proj = None
+
         if do:
-            # x_star is topology-independent, so compute it exactly once and
-            # reuse it for CRA, original, and merge intervention paths.
             x_star_dropout_mask = (
                 self._sample_projection_dropout_mask(
                     projection_reference
                 )
             )
-            x_star_proj = self._apply_video_projection(
-                projection_reference,
-                x_star_dropout_mask,
+
+            x_star_proj = (
+                self._apply_video_projection(
+                    projection_reference,
+                    x_star_dropout_mask,
+                )
             )
 
-        # CRA-only representation is retained only for the original CRA
-        # alignment objective and diagnostics.
-        cra_video_proj = self._project_grounded_video(
-            x_bar=x_bar,
-            temporal_weights=cra_key,
-            valid_mask=valid_mask,
-            do=do,
-            projection_dropout_mask=projection_dropout_mask,
-            x_star_proj=x_star_proj,
+        # CRA representation is diagnostic-only in VQA/Q-Bound mode.
+        # In VQ/CRA mode it is also the main representation because final_key
+        # equals cra_key.
+        cra_video_proj = (
+            self._project_grounded_video(
+                x_bar=x_bar,
+                temporal_weights=cra_key,
+                valid_mask=valid_mask,
+                do=do,
+                projection_dropout_mask=(
+                    projection_dropout_mask
+                ),
+                x_star_proj=x_star_proj,
+            )
         )
 
+        # --------------------------------------------------------------
+        # 3) Q-Bound branch.
+        # --------------------------------------------------------------
         qbound_aux = None
-        temporal_bias = torch.zeros_like(
-            base_temporal["cra_temporal_logits"]
-        )
 
-        # --------------------------------------------------------------
-        # 2) Question-conditioned Q-Bound topology.
-        # --------------------------------------------------------------
-        if self.qbound_enabled and use_qbound:
+        if qbound_active:
             if (
                 question_feature is None
                 and self.qbound_require_question_only
             ):
                 raise ValueError(
-                    "Q-Bound V1.1.1 requires question_feature=[B,D]. "
-                    "Pass question-only tokens through CRA.forward(..., "
-                    "question=...)."
+                    "Q-Bound V1.1.3 requires "
+                    "question_feature=[B,D]. Pass question-only "
+                    "tokens through CRA.forward(..., question=...)."
                 )
 
             qbound_language = (
@@ -644,151 +992,264 @@ class Decoder(nn.Module):
             )
 
             if self.qbound_detach_backbone_inputs:
-                video_for_qbound = x_raw.detach()
-                contextual_for_qbound = x_bar.detach()
-                language_for_qbound = qbound_language.detach()
+                video_for_qbound = (
+                    x_raw.detach()
+                )
+                contextual_for_qbound = (
+                    x_bar.detach()
+                )
+                language_for_qbound = (
+                    qbound_language.detach()
+                )
             else:
                 video_for_qbound = x_raw
                 contextual_for_qbound = x_bar
-                language_for_qbound = qbound_language
+                language_for_qbound = (
+                    qbound_language
+                )
 
             qbound_aux = self.qbound(
                 video_tokens=video_for_qbound,
-                question_features=language_for_qbound,
+                question_features=(
+                    language_for_qbound
+                ),
                 video_mask=valid_mask,
-                contextual_tokens=contextual_for_qbound,
-                # QBoundCore detaches this internally. With
-                # use_temporal_prior:false it becomes exact zeros.
-                temporal_prior=cra_key,
+                contextual_tokens=(
+                    contextual_for_qbound
+                ),
+                # V1.1.3 never needs CRA temporal evidence to define its
+                # topology. Passing None guarantees zero prior features even
+                # if an old config accidentally enables use_temporal_prior.
+                temporal_prior=None,
             )
 
             required_keys = {
-                "event_temporal_logits",
-                "frame_event_relevance",
-                "merge_event_temporal_logits",
+                "event_temporal_prob",
+                "merge_event_temporal_prob",
                 "merge_transition_selector",
                 "selected_transition_strength",
                 "selected_transition_mass",
                 "removed_boundary_mass",
             }
+
             missing = sorted(
-                required_keys.difference(qbound_aux)
+                required_keys.difference(
+                    qbound_aux
+                )
             )
+
             if missing:
                 raise KeyError(
-                    "Q-Bound V1.1.1 output is missing: "
+                    "Q-Bound V1.1.3 output is missing: "
                     + ", ".join(missing)
                 )
 
-            temporal_bias = self._build_temporal_bias(
-                qbound_aux["event_temporal_logits"],
-                valid_mask,
+            qbound_time = (
+                self.grounding_module
+                .finalize_probability_grounding(
+                    qbound_aux[
+                        "event_temporal_prob"
+                    ],
+                    valid_mask=valid_mask,
+                    window_sizes=window_sizes,
+                    detach_sigma=True,
+                )
+            )
+
+            qbound_key = (
+                self._normalize_temporal_distribution(
+                    qbound_time["key"],
+                    valid_mask,
+                )
+            )
+
+            final_key, mix = (
+                self._mix_temporal_keys(
+                    cra_key=cra_key,
+                    qbound_key=qbound_key,
+                    qbound_mix=qbound_mix,
+                    valid_mask=valid_mask,
+                )
+            )
+
+        else:
+            # Original CRA/VQ behavior.
+            qbound_key = cra_key
+            final_key = cra_key
+
+            mix = torch.zeros(
+                batch_size,
+                1,
+                dtype=final_key.dtype,
+                device=final_key.device,
             )
 
         # --------------------------------------------------------------
-        # 3) Final main grounding.
+        # 4) Final temporal grounding and main video representation.
+        # --------------------------------------------------------------
+        time_param = (
+            self._build_time_param_from_key(
+                final_key=final_key,
+                base_temporal=base_temporal,
+                qbound_key=qbound_key,
+                qbound_mix=mix,
+                window_sizes=window_sizes,
+            )
+        )
+
+        video_proj = (
+            self._project_grounded_video(
+                x_bar=x_bar,
+                temporal_weights=final_key,
+                valid_mask=valid_mask,
+                do=do,
+                projection_dropout_mask=(
+                    projection_dropout_mask
+                ),
+                x_star_proj=x_star_proj,
+            )
+        )
+
+        # CRITICAL V1.1.3 change:
+        # VQA alignment must supervise the same representation used by the
+        # main VQA scorer. In Q-Bound mode this therefore follows the handover
+        # and becomes pure Q-Bound when qbound_mix reaches 1.
         #
-        # Q-Bound has ONE route into the task:
-        #   CRA logits + event temporal logits -> final key -> main video.
-        # --------------------------------------------------------------
-        time_param = self.grounding_module.finalize_grounding(
-            base_temporal,
-            temporal_bias=temporal_bias,
-            window_sizes=window_sizes,
+        # In VQ / CRA-only mode final_key == cra_key, so original CRA alignment
+        # behavior is preserved.
+        time_param["grounding_feature"] = (
+            video_proj
         )
 
-        final_key = self._normalize_temporal_distribution(
-            time_param["key"],
-            valid_mask,
+        # Useful diagnostic only; no loss should be attached to it directly.
+        time_param["cra_grounding_feature"] = (
+            cra_video_proj
         )
-        time_param["key"] = final_key
-        time_param["refined_key"] = final_key
-
-        video_proj = self._project_grounded_video(
-            x_bar=x_bar,
-            temporal_weights=final_key,
-            valid_mask=valid_mask,
-            do=do,
-            projection_dropout_mask=projection_dropout_mask,
-            x_star_proj=x_star_proj,
-        )
-
-        # Preserve the original CRA alignment target. Q-Bound does not alter
-        # the target used by the existing CRA alignment objective.
-        time_param["grounding_feature"] = cra_video_proj
 
         # --------------------------------------------------------------
-        # 4) Transition-level merge counterfactual through the SAME path.
+        # 5) Transition-level merge counterfactual.
         # --------------------------------------------------------------
         if qbound_aux is not None:
-            event_key = self._normalize_temporal_distribution(
-                qbound_aux["frame_event_relevance"],
-                valid_mask,
-            )
-
-            merge_video_proj, merge_time_param, merge_bias = (
-                self._finalize_counterfactual(
-                    base_temporal=base_temporal,
-                    x_bar=x_bar,
-                    valid_mask=valid_mask,
-                    do=do,
-                    event_temporal_logits=(
-                        qbound_aux[
-                            "merge_event_temporal_logits"
-                        ][:, 0]
-                    ),
-                    window_sizes=window_sizes,
-                    projection_dropout_mask=projection_dropout_mask,
-                    x_star_proj=x_star_proj,
-                )
+            (
+                merge_video_proj,
+                merge_time_param,
+                merge_qbound_key,
+                merge_final_key,
+            ) = self._finalize_qbound_counterfactual(
+                merge_temporal_prob=(
+                    qbound_aux[
+                        "merge_event_temporal_prob"
+                    ][:, 0]
+                ),
+                cra_key=cra_key,
+                qbound_mix=mix,
+                x_bar=x_bar,
+                valid_mask=valid_mask,
+                do=do,
+                window_sizes=window_sizes,
+                projection_dropout_mask=(
+                    projection_dropout_mask
+                ),
+                x_star_proj=x_star_proj,
             )
 
             qbound_aux.update(
                 {
-                    # Original/main path.
+                    # CRA teacher / pure Q-Bound / actually-used main key.
                     "cra_key": cra_key,
-                    "event_key": event_key,
+                    "event_key": qbound_key,
+                    "qbound_key": qbound_key,
                     "final_key": final_key,
                     "refined_key": final_key,
-                    "temporal_bias": temporal_bias,
-                    "cra_video_proj": cra_video_proj,
-                    "main_video_proj": video_proj,
+                    "qbound_mix": (
+                        mix.squeeze(-1)
+                    ),
 
-                    # Transition-level merge through the same main path.
-                    "merge_temporal_bias": merge_bias,
+                    # Video representations.
+                    "cra_video_proj": (
+                        cra_video_proj
+                    ),
+                    "main_video_proj": (
+                        video_proj
+                    ),
+
+                    # Transition-level merge through the SAME handover.
+                    "merge_qbound_key": (
+                        merge_qbound_key.unsqueeze(1)
+                    ),
                     "merge_final_key": (
-                        merge_time_param["key"].unsqueeze(1)
+                        merge_final_key.unsqueeze(1)
                     ),
                     "merge_start": (
-                        merge_time_param["start"].unsqueeze(1)
+                        merge_time_param[
+                            "start"
+                        ].unsqueeze(1)
                     ),
                     "merge_end": (
-                        merge_time_param["end"].unsqueeze(1)
+                        merge_time_param[
+                            "end"
+                        ].unsqueeze(1)
                     ),
                     "merge_video_proj": (
                         merge_video_proj.unsqueeze(1)
                     ),
 
-                    # Useful direct diagnostic of how much the topology
-                    # intervention changed final temporal grounding.
+                    # Final-path intervention magnitude. During training this
+                    # naturally scales with the deterministic handover lambda.
                     "merge_key_l1": (
                         (
-                            merge_time_param["key"]
+                            merge_final_key
                             - final_key
                         )
                         .abs()
                         .mean(dim=-1)
                     ),
 
-                    "question_only_conditioning": torch.as_tensor(
-                        float(question_feature is not None),
-                        device=video_proj.device,
-                        dtype=video_proj.dtype,
+                    # Pure Q-Bound intervention magnitude, independent of
+                    # handover. This is particularly useful during epochs 1-5.
+                    "pure_qbound_merge_key_l1": (
+                        (
+                            merge_qbound_key
+                            - qbound_key
+                        )
+                        .abs()
+                        .mean(dim=-1)
+                    ),
+
+                    # Direct CRA-vs-Q-Bound disagreement before handover.
+                    "cra_qbound_key_l1": (
+                        (
+                            qbound_key
+                            - cra_key
+                        )
+                        .abs()
+                        .mean(dim=-1)
+                    ),
+
+                    "question_only_conditioning": (
+                        torch.as_tensor(
+                            float(
+                                question_feature
+                                is not None
+                            ),
+                            device=video_proj.device,
+                            dtype=video_proj.dtype,
+                        )
                     ),
                 }
             )
 
-        time_param["qbound_aux"] = qbound_aux
-        time_param["qbound_feature"] = video_proj
+        time_param["qbound_aux"] = (
+            qbound_aux
+        )
 
-        return video_proj, final_key, time_param
+        # Compatibility name used elsewhere in the current repository.
+        time_param["qbound_feature"] = (
+            video_proj
+        )
+
+        return (
+            video_proj,
+            final_key,
+            time_param,
+        )

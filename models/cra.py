@@ -11,13 +11,19 @@ from modules.m_cra.causal_module import LinguisticInterventionGraph
 
 class CRA(nn.Module):
     """
-    CRA with optional Q-Bound Version 1.1 event topology reasoning.
+    CRA wrapper with optional Q-Bound Version 1.1.3 temporal reasoning.
 
-    The original CRA path remains candidate-conditioned for compatibility.
-    Q-Bound receives a separate question-only representation so event
-    topology does not directly depend on answer choices. Q-Bound itself
-    is implemented independently under modules/qbound; CRA only provides
-    a backbone adapter.
+    Responsibilities of this wrapper are deliberately limited:
+
+    * preserve the original CRA candidate-conditioned VQ/VQA language path;
+    * encode a separate question-only representation for Q-Bound;
+    * pass the deterministic CRA -> Q-Bound handover weight ``qbound_mix``
+      to the refine decoder;
+    * expose the decoder's final temporal key and diagnostics unchanged.
+
+    Q-Bound never receives answer-choice-conditioned features for topology
+    induction.  The actual CRA/Q-Bound temporal handover is implemented in
+    modules.m_cra.refine.Decoder, not in this wrapper.
     """
 
     def __init__(self, cfgs, tokenizer) -> None:
@@ -52,7 +58,7 @@ class CRA(nn.Module):
                 "version",
                 model_cfg.get(
                     "qbound_version",
-                    model_cfg.get("gpeb_version", "1.1"),
+                    model_cfg.get("gpeb_version", "1.1.3"),
                 ),
             )
         )
@@ -271,12 +277,23 @@ class CRA(nn.Module):
         mode="VQA",
         gsub=None,
         question=None,
+        qbound_mix=1.0,
     ):
         """
-        Refined CRA forward.
+        Refined CRA/Q-Bound V1.1.3 forward.
 
-        `question` is required by default whenever Q-Bound V1.1 is active,
-        because boundary induction must remain question-only.
+        ``question`` is required by default whenever Q-Bound is active,
+        because topology induction must remain question-only.
+
+        ``qbound_mix`` is a deterministic, non-learned handover value in
+        [0,1].  It is consumed by RefineDecoder:
+
+            final_key =
+                (1 - qbound_mix) * stopgrad(cra_key)
+                + qbound_mix * qbound_key
+
+        The training pipeline schedules this value. Validation/test should
+        explicitly use qbound_mix=1.0.
         """
         mode = mode.upper()
 
@@ -335,7 +352,7 @@ class CRA(nn.Module):
             if question is None:
                 if self.qbound_require_question_only:
                     raise ValueError(
-                        "Q-Bound V1.1 requires question-only token ids. "
+                        "Q-Bound V1.1.3 requires question-only token ids. "
                         "Pass them through CRA.forward(..., question=...). "
                         "Do not silently reuse candidate answer features, "
                         "because that would leak answer-choice semantics "
@@ -367,11 +384,19 @@ class CRA(nn.Module):
             ),
             use_qbound=use_qbound,
             question_feature=question_g,
+            # Fixed curriculum value supplied by CRAPipeline.
+            # RefineDecoder detaches/validates it and performs the actual
+            # probability-space CRA -> Q-Bound handover.
+            qbound_mix=(
+                qbound_mix
+                if use_qbound
+                else 0.0
+            ),
         )
 
-        # Candidate embeddings are used by the main scorer. V1.1
-        # counterfactual video features exposed by the decoder must be
-        # evaluated by this same scorer in cra_pipeline.py.
+        # Candidate embeddings are still scored by the repository's
+        # original main dot-product rule. Q-Bound changes temporal grounding,
+        # not the answer-scoring head.
         answer_proj = answer_g
 
         outs = {
@@ -387,7 +412,12 @@ class CRA(nn.Module):
                 dtype=video_proj.dtype,
             ),
             "qbound_active": use_qbound,
-            # Compatibility alias for the current V1.0 pipeline.
+            "qbound_mix": (
+                time_param.get("qbound_mix")
+                if isinstance(time_param, dict)
+                else None
+            ),
+            # Temporary compatibility alias for old logging/checkpoints.
             "gpeb_active": use_qbound,
         }
 
@@ -402,9 +432,10 @@ class CRA(nn.Module):
         mode="VQA",
         gsub=None,
         question=None,
+        qbound_mix=1.0,
     ):
         # Keep a common call signature with refine_forward.
-        del gsub, question
+        del gsub, question, qbound_mix
 
         mode = mode.upper()
         if mode not in {"VQ", "VQA"}:
