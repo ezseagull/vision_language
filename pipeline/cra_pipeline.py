@@ -21,21 +21,24 @@ from utils.misc.misc import (
 
 class CRAPipeline(BasePipeline):
     """
-    CRA training pipeline with Q-Bound Version 1.1.3.
+    CRA training pipeline with Q-Bound Version 1.2.
 
-    V1.1.3 uses ONLY the repository's original task objectives:
+    V1.2 preserves the repository task objectives and adds one Q-Bound-specific weak event alignment objective:
 
         L =
-            L_VQ_CE
-            + L_VQA_CE
-            + L_alignment
+            L_CRA_original
+            + lambda_align * L_QBound_weak_align
+            + lambda_sparse * L_boundary_sparse   (optional; default 0)
 
-    There is deliberately NO Q-Bound auxiliary optimization loss:
-        * no necessity BCE
-        * no split invariance
-        * no minimality loss
-        * no CRA/Q-Bound consistency loss
-        * no separate answer head
+    The weak alignment is event/topology specific: the pure Q-Bound
+    evidence_visual_token is aligned with the question-only Q-Bound state
+    using in-batch InfoNCE. No answer feature is fed into topology induction.
+
+    There is still deliberately NO:
+        * necessity BCE
+        * split invariance
+        * CRA/Q-Bound consistency loss
+        * separate answer head
 
     Q-Bound learns through the main VQA path. During training a fixed,
     non-learned curriculum hands temporal responsibility from the detached
@@ -51,6 +54,9 @@ class CRAPipeline(BasePipeline):
     results and never benefit from the CRA teacher mixture.
 
     Transition-level MERGE is retained only as a diagnostic counterfactual.
+
+    Dynamic boundary count and event-count histograms are monitored explicitly
+    because V1.2 must not regress to either 1-event collapse or max-event saturation.
     """
 
     def __init__(self, cfgs) -> None:
@@ -78,7 +84,7 @@ class CRAPipeline(BasePipeline):
 
     def _qbound_handover_settings(self):
         """
-        Read the deterministic V1.1.3 CRA -> Q-Bound curriculum.
+        Read the deterministic V1.2 CRA -> Q-Bound curriculum.
 
         Preferred config:
             model:
@@ -87,7 +93,7 @@ class CRAPipeline(BasePipeline):
                 handover_epochs: 5
 
         Model-level fallbacks are kept only so older YAML files fail softly
-        until the final V1.1.3 config is installed.
+        until the final V1.2 config is installed.
         """
         model_cfg = self.cfgs.get("model", {})
         qbound_cfg = model_cfg.get("qbound", {})
@@ -126,6 +132,127 @@ class CRAPipeline(BasePipeline):
             )
 
         return handover_start, handover_epochs
+
+    def _qbound_v12_loss_settings(self):
+        """Read the small set of V1.2-specific auxiliary-loss settings."""
+        model_cfg = self.cfgs.get("model", {})
+        qbound_cfg = model_cfg.get("qbound", {})
+        if not isinstance(qbound_cfg, dict):
+            qbound_cfg = {}
+
+        align_weight = float(
+            qbound_cfg.get(
+                "weak_align_weight",
+                model_cfg.get("qbound_weak_align_weight", 0.10),
+            )
+        )
+        align_temperature = float(
+            qbound_cfg.get(
+                "weak_align_temperature",
+                model_cfg.get("qbound_weak_align_temperature", 0.07),
+            )
+        )
+        boundary_sparse_weight = float(
+            qbound_cfg.get(
+                "boundary_sparse_weight",
+                model_cfg.get("qbound_boundary_sparse_weight", 0.0),
+            )
+        )
+
+        if align_weight < 0.0:
+            raise ValueError("qbound weak_align_weight must be >= 0.")
+        if align_temperature <= 0.0:
+            raise ValueError("qbound weak_align_temperature must be > 0.")
+        if boundary_sparse_weight < 0.0:
+            raise ValueError("qbound boundary_sparse_weight must be >= 0.")
+
+        return align_weight, align_temperature, boundary_sparse_weight
+
+    @staticmethod
+    def _qbound_inbatch_alignment(
+        evidence_visual_token,
+        question_state,
+        temperature,
+    ):
+        """
+        Q-Bound-specific weak event alignment.
+
+        evidence_visual_token: [B,H]
+            Pure visual event evidence pooled by the learned dynamic topology.
+        question_state: [B,H]
+            Question-only Q-Bound state. It is detached and acts as a semantic
+            target; answer-choice semantics are never fed into topology.
+
+        The objective is symmetric in retrieval space, but gradients only need
+        to move the visual/topology side toward its own semantic target.
+        """
+        if evidence_visual_token is None or question_state is None:
+            raise ValueError(
+                "Q-Bound V1.2 weak alignment requires evidence_visual_token "
+                "and qa_state."
+            )
+        if evidence_visual_token.ndim != 2 or question_state.ndim != 2:
+            raise ValueError(
+                "Q-Bound weak-alignment tensors must both be [B,H]."
+            )
+        if evidence_visual_token.shape != question_state.shape:
+            raise ValueError(
+                "Q-Bound weak-alignment shape mismatch: "
+                f"{tuple(evidence_visual_token.shape)} vs "
+                f"{tuple(question_state.shape)}."
+            )
+
+        batch_size = evidence_visual_token.size(0)
+        if batch_size < 2:
+            zero = evidence_visual_token.sum() * 0.0
+            return zero, 0.0
+
+        visual = F.normalize(
+            evidence_visual_token,
+            p=2,
+            dim=-1,
+            eps=1e-6,
+        )
+        semantic = F.normalize(
+            question_state.detach(),
+            p=2,
+            dim=-1,
+            eps=1e-6,
+        )
+
+        logits = torch.matmul(visual, semantic.transpose(0, 1))
+        logits = logits / float(temperature)
+        labels = torch.arange(batch_size, device=logits.device)
+
+        visual_to_text = F.cross_entropy(logits, labels)
+        text_to_visual = F.cross_entropy(logits.transpose(0, 1), labels)
+        align_loss = 0.5 * (visual_to_text + text_to_visual)
+
+        retrieval_acc = (
+            logits.detach().argmax(dim=-1) == labels
+        ).float().mean().item()
+
+        return align_loss, retrieval_acc
+
+    @staticmethod
+    def _qbound_boundary_sparse_loss(qbound_aux):
+        """
+        Optional soft boundary-density penalty. Disabled by default in V1.2.
+
+        This must stay optional because a sparsity force can collapse dynamic
+        topology back to one event before event reasoning becomes necessary.
+        """
+        boundary_prob = qbound_aux.get("boundary_prob")
+        boundary_mask = qbound_aux.get("boundary_mask")
+        if not torch.is_tensor(boundary_prob) or not torch.is_tensor(boundary_mask):
+            raise KeyError(
+                "Q-Bound boundary sparsity requires boundary_prob/boundary_mask."
+            )
+        weights = boundary_mask.to(boundary_prob.dtype)
+        return (
+            (boundary_prob * weights).sum()
+            / weights.sum().clamp_min(1.0)
+        )
 
     def _train_qbound_mix(
         self,
@@ -195,7 +322,7 @@ class CRAPipeline(BasePipeline):
         )
 
     def _get_qbound_aux(self, gqa_output):
-        """Safely extract Q-Bound V1.1.3 outputs from a CRA VQA forward."""
+        """Safely extract Q-Bound V1.2 outputs from a CRA VQA forward."""
         if not self._qbound_enabled():
             return None
 
@@ -245,7 +372,7 @@ class CRAPipeline(BasePipeline):
             [B, C] or [B, M, C]
 
         `prop_num` aggregation is exactly the same operation used by the main
-        VQA path.  V1.1.3 counterfactuals therefore do not use a separate
+        VQA path.  V1.2 counterfactuals therefore do not use a separate
         auxiliary answer head.
         """
         if answer_proj.ndim != 3:
@@ -358,7 +485,7 @@ class CRAPipeline(BasePipeline):
         eps=1e-8,
     ):
         """
-        Diagnostic only in V1.1.3.
+        Diagnostic only in V1.2.
 
         There is NO CRA-event grounding consistency loss.
         """
@@ -395,7 +522,7 @@ class CRAPipeline(BasePipeline):
         return 0.5 * (first_kl + second_kl)
 
     # ------------------------------------------------------------------
-    # Q-Bound V1.1.3 counterfactual diagnostics
+    # Q-Bound V1.2 counterfactual diagnostics
     # ------------------------------------------------------------------
     @staticmethod
     def _distribution_entropy(
@@ -419,7 +546,7 @@ class CRAPipeline(BasePipeline):
             dim=-1,
         )
 
-    def _compute_qbound_v113_diagnostics(
+    def _compute_qbound_v12_diagnostics(
         self,
         gqa_output,
         answer_proj,
@@ -441,7 +568,7 @@ class CRAPipeline(BasePipeline):
 
             necessity = 1 - exp(-relu(CE_merge - CE_original))
 
-        It is NEVER used as a BCE target in V1.1.3.
+        It remains diagnostic-only in V1.2.
         """
         qbound_aux = self._get_qbound_aux(
             gqa_output
@@ -475,7 +602,7 @@ class CRAPipeline(BasePipeline):
 
         if missing:
             raise KeyError(
-                "Missing Q-Bound V1.1.3 outputs: "
+                "Missing Q-Bound V1.2 outputs: "
                 + ", ".join(missing)
             )
 
@@ -944,8 +1071,12 @@ class CRAPipeline(BasePipeline):
         scalar_keys = [
             "boundary_prob_mean",
             "boundary_count",
+            "event_count",
+            "selected_boundary_prob_mean",
             "assignment_entropy",
             "effective_event_count",
+            "soft_effective_event_count",
+            "event_relevance_entropy",
             "token_entropy",
             "selected_transition_mass",
             "selected_transition_strength",
@@ -1001,6 +1132,52 @@ class CRAPipeline(BasePipeline):
                     valid_boundary.detach()
                     .float().max().item()
                 )
+
+        # V1.2 dynamic-topology diagnostics. The histogram is the primary
+        # signal for detecting both max-event saturation and 1-event collapse.
+        event_count = qbound_aux.get("event_count")
+        if torch.is_tensor(event_count):
+            event_count_int = event_count.detach().round().long()
+            max_events = int(
+                self.cfgs.get("model", {})
+                .get("qbound", {})
+                .get("max_events", 4)
+            )
+            for number_of_events in range(1, max_events + 1):
+                stats[
+                    f"qbound_event_count_{number_of_events}_ratio"
+                ] = (
+                    event_count_int == number_of_events
+                ).float().mean().item()
+
+        candidate_mask = qbound_aux.get("boundary_candidate_mask")
+        if torch.is_tensor(candidate_mask):
+            stats["qbound_boundary_candidate_count"] = (
+                candidate_mask.detach().float().sum(dim=-1).mean().item()
+            )
+
+        pre_smooth_key = qbound_aux.get("qbound_pre_smooth_key")
+        post_smooth_key = qbound_aux.get("qbound_post_smooth_key")
+        if torch.is_tensor(pre_smooth_key) and torch.is_tensor(post_smooth_key):
+            stats["qbound_pre_post_smooth_l1"] = (
+                (pre_smooth_key.detach() - post_smooth_key.detach())
+                .abs().mean().item()
+            )
+            pre_peak = pre_smooth_key.detach().argmax(dim=-1)
+            post_peak = post_smooth_key.detach().argmax(dim=-1)
+            stats["qbound_smoothing_peak_change_ratio"] = (
+                pre_peak != post_peak
+            ).float().mean().item()
+
+        frame_semantic_logits = qbound_aux.get("frame_semantic_logits")
+        if torch.is_tensor(frame_semantic_logits):
+            values = frame_semantic_logits.detach().float()
+            stats["qbound_frame_semantic_logit_abs_mean"] = (
+                values.abs().mean().item()
+            )
+            stats["qbound_frame_semantic_logit_std"] = (
+                values.std(unbiased=False).item()
+            )
 
         event_mass = (
             qbound_aux.get(
@@ -1165,7 +1342,7 @@ class CRAPipeline(BasePipeline):
                     .float().max().item()
                 )
 
-        # Monitor whether tanh-bounded semantic scores are saturating.
+        # Monitor semantic score scale; V1.2 no longer applies tanh bounding.
         for source_key, stat_prefix in [
             (
                 "event_token_scores",
@@ -1331,11 +1508,27 @@ class CRAPipeline(BasePipeline):
 
             "qbound_boundary_prob_mean",
             "qbound_boundary_count",
+            "qbound_event_count",
+            "qbound_event_count_1_ratio",
+            "qbound_event_count_2_ratio",
+            "qbound_event_count_3_ratio",
+            "qbound_event_count_4_ratio",
+            "qbound_boundary_candidate_count",
+            "qbound_selected_boundary_prob_mean",
             "qbound_boundary_prob_min",
             "qbound_boundary_prob_max",
             "qbound_assignment_entropy",
             "qbound_effective_event_count",
+            "qbound_soft_effective_event_count",
+            "qbound_event_relevance_entropy",
             "qbound_token_entropy",
+            "qbound_pre_post_smooth_l1",
+            "qbound_smoothing_peak_change_ratio",
+            "qbound_frame_semantic_logit_abs_mean",
+            "qbound_frame_semantic_logit_std",
+            "qbound_weak_align_retrieval_acc",
+            "qbound_weak_align_weight",
+            "qbound_boundary_sparse_weight",
             "qbound_event_mass_min",
             "qbound_event_mass_max",
 
@@ -1529,7 +1722,7 @@ class CRAPipeline(BasePipeline):
             "vqa_target"
         ] = answer_id_device
 
-        # refine_v113.py sets grounding_feature = FINAL grounded feature.
+        # refine.py keeps grounding_feature = FINAL grounded feature.
         # Thus the original CRA VQA alignment objective now supervises the
         # same mixed/Q-Bound representation used by the main answer scorer.
         prediction_dict[
@@ -1550,22 +1743,82 @@ class CRAPipeline(BasePipeline):
             ]
         )
 
-        # V1.1.3 optimization = repository original task losses ONLY.
+        # Repository CRA task loss is preserved exactly; Q-Bound V1.2 auxiliary objectives are added below.
         loss = self.criterion(
             prediction_dict,
             target_dict,
         )
 
+        # --------------------------------------------------------------
+        # Q-Bound V1.2 weak event alignment.
+        #
+        # This is intentionally different from CRA's existing global alignment:
+        # it acts on the topology-pooled event evidence inside QBoundCore and a
+        # question-only semantic state. Therefore it can shape event assignment
+        # even during early CRA->Q-Bound handover without answer leakage.
+        # --------------------------------------------------------------
+        weak_align_retrieval_acc = None
+        align_weight = 0.0
+        boundary_sparse_weight = 0.0
+
+        qbound_aux = self._get_qbound_aux(gqa_output)
+        if self._qbound_enabled() and qbound_aux is not None:
+            (
+                align_weight,
+                align_temperature,
+                boundary_sparse_weight,
+            ) = self._qbound_v12_loss_settings()
+
+            if align_weight > 0.0:
+                qbound_align_loss, weak_align_retrieval_acc = (
+                    self._qbound_inbatch_alignment(
+                        evidence_visual_token=qbound_aux.get(
+                            "evidence_visual_token"
+                        ),
+                        question_state=qbound_aux.get("qa_state"),
+                        temperature=align_temperature,
+                    )
+                )
+                loss["qbound_align_loss"] = qbound_align_loss
+                loss["total_loss"] = (
+                    loss["total_loss"]
+                    + align_weight * qbound_align_loss
+                )
+
+            # Disabled by default for the first V1.2 run. Turn this on only if
+            # event_count again saturates at max_events.
+            if boundary_sparse_weight > 0.0:
+                qbound_boundary_sparse_loss = (
+                    self._qbound_boundary_sparse_loss(qbound_aux)
+                )
+                loss["qbound_boundary_sparse_loss"] = (
+                    qbound_boundary_sparse_loss
+                )
+                loss["total_loss"] = (
+                    loss["total_loss"]
+                    + boundary_sparse_weight * qbound_boundary_sparse_loss
+                )
+
         # Counterfactuals are diagnostic only. No value returned here is
         # added to loss["total_loss"].
         qbound_logs = (
-            self._compute_qbound_v113_diagnostics(
+            self._compute_qbound_v12_diagnostics(
                 gqa_output=gqa_output,
                 answer_proj=answer_proj,
                 answer_id=answer_id,
                 main_logits=predicts,
             )
         )
+
+        if self._qbound_enabled():
+            qbound_logs["qbound_weak_align_weight"] = float(align_weight)
+            qbound_logs["qbound_boundary_sparse_weight"] = float(
+                boundary_sparse_weight
+            )
+            if weak_align_retrieval_acc is not None:
+                qbound_logs["qbound_weak_align_retrieval_acc"] = float(
+                    weak_align_retrieval_acc
+                )
 
         predicted = (
             predicts.argmax(
@@ -1614,6 +1867,10 @@ class CRAPipeline(BasePipeline):
             self.monitor.reset_kv(f"{key}_loss")
 
         if self._qbound_enabled():
+            # Loss dict entries are logged separately below, but resetting them
+            # here keeps epoch statistics clean when an auxiliary weight changes.
+            self.monitor.reset_kv("qbound_align_loss")
+            self.monitor.reset_kv("qbound_boundary_sparse_loss")
             for key in self._qbound_monitor_keys():
                 self.monitor.reset_kv(key)
 
@@ -1862,6 +2119,33 @@ class CRAPipeline(BasePipeline):
                     f"{key}: {score[key]:.6f}"
                 )
 
+        temporal_diagnostic_prefixes = (
+            "val_QBound-",
+            "test_QBound-",
+            "val_CRA-",
+            "test_CRA-",
+            "val_QBoundPreSmooth-",
+            "test_QBoundPreSmooth-",
+            "val_QBoundPostSmooth-",
+            "test_QBoundPostSmooth-",
+        )
+
+        temporal_diagnostic_keys = [
+            key
+            for key in score
+            if key.startswith(temporal_diagnostic_prefixes)
+        ]
+
+        if temporal_diagnostic_keys:
+            self.monitor.log_info(
+                "\n============ Temporal-key faithfulness "
+                "============"
+            )
+            for key in sorted(temporal_diagnostic_keys):
+                self.monitor.log_info(
+                    f"{key}: {score[key]:.6f}"
+                )
+
         print("\n")
 
     def draw_grounding(
@@ -1981,6 +2265,14 @@ class CRAPipeline(BasePipeline):
         keyframe = {}
         ori_keyframe = {}
 
+        # Q-Bound V1.2 temporal-key diagnostics.
+        # Keep the pure Q-Bound and CRA teacher keys separately so we can
+        # directly test whether Q-Bound is selective AND temporally correct.
+        qbound_keyframe = {}
+        cra_keyframe = {}
+        qbound_pre_smooth_keyframe = {}
+        qbound_post_smooth_keyframe = {}
+
         qbound_stat_sums = collections.defaultdict(
             float
         )
@@ -2048,7 +2340,7 @@ class CRAPipeline(BasePipeline):
                     answer_id=answer_id,
                     mode="VQA",
                     question=question,
-                    # V1.1.3 checkpoint selection/reporting is ALWAYS
+                    # V1.2 checkpoint selection/reporting is ALWAYS
                     # evaluated on the pure Q-Bound temporal path.
                     qbound_mix=(
                         1.0
@@ -2095,7 +2387,7 @@ class CRAPipeline(BasePipeline):
 
                 if qbound_aux is not None:
                     counterfactual_logs = (
-                        self._compute_qbound_v113_diagnostics(
+                        self._compute_qbound_v12_diagnostics(
                             gqa_output=eval_wrapper,
                             answer_proj=answer_proj,
                             answer_id=answer_id,
@@ -2156,6 +2448,49 @@ class CRAPipeline(BasePipeline):
                         "ori_key"
                     ].detach().cpu().numpy()
 
+                    # Ver1.2: collect the temporal distributions needed by
+                    # Metric.temporal_key_metrics().  Validation/test always
+                    # run with qbound_mix=1, so qbound_key is the pure Q-Bound
+                    # grounding distribution used for model selection.
+                    batch_qbound_keyframe = None
+                    batch_cra_keyframe = None
+                    batch_qbound_pre_smooth_keyframe = None
+                    batch_qbound_post_smooth_keyframe = None
+
+                    if qbound_aux is not None:
+                        pure_qbound_key = qbound_aux.get(
+                            "qbound_key",
+                            qbound_aux.get("event_key"),
+                        )
+                        pure_cra_key = qbound_aux.get("cra_key")
+                        pre_smooth_key = qbound_aux.get(
+                            "qbound_pre_smooth_key"
+                        )
+                        post_smooth_key = qbound_aux.get(
+                            "qbound_post_smooth_key",
+                            pure_qbound_key,
+                        )
+
+                        if torch.is_tensor(pure_qbound_key):
+                            batch_qbound_keyframe = (
+                                pure_qbound_key.detach().cpu().numpy()
+                            )
+
+                        if torch.is_tensor(pure_cra_key):
+                            batch_cra_keyframe = (
+                                pure_cra_key.detach().cpu().numpy()
+                            )
+
+                        if torch.is_tensor(pre_smooth_key):
+                            batch_qbound_pre_smooth_keyframe = (
+                                pre_smooth_key.detach().cpu().numpy()
+                            )
+
+                        if torch.is_tensor(post_smooth_key):
+                            batch_qbound_post_smooth_keyframe = (
+                                post_smooth_key.detach().cpu().numpy()
+                            )
+
                     for batch_index, qid in enumerate(
                         question_id
                     ):
@@ -2191,6 +2526,34 @@ class CRAPipeline(BasePipeline):
                                 batch_index
                             ].tolist()
                         )
+
+                        if batch_qbound_keyframe is not None:
+                            qbound_keyframe[qid] = (
+                                batch_qbound_keyframe[
+                                    batch_index
+                                ].tolist()
+                            )
+
+                        if batch_cra_keyframe is not None:
+                            cra_keyframe[qid] = (
+                                batch_cra_keyframe[
+                                    batch_index
+                                ].tolist()
+                            )
+
+                        if batch_qbound_pre_smooth_keyframe is not None:
+                            qbound_pre_smooth_keyframe[qid] = (
+                                batch_qbound_pre_smooth_keyframe[
+                                    batch_index
+                                ].tolist()
+                            )
+
+                        if batch_qbound_post_smooth_keyframe is not None:
+                            qbound_post_smooth_keyframe[qid] = (
+                                batch_qbound_post_smooth_keyframe[
+                                    batch_index
+                                ].tolist()
+                            )
                 else:
                     for batch_index, qid in enumerate(
                         question_id
@@ -2274,11 +2637,71 @@ class CRAPipeline(BasePipeline):
             gs=False,
         )
 
+        # --------------------------------------------------------------
+        # Q-Bound V1.2 temporal-faithfulness diagnostics.
+        #
+        # Official benchmark metrics above remain untouched. These extra
+        # diagnostics answer the failure mode seen in V1.1.3:
+        #   "the key is selective, but is it selective in the correct GT
+        #    temporal region?"
+        # --------------------------------------------------------------
+        if qbound_keyframe:
+            if not hasattr(self.metric, "temporal_key_metrics"):
+                raise AttributeError(
+                    "Q-Bound V1.2 requires Metric.temporal_key_metrics(). "
+                    "Please use metrics_qbound_v1_2.py."
+                )
+
+            score.update(
+                self.metric.temporal_key_metrics(
+                    qbound_keyframe,
+                    ground_truth,
+                    segments,
+                    prefix="QBound",
+                )
+            )
+
+        if cra_keyframe:
+            score.update(
+                self.metric.temporal_key_metrics(
+                    cra_keyframe,
+                    ground_truth,
+                    segments,
+                    prefix="CRA",
+                )
+            )
+
+        # Pre/post smoothing diagnostics are useful for identifying whether
+        # Gaussian smoothing changes an otherwise-correct Q-Bound peak.
+        if qbound_pre_smooth_keyframe:
+            score.update(
+                self.metric.temporal_key_metrics(
+                    qbound_pre_smooth_keyframe,
+                    ground_truth,
+                    segments,
+                    prefix="QBoundPreSmooth",
+                )
+            )
+
+        if qbound_post_smooth_keyframe:
+            score.update(
+                self.metric.temporal_key_metrics(
+                    qbound_post_smooth_keyframe,
+                    ground_truth,
+                    segments,
+                    prefix="QBoundPostSmooth",
+                )
+            )
+
         result = {
             "ph": post_hoc_ground,
             "result": results,
             "gt_ground": ground_truth,
             "ph_attn": ground_res,
+            "qbound_key": qbound_keyframe,
+            "cra_key": cra_keyframe,
+            "qbound_pre_smooth_key": qbound_pre_smooth_keyframe,
+            "qbound_post_smooth_key": qbound_post_smooth_keyframe,
         }
 
         if saw_time_param:

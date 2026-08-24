@@ -109,7 +109,7 @@ class DecoderLayer(nn.Module):
 
 class Decoder(nn.Module):
     """
-    CRA refinement decoder with Q-Bound Version 1.1.3.
+    CRA refinement decoder with Q-Bound Version 1.2.
 
     Design
     ------
@@ -138,17 +138,21 @@ class Decoder(nn.Module):
     Validation/test should use qbound_mix=1.0 so checkpoint selection never
     benefits from a permanent CRA temporal shortcut.
 
-    Important V1.1.3 properties
-    ---------------------------
-    * no CRAQBoundAdapter
-    * no alpha/beta gate
-    * no CRA + Q-Bound temporal-logit addition
-    * no bridge/global event residual
-    * no second softmax on the Q-Bound Gaussian branch
-    * CRA sigma is detached on the Q-Bound smoothing branch
-    * VQA alignment uses the FINAL grounded video representation
-    * transition-level merge remains a diagnostic counterfactual
-    * original and merge paths share the same projection dropout realization
+    Important V1.2 properties
+    -------------------------
+    * Q-Bound core owns dynamic 0..K-1 boundary selection and contiguous events;
+    * CRA never defines Q-Bound topology and remains outside the core;
+    * no alpha/beta gate and no CRA + Q-Bound temporal-logit addition;
+    * no second softmax on the Q-Bound Gaussian branch;
+    * CRA sigma is detached on the Q-Bound smoothing branch;
+    * main VQA still follows the deterministic CRA->Q-Bound handover;
+    * a PURE-QBound grounded feature is exposed for weak alignment so the
+      alignment objective cannot be solved by the temporary CRA teacher;
+    * event_visual_tokens/evidence_visual_token are propagated for future
+      weak event alignment without putting dataset/loss logic inside the core;
+    * transition-level merge remains a diagnostic counterfactual;
+    * original, pure-QBound, CRA diagnostic, and merge paths share the same
+      projection dropout realization whenever their dimensions match.
     """
 
     def __init__(
@@ -217,7 +221,7 @@ class Decoder(nn.Module):
         )
 
         # --------------------------------------------------------------
-        # Q-Bound V1.1.3
+        # Q-Bound V1.2
         # --------------------------------------------------------------
         self.qbound_enabled = bool(
             qbound_cfg.get(
@@ -246,97 +250,65 @@ class Decoder(nn.Module):
         )
 
         if self.qbound_enabled:
+            # V1.2 intentionally stops inheriting the most topology-sensitive
+            # defaults from old GPEB/V1.1 configs. In particular, the old
+            # boundary_bias_init=-2.0 was appropriate for dense soft boundary
+            # mass but can collapse hard dynamic selection to zero transitions.
+            # Explicit values under model.qbound still override these defaults.
             self.qbound = QBoundCore(
                 input_dim=embed_dim,
                 hidden_dim=qbound_cfg.get(
                     "hidden_dim",
-                    model_cfg.get(
-                        "qbound_hidden_dim",
-                        model_cfg.get(
-                            "gpeb_hidden_dim",
-                            256,
-                        ),
-                    ),
+                    model_cfg.get("qbound_hidden_dim", 256),
                 ),
                 max_events=qbound_cfg.get(
                     "max_events",
-                    model_cfg.get(
-                        "qbound_max_events",
-                        model_cfg.get(
-                            "gpeb_max_events",
-                            model_cfg.get(
-                                "gpeb_num_bins",
-                                4,
-                            ),
-                        ),
-                    ),
+                    model_cfg.get("qbound_max_events", 4),
                 ),
+                # CRA temporal evidence is not part of V1.2 topology. This
+                # option remains available for later generic-prior ablations,
+                # but forward() below deliberately passes temporal_prior=None.
                 use_temporal_prior=qbound_cfg.get(
                     "use_temporal_prior",
-                    model_cfg.get(
-                        "qbound_use_temporal_prior",
-                        model_cfg.get(
-                            "gpeb_use_grounding_prior",
-                            False,
-                        ),
-                    ),
+                    False,
                 ),
                 dropout=qbound_cfg.get(
                     "dropout",
-                    model_cfg.get(
-                        "qbound_dropout",
-                        model_cfg.get(
-                            "gpeb_dropout",
-                            dropout,
-                        ),
-                    ),
+                    model_cfg.get("qbound_dropout", dropout),
                 ),
                 boundary_temperature=qbound_cfg.get(
                     "boundary_temperature",
-                    model_cfg.get(
-                        "qbound_boundary_temperature",
-                        model_cfg.get(
-                            "gpeb_boundary_temperature",
-                            0.7,
-                        ),
-                    ),
+                    model_cfg.get("qbound_boundary_temperature", 0.7),
                 ),
+                # Soft assignment exists only as the ST gradient surrogate in
+                # V1.2; the forward event partition itself is hard/contiguous.
                 assignment_temperature=qbound_cfg.get(
                     "assignment_temperature",
-                    model_cfg.get(
-                        "qbound_assignment_temperature",
-                        model_cfg.get(
-                            "gpeb_assignment_temperature",
-                            0.35,
-                        ),
-                    ),
+                    model_cfg.get("qbound_assignment_temperature", 0.5),
+                ),
+                boundary_threshold=qbound_cfg.get(
+                    "boundary_threshold",
+                    model_cfg.get("qbound_boundary_threshold", 0.5),
+                ),
+                boundary_radius=qbound_cfg.get(
+                    "boundary_radius",
+                    model_cfg.get("qbound_boundary_radius", 2),
                 ),
                 boundary_bias_init=qbound_cfg.get(
                     "boundary_bias_init",
-                    model_cfg.get(
-                        "qbound_boundary_bias_init",
-                        model_cfg.get(
-                            "gpeb_boundary_bias_init",
-                            -2.0,
-                        ),
-                    ),
+                    model_cfg.get("qbound_boundary_bias_init", -0.2),
                 ),
                 min_event_mass=qbound_cfg.get(
                     "min_event_mass",
-                    model_cfg.get(
-                        "qbound_min_event_mass",
-                        model_cfg.get(
-                            "gpeb_min_event_mass",
-                            0.25,
-                        ),
-                    ),
+                    model_cfg.get("qbound_min_event_mass", 0.25),
                 ),
             )
 
-            # Keep this True for the first controlled V1.1.3 experiment.
-            # Q-Bound learns its own parameters from VQA, while the shared CRA
-            # backbone is protected from topology gradients until a later
-            # explicit ablation.
+            # Keep backbone detachment configurable. For the first controlled
+            # V1.2 run, True isolates whether dynamic topology + weak alignment
+            # can improve grounding without changing the CRA feature backbone.
+            # This is NOT a dependency on CRA: a future generic backbone can be
+            # detached or trained by the same adapter-level switch.
             self.qbound_detach_backbone_inputs = bool(
                 qbound_cfg.get(
                     "detach_backbone_inputs",
@@ -463,7 +435,7 @@ class Decoder(nn.Module):
             [B] tensor
             [B,1] tensor
 
-        V1.1.3 intentionally has NO learnable mixing parameter.
+        V1.2 intentionally has NO learnable mixing parameter.
         """
         if qbound_mix is None:
             qbound_mix = 1.0
@@ -648,7 +620,7 @@ class Decoder(nn.Module):
         return projected
 
     # ------------------------------------------------------------------
-    # V1.1.3 temporal handover helpers
+    # V1.2 temporal handover helpers
     # ------------------------------------------------------------------
     def _mix_temporal_keys(
         self,
@@ -734,7 +706,7 @@ class Decoder(nn.Module):
             base_temporal["cra_key"]
         )
 
-        # V1.1.3 branch diagnostics.
+        # V1.2 branch diagnostics.
         time_param["qbound_key"] = (
             qbound_key
         )
@@ -980,7 +952,7 @@ class Decoder(nn.Module):
                 and self.qbound_require_question_only
             ):
                 raise ValueError(
-                    "Q-Bound V1.1.3 requires "
+                    "Q-Bound V1.2 requires "
                     "question_feature=[B,D]. Pass question-only "
                     "tokens through CRA.forward(..., question=...)."
                 )
@@ -1017,14 +989,32 @@ class Decoder(nn.Module):
                 contextual_tokens=(
                     contextual_for_qbound
                 ),
-                # V1.1.3 never needs CRA temporal evidence to define its
+                # V1.2 never needs CRA temporal evidence to define its
                 # topology. Passing None guarantees zero prior features even
                 # if an old config accidentally enables use_temporal_prior.
                 temporal_prior=None,
             )
 
             required_keys = {
+                # Main temporal path.
                 "event_temporal_prob",
+                "event_temporal_logits",
+
+                # Dynamic-topology diagnostics: these keys distinguish the
+                # V1.2 core from the old soft fixed-bin implementation.
+                "boundary_hard",
+                "boundary_count",
+                "event_count",
+                "selected_boundary_prob_mean",
+
+                # Weak-alignment-ready visual/event evidence.
+                "event_visual_tokens",
+                "evidence_visual_token",
+                "event_valid_mask",
+                "event_relevance_weights",
+                "frame_semantic_logits",
+
+                # Counterfactual diagnostics.
                 "merge_event_temporal_prob",
                 "merge_transition_selector",
                 "selected_transition_strength",
@@ -1040,7 +1030,7 @@ class Decoder(nn.Module):
 
             if missing:
                 raise KeyError(
-                    "Q-Bound V1.1.3 output is missing: "
+                    "Q-Bound V1.2 output is missing: "
                     + ", ".join(missing)
                 )
 
@@ -1063,6 +1053,24 @@ class Decoder(nn.Module):
                 )
             )
 
+            # Pure-QBound grounded representation. This deliberately bypasses
+            # the CRA->Q-Bound handover and is the representation that the new
+            # weak alignment loss should supervise in cra_pipeline.py. Using
+            # the mixed final representation here would let CRA solve part of
+            # the alignment objective during the warm handover epochs.
+            qbound_video_proj = (
+                self._project_grounded_video(
+                    x_bar=x_bar,
+                    temporal_weights=qbound_key,
+                    valid_mask=valid_mask,
+                    do=do,
+                    projection_dropout_mask=(
+                        projection_dropout_mask
+                    ),
+                    x_star_proj=x_star_proj,
+                )
+            )
+
             final_key, mix = (
                 self._mix_temporal_keys(
                     cra_key=cra_key,
@@ -1076,6 +1084,7 @@ class Decoder(nn.Module):
             # Original CRA/VQ behavior.
             qbound_key = cra_key
             final_key = cra_key
+            qbound_video_proj = cra_video_proj
 
             mix = torch.zeros(
                 batch_size,
@@ -1110,21 +1119,46 @@ class Decoder(nn.Module):
             )
         )
 
-        # CRITICAL V1.1.3 change:
-        # VQA alignment must supervise the same representation used by the
-        # main VQA scorer. In Q-Bound mode this therefore follows the handover
-        # and becomes pure Q-Bound when qbound_mix reaches 1.
-        #
-        # In VQ / CRA-only mode final_key == cra_key, so original CRA alignment
-        # behavior is preserved.
+        # Existing CRA/CMA-compatible feature: this follows the actually-used
+        # main VQA path and therefore still follows the deterministic handover.
+        # We keep it unchanged for compatibility until cra_pipeline.py is
+        # explicitly refactored.
         time_param["grounding_feature"] = (
             video_proj
         )
 
-        # Useful diagnostic only; no loss should be attached to it directly.
+        # V1.2 weak-alignment feature: PURE Q-Bound, independent of qbound_mix.
+        # New Q-Bound alignment losses should use this field (or the event-level
+        # features below), NOT grounding_feature, so early CRA teacher mixing
+        # cannot satisfy the new objective.
+        time_param["qbound_grounding_feature"] = (
+            qbound_video_proj
+        )
+
+        # Useful CRA diagnostic only; no new Q-Bound loss should attach here.
         time_param["cra_grounding_feature"] = (
             cra_video_proj
         )
+
+        if qbound_aux is not None:
+            # These tensors are backbone-agnostic outputs from QBoundCore. They
+            # make weak event/evidence alignment possible in the pipeline while
+            # keeping all dataset- and loss-specific logic outside the core.
+            time_param["qbound_event_visual_tokens"] = (
+                qbound_aux["event_visual_tokens"]
+            )
+            time_param["qbound_evidence_visual_token"] = (
+                qbound_aux["evidence_visual_token"]
+            )
+            time_param["qbound_event_valid_mask"] = (
+                qbound_aux["event_valid_mask"]
+            )
+            time_param["qbound_event_relevance_weights"] = (
+                qbound_aux["event_relevance_weights"]
+            )
+            time_param["qbound_frame_semantic_logits"] = (
+                qbound_aux["frame_semantic_logits"]
+            )
 
         # --------------------------------------------------------------
         # 5) Transition-level merge counterfactual.
@@ -1169,8 +1203,22 @@ class Decoder(nn.Module):
                     "cra_video_proj": (
                         cra_video_proj
                     ),
+                    "qbound_video_proj": (
+                        qbound_video_proj
+                    ),
                     "main_video_proj": (
                         video_proj
+                    ),
+
+                    # Distinguish the core distribution from the repository
+                    # Gaussian-smoothed key actually used for grounding. This
+                    # is useful when checking whether smoothing, rather than the
+                    # topology itself, moves the peak away from GT evidence.
+                    "qbound_pre_smooth_key": (
+                        qbound_aux["event_temporal_prob"]
+                    ),
+                    "qbound_post_smooth_key": (
+                        qbound_key
                     ),
 
                     # Transition-level merge through the SAME handover.
@@ -1243,7 +1291,9 @@ class Decoder(nn.Module):
             qbound_aux
         )
 
-        # Compatibility name used elsewhere in the current repository.
+        # Compatibility name used elsewhere in the current repository. Keep
+        # this as the MAIN representation; the new pure-QBound feature has the
+        # explicit qbound_grounding_feature name above.
         time_param["qbound_feature"] = (
             video_proj
         )

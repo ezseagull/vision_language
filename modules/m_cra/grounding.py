@@ -12,7 +12,7 @@ class AdaptiveGaussianFilter(nn.Module):
         -> Gaussian Conv1d
         -> temporal softmax
 
-    Q-Bound V1.1.3 path:
+    Q-Bound V1.2 path:
         input temporal probability
         -> mask-aware Gaussian normalized convolution
         -> sum normalization
@@ -131,10 +131,11 @@ class AdaptiveGaussianFilter(nn.Module):
         weights,
         valid_mask=None,
         detach_sigma=True,
+        sigma_override=None,
         eps=1e-6,
     ):
         """
-        Probability-preserving Gaussian smoothing for Q-Bound V1.1.3.
+        Probability-preserving Gaussian smoothing for Q-Bound V1.2.
 
         Args:
             weights:
@@ -142,8 +143,12 @@ class AdaptiveGaussianFilter(nn.Module):
             valid_mask:
                 optional [B, T] or [B, T, 1] valid-frame mask.
             detach_sigma:
-                if True (default), Q-Bound gradients do not update the CRA
-                Gaussian sigma.
+                Used only when ``sigma_override`` is None. If True, gradients
+                do not update this filter's learnable sigma.
+            sigma_override:
+                Optional fixed scalar/tensor sigma. Ver1.2 uses this for the
+                Q-Bound branch so its smoothing width is not inherited from
+                CRA's learnable Gaussian parameter.
             eps:
                 numerical stability constant.
 
@@ -212,11 +217,20 @@ class AdaptiveGaussianFilter(nn.Module):
             uniform_fallback,
         )
 
-        sigma = (
-            self.sigma.detach()
-            if detach_sigma
-            else self.sigma
-        )
+        if sigma_override is None:
+            sigma = (
+                self.sigma.detach()
+                if detach_sigma
+                else self.sigma
+            )
+        else:
+            # Fixed Q-Bound smoothing width. This deliberately has no
+            # gradient path to CRA's learnable sigma.
+            sigma = torch.as_tensor(
+                sigma_override,
+                device=weights.device,
+                dtype=weights.dtype,
+            )
 
         kernel = self.create_gaussian_kernel(
             self.kernel_size,
@@ -299,7 +313,7 @@ class AdaptiveGaussianFilter(nn.Module):
 
 class GroundingModule(nn.Module):
     """
-    CRA grounding plus a separate Q-Bound V1.1.3 probability path.
+    CRA grounding plus a separate Q-Bound V1.2 probability path.
 
     CRA behavior is preserved exactly:
         raw CRA score
@@ -307,7 +321,7 @@ class GroundingModule(nn.Module):
         -> Gaussian Conv1d
         -> second softmax = cra_key
 
-    Q-Bound V1.1.3 does NOT use CRA temporal-logit fusion. Its main temporal
+    Q-Bound V1.2 does NOT use CRA temporal-logit fusion. Its main temporal
     distribution comes directly from QBoundCore.event_temporal_prob:
 
         Q-Bound temporal probability
@@ -378,6 +392,7 @@ class GroundingModule(nn.Module):
         dropout=0.3,
         initial_sigma=1.0,
         window_sizes=(1, 3, 5),
+        qbound_sigma=None,
     ):
         super().__init__()
 
@@ -407,6 +422,22 @@ class GroundingModule(nn.Module):
 
         self.gs_filter = AdaptiveGaussianFilter(
             initial_sigma=float(initial_sigma),
+        )
+
+        # Ver1.2 decouples Q-Bound smoothing from CRA's learnable sigma.
+        # The value defaults to the same initial width for backward-compatible
+        # behavior, but it is a non-persistent buffer rather than a parameter.
+        qbound_sigma_value = (
+            float(initial_sigma)
+            if qbound_sigma is None
+            else float(qbound_sigma)
+        )
+        if qbound_sigma_value <= 0.0:
+            raise ValueError("qbound_sigma must be positive.")
+        self.register_buffer(
+            "qbound_sigma",
+            torch.tensor(qbound_sigma_value, dtype=torch.float32),
+            persistent=False,
         )
 
         self.window_sizes = list(window_sizes)
@@ -653,9 +684,10 @@ class GroundingModule(nn.Module):
         valid_mask=None,
         window_sizes=None,
         detach_sigma=True,
+        apply_smoothing=True,
     ):
         """
-        Build Q-Bound V1.1.3 grounding directly from temporal probabilities.
+        Build Q-Bound V1.2 grounding directly from temporal probabilities.
 
         Expected main input:
             QBoundCore["event_temporal_prob"]      [B,T]
@@ -699,11 +731,18 @@ class GroundingModule(nn.Module):
             valid_mask,
         )
 
-        qbound_key = self.gs_filter.smooth_probability(
-            pre_smooth_key.unsqueeze(-1),
-            valid_mask=valid_mask,
-            detach_sigma=detach_sigma,
-        ).squeeze(-1)
+        if apply_smoothing:
+            qbound_key = self.gs_filter.smooth_probability(
+                pre_smooth_key.unsqueeze(-1),
+                valid_mask=valid_mask,
+                detach_sigma=detach_sigma,
+                sigma_override=self.qbound_sigma,
+            ).squeeze(-1)
+        else:
+            # Useful controlled ablation: QBoundCore already returns a valid
+            # probability distribution, so smoothing is not mathematically
+            # required for the Q-Bound branch.
+            qbound_key = pre_smooth_key
 
         # Defensive normalization after smoothing. smooth_probability already
         # guarantees this, but keeping the invariant explicit here makes the
@@ -719,7 +758,17 @@ class GroundingModule(nn.Module):
         )
 
         time_param["pre_smooth_key"] = pre_smooth_key
+        time_param["post_smooth_key"] = qbound_key
         time_param["qbound_key"] = qbound_key
+        time_param["qbound_smoothing_applied"] = torch.as_tensor(
+            float(apply_smoothing),
+            dtype=qbound_key.dtype,
+            device=qbound_key.device,
+        )
+        time_param["qbound_sigma"] = self.qbound_sigma.to(
+            device=qbound_key.device,
+            dtype=qbound_key.dtype,
+        )
         time_param["valid_mask"] = valid_mask
 
         return time_param
@@ -734,7 +783,7 @@ class GroundingModule(nn.Module):
         LEGACY V1.1 temporal-logit fusion path.
 
         Kept unchanged for compatibility and CRA baseline reproduction.
-        Q-Bound V1.1.3 must use ``finalize_probability_grounding()`` instead.
+        Q-Bound V1.2 must use ``finalize_probability_grounding()`` instead.
 
         base_temporal:
             output of compute_base_temporal()
@@ -1031,7 +1080,7 @@ class GroundingModule(nn.Module):
                 valid_mask=video_mask,
             )
 
-        Q-Bound V1.1.3 does not use this convenience forward for its main
+        Q-Bound V1.2 does not use this convenience forward for its main
         temporal path. It calls ``finalize_probability_grounding()`` directly.
         """
         base_temporal = (

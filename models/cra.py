@@ -11,7 +11,7 @@ from modules.m_cra.causal_module import LinguisticInterventionGraph
 
 class CRA(nn.Module):
     """
-    CRA wrapper with optional Q-Bound Version 1.1.3 temporal reasoning.
+    CRA wrapper with optional Q-Bound Version 1.2 temporal reasoning.
 
     Responsibilities of this wrapper are deliberately limited:
 
@@ -19,7 +19,14 @@ class CRA(nn.Module):
     * encode a separate question-only representation for Q-Bound;
     * pass the deterministic CRA -> Q-Bound handover weight ``qbound_mix``
       to the refine decoder;
+    * expose pure-Q-Bound grounding/event features for weak alignment;
     * expose the decoder's final temporal key and diagnostics unchanged.
+
+    Version 1.2 keeps CRA-specific training/inference logic outside QBoundCore.
+    The topology module receives only generic video/context tokens plus a
+    question-only representation. Ground-truth answer/QA features may be
+    exposed as TRAINING-ONLY weak-alignment targets, but are never passed into
+    Q-Bound topology induction.
 
     Q-Bound never receives answer-choice-conditioned features for topology
     induction.  The actual CRA/Q-Bound temporal handover is implemented in
@@ -58,7 +65,7 @@ class CRA(nn.Module):
                 "version",
                 model_cfg.get(
                     "qbound_version",
-                    model_cfg.get("gpeb_version", "1.1.3"),
+                    model_cfg.get("gpeb_version", "1.2"),
                 ),
             )
         )
@@ -280,7 +287,7 @@ class CRA(nn.Module):
         qbound_mix=1.0,
     ):
         """
-        Refined CRA/Q-Bound V1.1.3 forward.
+        Refined CRA/Q-Bound V1.2 forward.
 
         ``question`` is required by default whenever Q-Bound is active,
         because topology induction must remain question-only.
@@ -352,7 +359,7 @@ class CRA(nn.Module):
             if question is None:
                 if self.qbound_require_question_only:
                     raise ValueError(
-                        "Q-Bound V1.1.3 requires question-only token ids. "
+                        "Q-Bound V1.2 requires question-only token ids. "
                         "Pass them through CRA.forward(..., question=...). "
                         "Do not silently reuse candidate answer features, "
                         "because that would leak answer-choice semantics "
@@ -399,11 +406,100 @@ class CRA(nn.Module):
         # not the answer-scoring head.
         answer_proj = answer_g
 
+        # --------------------------------------------------------------
+        # Q-Bound V1.2 outputs for the training pipeline.
+        #
+        # The new weak-alignment objective must consume PURE Q-Bound evidence,
+        # not the mixed CRA->Q-Bound main representation.  We therefore expose
+        # both frame/video evidence and event-level visual tokens explicitly.
+        # --------------------------------------------------------------
+        qbound_aux = (
+            time_param.get("qbound_aux")
+            if isinstance(time_param, dict)
+            else None
+        )
+
+        if use_qbound:
+            required_time_keys = {
+                "qbound_grounding_feature",
+                "qbound_event_visual_tokens",
+                "qbound_evidence_visual_token",
+                "qbound_event_valid_mask",
+                "qbound_event_relevance_weights",
+                "qbound_frame_semantic_logits",
+            }
+            missing_time_keys = sorted(
+                required_time_keys.difference(time_param)
+            )
+            if missing_time_keys:
+                raise KeyError(
+                    "RefineDecoder/Q-Bound V1.2 time_param is missing: "
+                    + ", ".join(missing_time_keys)
+                )
+
+            if qbound_aux is None:
+                raise KeyError(
+                    "RefineDecoder/Q-Bound V1.2 must expose time_param['qbound_aux']."
+                )
+
+            required_aux_keys = {
+                "boundary_hard",
+                "boundary_count",
+                "event_count",
+                "selected_boundary_prob_mean",
+                "event_temporal_prob",
+                "event_visual_tokens",
+                "evidence_visual_token",
+            }
+            missing_aux_keys = sorted(
+                required_aux_keys.difference(qbound_aux)
+            )
+            if missing_aux_keys:
+                raise KeyError(
+                    "Q-Bound V1.2 auxiliary output is missing: "
+                    + ", ".join(missing_aux_keys)
+                )
+
+        qbound_grounding_feature = (
+            time_param.get("qbound_grounding_feature")
+            if isinstance(time_param, dict)
+            else None
+        )
+        qbound_event_visual_tokens = (
+            time_param.get("qbound_event_visual_tokens")
+            if isinstance(time_param, dict)
+            else None
+        )
+        qbound_evidence_visual_token = (
+            time_param.get("qbound_evidence_visual_token")
+            if isinstance(time_param, dict)
+            else None
+        )
+        qbound_event_valid_mask = (
+            time_param.get("qbound_event_valid_mask")
+            if isinstance(time_param, dict)
+            else None
+        )
+        qbound_event_relevance_weights = (
+            time_param.get("qbound_event_relevance_weights")
+            if isinstance(time_param, dict)
+            else None
+        )
+        qbound_frame_semantic_logits = (
+            time_param.get("qbound_frame_semantic_logits")
+            if isinstance(time_param, dict)
+            else None
+        )
+
         outs = {
             "fatt": video_attn,
             "time_param": time_param,
+
+            # Original CRA alignment target (GT QA feature when available).
             "align_gt": qsn_gt,
             "qa_condition": qsn_g,
+
+            # Question-only representation used by Q-Bound topology.
             "question_condition": question_g,
             "question_tokens": question_tokens,
             "question_only_conditioning": torch.as_tensor(
@@ -411,13 +507,37 @@ class CRA(nn.Module):
                 device=video_proj.device,
                 dtype=video_proj.dtype,
             ),
+
+            # V1.2 weak-alignment candidates.
+            #
+            # qbound_align_question:
+            #   strict question-only alignment target.
+            #
+            # qbound_align_qa:
+            #   TRAINING-ONLY GT QA semantic target. This is never fed into
+            #   QBoundCore and can be used for a CRA-comparable CMA-style
+            #   weak-supervision ablation in cra_pipeline.py.
+            "qbound_align_question": question_g,
+            "qbound_align_qa": qsn_gt,
+
+            # PURE Q-Bound evidence, independent of qbound_mix.
+            "qbound_grounding_feature": qbound_grounding_feature,
+            "qbound_event_visual_tokens": qbound_event_visual_tokens,
+            "qbound_evidence_visual_token": qbound_evidence_visual_token,
+            "qbound_event_valid_mask": qbound_event_valid_mask,
+            "qbound_event_relevance_weights": qbound_event_relevance_weights,
+            "qbound_frame_semantic_logits": qbound_frame_semantic_logits,
+            "qbound_aux": qbound_aux,
+
             "qbound_active": use_qbound,
             "qbound_mix": (
                 time_param.get("qbound_mix")
                 if isinstance(time_param, dict)
                 else None
             ),
-            # Temporary compatibility alias for old logging/checkpoints.
+            "qbound_version": self.qbound_version,
+
+            # Temporary compatibility aliases for old logging/checkpoints.
             "gpeb_active": use_qbound,
         }
 

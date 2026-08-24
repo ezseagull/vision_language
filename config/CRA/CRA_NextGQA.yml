@@ -33,6 +33,7 @@ model:
   n_negs: 1
   prop_num: 1
 
+  # Keep original CRA grounding settings unchanged for fair comparison.
   sigma: 3.0
   gamma: 1
   lamb: 0.15
@@ -44,32 +45,72 @@ model:
   vote: 0
 
   # ------------------------------------------------------------
-  # Q-Bound V1.1.3
+  # Q-Bound V1.2
+  # Dynamic topology + weak event alignment
   # ------------------------------------------------------------
   qbound:
     enabled: true
-    version: "1.1.3"
+    version: "1.2"
 
+    # Q-Bound core size.
     hidden_dim: 256
+
+    # Maximum number of events, NOT the target event count.
+    # Dynamic selection may produce 1, 2, 3, or 4 events per sample.
     max_events: 4
 
-    # Q-Bound topology must not consume CRA temporal grounding.
-    # refine_v113.py also passes temporal_prior=None defensively.
+    # Topology must remain question-only.
+    require_question_only: true
+
+    # CRA temporal grounding is NOT consumed by Q-Bound topology.
     use_temporal_prior: false
 
-    # First controlled V1.1.3 run:
-    # Q-Bound learns its own parameters while the shared CRA backbone
-    # is protected from topology gradients. This can be ablated later.
+    # First controlled V1.2 run:
+    # isolate Q-Bound learning from changes to the CRA feature backbone.
     detach_backbone_inputs: true
 
-    # Explicit topology settings for reproducibility.
+    # Q-Bound internal dropout.
+    dropout: 0.3
+
+    # ----------------------------------------------------------
+    # Dynamic boundary selection
+    # ----------------------------------------------------------
     boundary_temperature: 0.7
-    assignment_temperature: 0.35
-    boundary_bias_init: -2.0
+
+    # Used by the soft/ST assignment surrogate only.
+    # V1.2 forward topology itself is hard and contiguous.
+    assignment_temperature: 0.5
+
+    # A boundary must be a local peak and exceed this probability.
+    boundary_threshold: 0.5
+
+    # Local competition radius: +/- 2 temporal edges.
+    boundary_radius: 2
+
+    # IMPORTANT:
+    # -2.0 from V1.1.3 is removed because it can collapse hard selection
+    # to zero boundaries. -0.5 gives a less biased initialization while
+    # avoiding the opposite tendency toward max-event saturation.
+    boundary_bias_init: -0.5
+
     min_event_mass: 0.25
 
-    # Deterministic CRA -> Q-Bound temporal handover.
-    # Training: lambda goes linearly from 0.2 to 1.0 over 5 epochs.
+    # ----------------------------------------------------------
+    # Weak event alignment
+    # ----------------------------------------------------------
+    # Align topology-pooled pure visual event evidence with the detached
+    # question-only Q-Bound semantic state using symmetric in-batch InfoNCE.
+    weak_align_weight: 0.10
+    weak_align_temperature: 0.07
+
+    # Disabled in the first V1.2 run.
+    # Enable only if event_count_4_ratio again saturates near 1.0.
+    boundary_sparse_weight: 0.0
+
+    # ----------------------------------------------------------
+    # Deterministic CRA -> Q-Bound temporal handover
+    # ----------------------------------------------------------
+    # Training: lambda increases linearly from 0.2 to 1.0 over 5 epochs.
     # Validation/test: pipeline always forces lambda = 1.0.
     handover_start: 0.2
     handover_epochs: 5
@@ -78,8 +119,8 @@ optim:
   pipeline: cra
   optimizer: Adam
 
-  # Original CRA objectives only.
-  # V1.1.3 has NO Q-Bound auxiliary loss.
+  # Original CRA task objectives are kept unchanged.
+  # Q-Bound weak alignment is added separately inside CRAPipeline.
   loss:
     ce:
       vq: 1
@@ -92,11 +133,15 @@ optim:
   weight_decay: 0
   amsgrad: true
 
-  # Dedicated Q-Bound optimizer group created by BasePipeline.
+  # Dedicated Q-Bound parameter group.
   qbound_lr: 5.e-5
 
-  epochs: 30
+  # Exploratory / diagnostic run.
+  # If topology and temporal faithfulness are healthy, run the final
+  # experiment later with the full training budget used for comparison.
+  epochs: 15
   save_period: 1
+
   lr_scheduler: warmup
   step_size: 1
 
@@ -104,15 +149,17 @@ stat:
   monitor:
     mode: max
     metric: acc
-    early_stop: 30
+    early_stop: 15
     vis: false
     display_port: 8099
 
   record_dir: ./output
+
+  # Do NOT resume a V1.1.3 checkpoint: Q-Bound topology has changed.
   resume: null
 
 misc:
-  running_name: CRA/NextGQA/QBound_v1.1.3_seed2024
-  info: "CRA + Q-Bound V1.1.3"
+  running_name: CRA/NextGQA/QBound_v1.2_seed2024
+  info: "CRA + Q-Bound V1.2 | dynamic topology + weak event alignment"
   cuda: "0"
   seed: 2024

@@ -7,86 +7,93 @@ import torch.nn.functional as F
 
 class QBoundCore(nn.Module):
     """
-    Q-Bound Version 1.1.3 core.
+    Q-Bound Version 1.2 core.
 
-    Backbone-agnostic module for learning a question-conditioned, monotonic
-    event decomposition and event-level temporal evidence.
+    Main changes from V1.1.3
+    ------------------------
+    1) True dynamic topology.
+       Boundary probabilities are no longer accumulated and rescaled to K-1.
+       Instead, Q-Bound performs local-peak competition, thresholded dynamic
+       activation, and a hard top-(K-1) safety cap. The forward topology is
+       therefore allowed to contain 0..K-1 transitions for each sample.
 
-    Inputs:
-        video_tokens: [B, T, D]
-            Backbone video features before optional contextual refinement.
-        question_features: [B, D] (preferred)
-            Question-only representation.
-        video_mask: [B, T], optional
-            Valid-frame mask.
-        contextual_tokens: [B, T, D], optional
-            Contextualized video features. Falls back to ``video_tokens``.
-        temporal_prior: [B, T], optional
-            Detached temporal prior from the backbone. When disabled or absent,
-            it contributes exactly zero features.
+    2) Actual contiguous events in the forward pass.
+       Selected boundaries create integer event coordinates and hard contiguous
+       event assignments. A straight-through soft surrogate is retained only
+       for gradient propagation.
 
-    Core outputs:
-        event_temporal_logits: [B, T]
-        event_temporal_prob: [B, T]
-        boundary_prob / boundary_mass: [B, T-1]
-        event_assignment: [B, T, K]
-        event_tokens: [B, K, H]
-        transition_tokens: [B, K-1, H]
-        merge_* transition-level counterfactual outputs
+    3) No learned event-activity rescue gate.
+       Event existence follows directly from the selected topology. Empty event
+       slots are inactive; non-empty slots are active.
 
-    Version 1.1.3 keeps the transition-level counterfactual from V1.1.1,
-    but changes the MAIN temporal-evidence path so that useful temporal
-    selectivity must remain coupled to the learned event topology.
+    4) No tanh-saturated semantic scoring.
+       Event/transition token logits remain ordinary logits. Main temporal
+       evidence is produced by event relevance together with a question-aware
+       within-event frame scorer.
 
-    Main-path principles:
-      * no CRA-specific fusion and no CRA temporal prior when disabled;
-      * no global bridge representation / residual shortcut;
-      * no hard event-validity mask in the main temporal evidence path;
-      * soft event activity couples event mass to temporal influence;
-      * soft transition activity couples neighboring event existence to
-        transition influence;
-      * bounded semantic token scores prevent tiny topology variations from
-        being amplified by arbitrarily large event/transition logits.
+    5) Weak-alignment-ready outputs.
+       The core exposes event_visual_tokens and evidence_visual_token so the
+       training pipeline can add a weak cross-modal / QA alignment objective
+       without putting dataset-specific supervision inside QBoundCore.
 
-    The core remains backbone-agnostic and exposes a probability-like
-    frame relevance distribution for the Q-Bound grounding branch.
+    Backbone independence
+    ---------------------
+    QBoundCore only consumes generic video/question representations. CRA-specific
+    handover, losses, answer heads, and any optional temporal prior remain outside
+    the architectural definition of Q-Bound.
+
+    Inputs
+    ------
+    video_tokens: [B, T, D]
+    question_features: [B, D] preferred
+    video_mask: [B, T], optional
+    contextual_tokens: [B, T, D], optional
+    temporal_prior: [B, T], optional detached prior
     """
-
 
     def __init__(
         self,
         input_dim: int = 768,
         hidden_dim: int = 256,
         max_events: int = 4,
-        use_temporal_prior: bool = True,
+        use_temporal_prior: bool = False,
         dropout: float = 0.1,
         boundary_temperature: float = 0.7,
-        assignment_temperature: float = 0.35,
-        boundary_bias_init: float = -2.0,
+        assignment_temperature: float = 0.5,
+        boundary_threshold: float = 0.5,
+        boundary_radius: int = 2,
+        boundary_bias_init: float = -0.2,
         min_event_mass: float = 0.25,
     ) -> None:
         super().__init__()
 
         if max_events < 2:
-            raise ValueError("Version 1.1.3 requires max_events >= 2.")
+            raise ValueError("Version 1.2 requires max_events >= 2.")
         if not 0.0 <= dropout < 1.0:
             raise ValueError("dropout must be in [0, 1).")
         if boundary_temperature <= 0.0:
             raise ValueError("boundary_temperature must be positive.")
         if assignment_temperature <= 0.0:
             raise ValueError("assignment_temperature must be positive.")
+        if not 0.0 < boundary_threshold < 1.0:
+            raise ValueError("boundary_threshold must be in (0, 1).")
+        if boundary_radius < 0:
+            raise ValueError("boundary_radius must be >= 0.")
         if min_event_mass <= 0.0:
             raise ValueError("min_event_mass must be positive.")
 
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.max_events = max_events
+        self.max_transitions = max_events - 1
 
         self.use_temporal_prior = bool(use_temporal_prior)
 
-        self.boundary_temperature = boundary_temperature
-        self.assignment_temperature = assignment_temperature
-        self.min_event_mass = min_event_mass
+        self.boundary_temperature = float(boundary_temperature)
+        self.assignment_temperature = float(assignment_temperature)
+        self.boundary_threshold = float(boundary_threshold)
+        self.boundary_radius = int(boundary_radius)
+        self.min_event_mass = float(min_event_mass)
 
         self.raw_proj = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
@@ -101,7 +108,7 @@ class QBoundCore(nn.Module):
             nn.LayerNorm(hidden_dim),
         )
 
-        # Retained from V1.0: question-conditioned modulation of visual states.
+        # Question-conditioned modulation remains intentionally weak.
         self.qa_film = nn.Linear(hidden_dim, hidden_dim * 2)
 
         # left/right contextual state, abs change, raw change, interaction,
@@ -114,7 +121,13 @@ class QBoundCore(nn.Module):
             nn.Dropout(dropout),
         )
         self.boundary_classifier = nn.Linear(hidden_dim, 1)
-        nn.init.normal_(self.boundary_classifier.weight, mean=0.0, std=1e-3)
+
+        # V1.1.3 used an almost-zero classifier weight together with a strongly
+        # negative bias. Under hard dynamic selection that would make the model
+        # start with zero transitions almost everywhere. A small but non-trivial
+        # random initialization lets different local peaks compete from the
+        # beginning while the negative bias still discourages dense boundaries.
+        nn.init.normal_(self.boundary_classifier.weight, mean=0.0, std=2e-2)
         nn.init.constant_(self.boundary_classifier.bias, boundary_bias_init)
 
         # contextual, raw, dynamics, question, center, duration, prior mass.
@@ -132,21 +145,32 @@ class QBoundCore(nn.Module):
             nn.LayerNorm(hidden_dim),
         )
 
-        # Question-conditioned selection of ordered event/transition evidence.
+        # Ordered event / transition relevance. These are logits, not bounded
+        # scores. They are normalized where a probability distribution is needed.
         self.token_score = nn.Sequential(
             nn.Linear(hidden_dim * 3, hidden_dim),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
         )
-        # V1.1.3 has no external beta gate. Keep the initial Q-Bound
-        # temporal perturbation naturally small instead of hiding it behind a
-        # learnable scalar that can collapse to zero.
-        nn.init.normal_(self.token_score[-1].weight, mean=0.0, std=1e-3)
+        nn.init.normal_(self.token_score[-1].weight, mean=0.0, std=1e-2)
         nn.init.zeros_(self.token_score[-1].bias)
 
+        # Question-aware within-event frame scorer. This is the main V1.2b
+        # preparation: event relevance decides *which event* matters, while this
+        # scorer decides *where inside that event* the temporal evidence lies.
+        self.frame_evidence_encoder = nn.Sequential(
+            nn.Linear(hidden_dim * 4, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Dropout(dropout),
+        )
+        self.frame_evidence_score = nn.Linear(hidden_dim, 1)
+        nn.init.normal_(self.frame_evidence_score.weight, mean=0.0, std=1e-2)
+        nn.init.zeros_(self.frame_evidence_score.bias)
 
     def _summarize_qa(self, qa_features: torch.Tensor) -> torch.Tensor:
-        """Compatibility helper. V1.1.3 should receive question-only [B, D]."""
+        """Compatibility helper. V1.2 should receive question-only [B, D]."""
         if qa_features.ndim < 2:
             raise ValueError("qa_features must have at least two dimensions.")
         if qa_features.size(-1) != self.input_dim:
@@ -157,8 +181,6 @@ class QBoundCore(nn.Module):
         if qa_features.ndim == 2:
             return qa_features
 
-        # Kept only so the old caller does not crash before refine.py is
-        # refactored. We will verify there that this path is not used.
         batch_size = qa_features.size(0)
         qa_features = qa_features.reshape(batch_size, -1, self.input_dim)
         return qa_features.mean(dim=1)
@@ -230,12 +252,10 @@ class QBoundCore(nn.Module):
         dtype: torch.dtype,
     ) -> torch.Tensor:
         """
-        Return [B,T] prior features.
+        Return [B,T] detached prior features.
 
-        Crucial V1.1 behavior:
-            * disabled/absent prior -> all zeros, not a uniform distribution;
-            * prior is detached so Q-Bound cannot modify the CRA prior source;
-            * no direct prior addition to token logits or event pooling.
+        Disabled/absent prior -> all zeros. The prior never directly determines
+        boundaries, event pooling, or temporal logits.
         """
         batch_size, time_steps = video_mask.shape
         if (not self.use_temporal_prior) or temporal_prior is None:
@@ -259,26 +279,109 @@ class QBoundCore(nn.Module):
         prior = self._normalize_distribution(prior, video_mask, dim=-1)
         return prior
 
-    def _cap_boundary_mass(
+    def _select_dynamic_boundaries(
         self,
-        boundary_mass: torch.Tensor,
+        boundary_prob: torch.Tensor,
         boundary_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        boundary_mass = boundary_mass * boundary_mask.to(boundary_mass.dtype)
-        max_total = float(self.max_events - 1)
-        total_mass = boundary_mass.sum(dim=-1, keepdim=True)
-        scale = torch.clamp(
-            max_total / total_mass.clamp_min(1e-6),
-            max=1.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Convert dense boundary probabilities [B,T-1] into a genuinely dynamic
+        0/1 forward topology.
+
+        Steps:
+          1) local maximum competition within +/- boundary_radius;
+          2) threshold activation;
+          3) keep at most K-1 strongest candidates;
+          4) straight-through surrogate for gradients.
+
+        Returns
+        -------
+        boundary_mass_st:
+            [B,T-1], forward values are exactly 0/1.
+        boundary_hard:
+            [B,T-1], detached binary selector used for diagnostics.
+        boundary_candidate_mask:
+            [B,T-1], local-peak + threshold candidates before the top-k cap.
+        local_peak_value:
+            [B,T-1], local max probability for diagnostics.
+        """
+        if boundary_prob.shape != boundary_mask.shape:
+            raise ValueError("boundary_prob and boundary_mask must match.")
+
+        boundary_mask = boundary_mask.bool()
+        masked_prob = boundary_prob.masked_fill(~boundary_mask, -1e4)
+
+        if self.boundary_radius > 0:
+            kernel = 2 * self.boundary_radius + 1
+            local_peak_value = F.max_pool1d(
+                masked_prob.unsqueeze(1),
+                kernel_size=kernel,
+                stride=1,
+                padding=self.boundary_radius,
+            ).squeeze(1)
+        else:
+            local_peak_value = masked_prob
+
+        # Ties are harmless because the global K-1 safety cap below remains.
+        local_peak_mask = (
+            boundary_prob >= (local_peak_value - 1e-6)
+        ) & boundary_mask
+        threshold_mask = boundary_prob >= self.boundary_threshold
+        candidate_mask = local_peak_mask & threshold_mask
+
+        candidate_scores = boundary_prob.masked_fill(~candidate_mask, -1e4)
+        k = min(self.max_transitions, boundary_prob.size(-1))
+        top_values, top_indices = torch.topk(candidate_scores, k=k, dim=-1)
+        top_valid = top_values > -1e3
+
+        boundary_hard = torch.zeros_like(boundary_prob)
+        boundary_hard.scatter_(
+            dim=-1,
+            index=top_indices,
+            src=top_valid.to(boundary_prob.dtype),
         )
-        return boundary_mass * scale
+        boundary_hard = boundary_hard * boundary_mask.to(boundary_prob.dtype)
+
+        # Surrogate gradient is strongest at local peaks and attenuated away
+        # from them. Selection/thresholding remain hard only in the forward pass.
+        safe_local_peak = torch.where(
+            boundary_mask,
+            local_peak_value.clamp_min(1e-6),
+            torch.ones_like(local_peak_value),
+        )
+        local_competition = (
+            boundary_prob / safe_local_peak
+        ).clamp(min=0.0, max=1.0)
+        soft_surrogate = (
+            boundary_prob
+            * local_competition.detach()
+            * boundary_mask.to(boundary_prob.dtype)
+        )
+
+        boundary_mass_st = (
+            boundary_hard
+            + soft_surrogate
+            - soft_surrogate.detach()
+        )
+
+        return (
+            boundary_mass_st,
+            boundary_hard.detach(),
+            candidate_mask.detach(),
+            local_peak_value.detach(),
+        )
 
     def _build_assignment(
         self,
         boundary_mass: torch.Tensor,
         video_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Boundary mass [B,T-1] -> monotonic assignment [B,T,K]."""
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Dynamic selected boundaries -> actual contiguous events.
+
+        The forward assignment is hard one-hot and contiguous. Backward uses a
+        Gaussian soft assignment around the same event coordinate.
+        """
         event_coordinate = F.pad(
             torch.cumsum(boundary_mass, dim=-1),
             pad=(1, 0),
@@ -292,51 +395,124 @@ class QBoundCore(nn.Module):
         ).view(1, 1, self.max_events)
 
         distance = event_coordinate.unsqueeze(-1) - event_centers
-        assignment_logits = -(
+        soft_logits = -(
             distance.pow(2) / (2.0 * self.assignment_temperature ** 2)
         )
-        event_assignment = torch.softmax(assignment_logits, dim=-1)
+        soft_assignment = torch.softmax(soft_logits, dim=-1)
+
+        hard_event_index = (
+            torch.round(event_coordinate.detach())
+            .long()
+            .clamp(min=0, max=self.max_events - 1)
+        )
+        hard_assignment = F.one_hot(
+            hard_event_index,
+            num_classes=self.max_events,
+        ).to(soft_assignment.dtype)
+
         event_assignment = (
-            event_assignment * video_mask.to(event_assignment.dtype).unsqueeze(-1)
+            hard_assignment
+            + soft_assignment
+            - soft_assignment.detach()
         )
-        denominator = event_assignment.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-        event_assignment = torch.where(
-            video_mask.unsqueeze(-1),
-            event_assignment / denominator,
-            torch.zeros_like(event_assignment),
+        event_assignment = (
+            event_assignment
+            * video_mask.to(event_assignment.dtype).unsqueeze(-1)
         )
-        return event_assignment, event_coordinate
+
+        return event_assignment, event_coordinate, hard_event_index
+
+    def _build_transition_affinity(
+        self,
+        event_coordinate: torch.Tensor,
+        boundary_mass: torch.Tensor,
+        boundary_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Map selected frame edges to ordered transition slots with ST gradients."""
+        boundary_mid_coordinate = (
+            event_coordinate[:, :-1] + 0.5 * boundary_mass
+        )
+        transition_centers = (
+            torch.arange(
+                self.max_transitions,
+                dtype=boundary_mass.dtype,
+                device=boundary_mass.device,
+            )
+            + 0.5
+        ).view(1, 1, self.max_transitions)
+
+        distance = boundary_mid_coordinate.unsqueeze(-1) - transition_centers
+        soft_logits = -(
+            distance.pow(2) / (2.0 * self.assignment_temperature ** 2)
+        )
+        soft_affinity = torch.softmax(soft_logits, dim=-1)
+
+        # A real selected boundary after j previous boundaries belongs to slot j.
+        hard_slot_index = (
+            torch.floor(event_coordinate[:, :-1].detach())
+            .long()
+            .clamp(min=0, max=self.max_transitions - 1)
+        )
+        hard_affinity = F.one_hot(
+            hard_slot_index,
+            num_classes=self.max_transitions,
+        ).to(soft_affinity.dtype)
+
+        affinity = hard_affinity + soft_affinity - soft_affinity.detach()
+        affinity = (
+            affinity
+            * boundary_mask.to(affinity.dtype).unsqueeze(-1)
+        )
+        return affinity
 
     def _encode_partition(
         self,
         raw_states: torch.Tensor,
         contextual_states: torch.Tensor,
+        raw_visual_states: torch.Tensor,
+        contextual_visual_states: torch.Tensor,
         qa_state: torch.Tensor,
         video_mask: torch.Tensor,
         temporal_prior: torch.Tensor,
         boundary_mass: torch.Tensor,
         boundary_hidden: torch.Tensor,
         boundary_mask: torch.Tensor,
+        frame_semantic_logits: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         batch_size, time_steps, _ = contextual_states.shape
 
-        boundary_mass = self._cap_boundary_mass(boundary_mass, boundary_mask)
-        event_assignment, event_coordinate = self._build_assignment(
-            boundary_mass, video_mask
+        event_assignment, event_coordinate, hard_event_index = self._build_assignment(
+            boundary_mass,
+            video_mask,
         )
 
+        # Because the forward assignment is hard, these are actual frame counts.
         event_mass = event_assignment.sum(dim=1)
-        event_valid_mask = event_mass >= self.min_event_mass
+        event_valid_mask = event_mass > self.min_event_mass
         event_valid_mask[:, 0] = video_mask.any(dim=1)
+        event_activity = event_valid_mask.to(event_mass.dtype)
+        event_count = event_valid_mask.sum(dim=-1).to(event_mass.dtype)
 
         local_delta = torch.zeros_like(raw_states)
         local_delta[:, 1:] = raw_states[:, 1:] - raw_states[:, :-1]
 
-        # V1.1: event semantics are pooled ONLY by the learned partition.
-        # The optional CRA prior is a feature, not a pooling weight.
+        # Question-conditioned event semantics used by the downstream task.
         context_pool = self._weighted_pool(contextual_states, event_assignment)
         raw_pool = self._weighted_pool(raw_states, event_assignment)
         delta_pool = self._weighted_pool(local_delta, event_assignment)
+
+        # Weak-alignment-ready visual content. These states are taken before the
+        # FiLM modulation so the alignment signal cannot be solved merely by
+        # copying the question modulation into the event representation.
+        visual_context_pool = self._weighted_pool(
+            contextual_visual_states, event_assignment
+        )
+        visual_raw_pool = self._weighted_pool(
+            raw_visual_states, event_assignment
+        )
+        event_visual_tokens = 0.5 * (
+            visual_context_pool + visual_raw_pool
+        )
 
         positions = torch.linspace(
             0.0,
@@ -357,7 +533,6 @@ class QBoundCore(nn.Module):
         )
         event_duration = event_mass / valid_length
 
-        # Optional prior enters as ONE event-level feature only.
         event_prior_mass = torch.einsum(
             "btk,bt->bk", event_assignment, temporal_prior
         )
@@ -378,41 +553,15 @@ class QBoundCore(nn.Module):
             )
         )
 
-        # Ordered transition slots are preserved from V1.0.
-        boundary_mid_coordinate = event_coordinate[:, :-1] + 0.5 * boundary_mass
-        transition_centers = (
-            torch.arange(
-                self.max_events - 1,
-                dtype=contextual_states.dtype,
-                device=contextual_states.device,
-            )
-            + 0.5
-        ).view(1, 1, self.max_events - 1)
-
-        transition_distance = (
-            boundary_mid_coordinate.unsqueeze(-1) - transition_centers
-        )
-        transition_slot_logits = -(
-            transition_distance.pow(2)
-            / (2.0 * self.assignment_temperature ** 2)
-        )
-        transition_slot_affinity = torch.softmax(
-            transition_slot_logits, dim=-1
-        )
-        transition_slot_affinity = (
-            transition_slot_affinity
-            * boundary_mask.to(transition_slot_affinity.dtype).unsqueeze(-1)
+        transition_slot_affinity = self._build_transition_affinity(
+            event_coordinate=event_coordinate,
+            boundary_mass=boundary_mass,
+            boundary_mask=boundary_mask,
         )
 
         transition_pool_weights = (
             transition_slot_affinity * boundary_mass.unsqueeze(-1)
         )
-
-        # Total frame-level boundary mass assigned to each ordered event
-        # transition.  This is the correct structural quantity for a
-        # transition-level counterfactual; the previous V1.1 code used a
-        # weighted average of frame-edge probabilities, which stayed near
-        # ~0.05 and made a merge almost ineffectual.
         transition_mass = transition_pool_weights.sum(dim=1)
 
         transition_denominator = transition_mass.unsqueeze(1).clamp_min(1e-6)
@@ -426,15 +575,13 @@ class QBoundCore(nn.Module):
             boundary_hidden,
         )
 
-        # Smooth probability-like existence strength for each transition.
-        # If soft boundary masses in one transition accumulate to ~1, the
-        # strength is already substantial (~0.63) without any new hyperparameter.
+        # Forward transition mass is 0 or 1 for a valid dynamic topology.
         transition_strength = 1.0 - torch.exp(-transition_mass)
 
         left_event = event_tokens[:, :-1]
         right_event = event_tokens[:, 1:]
         qa_transitions = qa_state.unsqueeze(1).expand(
-            -1, self.max_events - 1, -1
+            -1, self.max_transitions, -1
         )
         transition_tokens = self.transition_encoder(
             torch.cat(
@@ -452,13 +599,11 @@ class QBoundCore(nn.Module):
         )
 
         transition_valid_mask = (
-            event_valid_mask[:, :-1] & event_valid_mask[:, 1:]
+            event_valid_mask[:, :-1]
+            & event_valid_mask[:, 1:]
+            & (transition_mass > 0.5)
         )
-
-        # Counterfactual selection must not disappear merely because one soft
-        # event fell below min_event_mass.  A transition is structurally
-        # selectable whenever it still owns non-zero boundary mass.
-        transition_counterfactual_mask = transition_mass > 1e-6
+        transition_counterfactual_mask = transition_mass > 0.5
 
         # Interleave ordered event and transition tokens:
         # E0, R01, E1, R12, E2, ...
@@ -483,94 +628,50 @@ class QBoundCore(nn.Module):
                 dim=-1,
             )
         ).squeeze(-1)
-
-        # Token weights are retained only for diagnostics (e.g. token entropy).
-        # V1.1.3 deliberately removes the global bridge representation so the
-        # main task cannot bypass temporal topology through a pooled event vector.
-        token_weights = self._masked_softmax(
-            token_logits,
-            token_mask,
-            dim=-1,
-        )
-
-        # ------------------------------------------------------------------
-        # Topology-coupled temporal evidence (V1.1.3).
-        #
-        # Hard event_valid_mask is NOT used here. A hard threshold makes weak
-        # events disappear abruptly and gives them almost no useful main-task
-        # gradient to recover. Instead we use a smooth activity factor:
-        #
-        #     activity_k = mass_k / (mass_k + min_event_mass)
-        #
-        # We then renormalize the assignment across event slots after applying
-        # these activities. If the learned partition collapses to one effective
-        # event, active_assignment becomes almost constant across time and the
-        # event contribution becomes almost temporally uniform.
-        # ------------------------------------------------------------------
-        event_activity = event_mass / (
-            event_mass + float(self.min_event_mass)
-        )
-
-        active_assignment = (
-            event_assignment
-            * event_activity.unsqueeze(1)
-        )
-        active_assignment = (
-            active_assignment
-            / active_assignment.sum(
-                dim=-1,
-                keepdim=True,
-            ).clamp_min(1e-6)
-        )
-        active_assignment = (
-            active_assignment
-            * video_mask.to(active_assignment.dtype).unsqueeze(-1)
-        )
-
-        # A transition should only be semantically influential when both of its
-        # neighboring events are active. The square root keeps this symmetric
-        # and smooth while avoiding a hard validity cutoff.
-        transition_activity = torch.sqrt(
-            (
-                event_activity[:, :-1]
-                * event_activity[:, 1:]
-            ).clamp_min(0.0)
-        )
+        token_weights = self._masked_softmax(token_logits, token_mask, dim=-1)
 
         raw_event_token_logits = token_logits[:, 0::2]
         raw_transition_token_logits = token_logits[:, 1::2]
 
-        # IMPORTANT anti-shortcut constraint:
-        # token_score is an unconstrained MLP. Without bounding its output, the
-        # model could amplify tiny residual assignment differences with huge
-        # token logits while keeping the actual boundary topology weak. tanh is
-        # parameter-free and keeps semantic scores in [-1, 1].
-        event_token_scores = (
-            torch.tanh(raw_event_token_logits)
-            * event_activity
-        )
-        transition_token_scores = (
-            torch.tanh(raw_transition_token_logits)
-            * transition_activity
-        )
-
-        event_frame_logits = torch.einsum(
-            "btk,bk->bt",
-            active_assignment,
-            event_token_scores,
-        )
-
-        transition_edge_logits = torch.sum(
-            transition_slot_affinity
-            * transition_token_scores.unsqueeze(1),
+        # No tanh saturation. Invalid slots are removed by masks when a
+        # probability distribution is required.
+        event_relevance_weights = self._masked_softmax(
+            raw_event_token_logits,
+            event_valid_mask,
             dim=-1,
         )
-        # Transition evidence must vanish when the underlying learned boundary
-        # mass vanishes. This preserves a direct topology -> evidence coupling.
-        transition_edge_logits = (
-            transition_edge_logits
-            * boundary_mass
+        transition_relevance_weights = self._masked_softmax(
+            raw_transition_token_logits,
+            transition_valid_mask,
+            dim=-1,
         )
+
+        # Project event relevance back to frames. Since the forward assignment
+        # is contiguous one-hot, each frame receives the relevance of its event.
+        frame_event_gate = torch.einsum(
+            "btk,bk->bt",
+            event_assignment,
+            event_relevance_weights,
+        )
+        frame_event_gate = (
+            frame_event_gate * video_mask.to(frame_event_gate.dtype)
+        )
+
+        # Combine event-level selection and within-event semantic evidence in
+        # logit space. This avoids double-softmax while preserving a direct
+        # topology -> evidence dependency.
+        event_frame_logits = torch.log(frame_event_gate.clamp_min(1e-6))
+
+        # Transition evidence is retained for diagnostics/counterfactuals, but
+        # it is no longer the dominant main grounding signal. Otherwise the
+        # model can learn to peak specifically at boundaries rather than at the
+        # evidence frames inside an event.
+        transition_edge_logits = torch.sum(
+            transition_slot_affinity
+            * transition_relevance_weights.unsqueeze(1),
+            dim=-1,
+        )
+        transition_edge_logits = transition_edge_logits * boundary_mass
 
         frame_transition_logits = torch.zeros(
             batch_size,
@@ -578,25 +679,30 @@ class QBoundCore(nn.Module):
             dtype=contextual_states.dtype,
             device=contextual_states.device,
         )
-        frame_transition_logits[:, :-1] += (
-            0.5 * transition_edge_logits
-        )
-        frame_transition_logits[:, 1:] += (
-            0.5 * transition_edge_logits
-        )
+        frame_transition_logits[:, :-1] += 0.5 * transition_edge_logits
+        frame_transition_logits[:, 1:] += 0.5 * transition_edge_logits
 
+        # Main V1.2 grounding logits: event selection + within-event evidence.
         event_temporal_logits = (
-            event_frame_logits
-            + frame_transition_logits
-        ) * video_mask.to(event_frame_logits.dtype)
+            event_frame_logits + frame_semantic_logits
+        )
+        event_temporal_logits = (
+            event_temporal_logits * video_mask.to(event_temporal_logits.dtype)
+        )
 
-        # Exactly ONE temporal softmax is applied inside QBoundCore. The
-        # Q-Bound branch will later use probability-preserving Gaussian
-        # smoothing rather than CRA's second temporal softmax.
+        # Exactly one temporal softmax inside QBoundCore.
         frame_event_relevance = self._masked_softmax(
             event_temporal_logits,
             video_mask,
             dim=-1,
+        )
+
+        # Alignment-ready evidence token: a weighted sum of event visual content.
+        # This remains generic; the actual weak alignment loss belongs outside.
+        evidence_visual_token = torch.einsum(
+            "bk,bkd->bd",
+            event_relevance_weights,
+            event_visual_tokens,
         )
 
         assignment_entropy_per_frame = -torch.sum(
@@ -619,46 +725,64 @@ class QBoundCore(nn.Module):
             * torch.log(event_mass_distribution.clamp_min(1e-8)),
             dim=-1,
         )
-        effective_event_count = torch.exp(event_mass_entropy)
+        soft_effective_event_count = torch.exp(event_mass_entropy)
 
         token_entropy = -torch.sum(
             token_weights * torch.log(token_weights.clamp_min(1e-8)),
+            dim=-1,
+        )
+        event_relevance_entropy = -torch.sum(
+            event_relevance_weights
+            * torch.log(event_relevance_weights.clamp_min(1e-8)),
             dim=-1,
         )
 
         return {
             "boundary_mass": boundary_mass,
             "event_coordinate": event_coordinate,
+            "hard_event_index": hard_event_index,
             "event_assignment": event_assignment,
             "event_tokens": event_tokens,
+            "event_visual_tokens": event_visual_tokens,
+            "evidence_visual_token": evidence_visual_token,
             "transition_tokens": transition_tokens,
             "ordered_tokens": ordered_tokens,
             "event_mass": event_mass,
             "event_mass_distribution": event_mass_distribution,
             "event_valid_mask": event_valid_mask,
-            "transition_valid_mask": transition_valid_mask,
+            "event_activity": event_activity,
+            "event_count": event_count,
             "event_prior_mass": event_prior_mass,
             "transition_slot_affinity": transition_slot_affinity,
             "transition_mass": transition_mass,
             "transition_strength": transition_strength,
+            "transition_valid_mask": transition_valid_mask,
             "transition_counterfactual_mask": transition_counterfactual_mask,
             "token_mask": token_mask,
             "token_logits": token_logits,
             "token_weights": token_weights,
-            "event_activity": event_activity,
-            "active_assignment": active_assignment,
-            "transition_activity": transition_activity,
             "raw_event_token_logits": raw_event_token_logits,
             "raw_transition_token_logits": raw_transition_token_logits,
-            "event_token_scores": event_token_scores,
-            "transition_token_scores": transition_token_scores,
+            "event_relevance_weights": event_relevance_weights,
+            "transition_relevance_weights": transition_relevance_weights,
+            "frame_event_gate": frame_event_gate,
+            "frame_semantic_logits": frame_semantic_logits,
             "event_frame_logits": event_frame_logits,
             "frame_transition_logits": frame_transition_logits,
             "event_temporal_logits": event_temporal_logits,
             "frame_event_relevance": frame_event_relevance,
             "assignment_entropy": assignment_entropy,
-            "effective_event_count": effective_event_count,
+            # Compatibility: in V1.2 this is the actual number of non-empty
+            # events, not exp(entropy) of a soft fixed-bin mass distribution.
+            "effective_event_count": event_count,
+            "soft_effective_event_count": soft_effective_event_count,
             "token_entropy": token_entropy,
+            "event_relevance_entropy": event_relevance_entropy,
+            # Compatibility aliases. Semantics are intentionally updated.
+            "active_assignment": event_assignment,
+            "transition_activity": transition_valid_mask.to(event_mass.dtype),
+            "event_token_scores": raw_event_token_logits,
+            "transition_token_scores": raw_transition_token_logits,
         }
 
     @staticmethod
@@ -666,13 +790,7 @@ class QBoundCore(nn.Module):
         scores: torch.Tensor,
         mask: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Deterministic top-1 intervention selector.
-
-        The selector itself is not a learned routing mechanism.  It only
-        chooses which existing transition to ablate, so V1.1.3 keeps the
-        straight-through soft selector and its temperature hyperparameter.
-        """
+        """Deterministic top-1 selector for transition counterfactuals."""
         if scores.shape != mask.shape:
             raise ValueError(
                 "scores and mask must have the same shape, got "
@@ -718,7 +836,7 @@ class QBoundCore(nn.Module):
                 f"Expected input_dim={self.input_dim}, got {feature_dim}."
             )
         if time_steps < 2:
-            raise ValueError("Version 1.1.3 requires at least 2 timesteps.")
+            raise ValueError("Version 1.2 requires at least 2 timesteps.")
 
         video_mask = self._normalize_mask(
             video_mask,
@@ -728,15 +846,16 @@ class QBoundCore(nn.Module):
         )
         boundary_mask = video_mask[:, :-1] & video_mask[:, 1:]
 
-        # The optional prior is detached inside _prepare_temporal_prior().
         temporal_prior_used = self._prepare_temporal_prior(
             temporal_prior,
             video_mask,
             video_tokens.dtype,
         )
 
-        raw_states = self.raw_proj(video_tokens)
-        contextual_states = self.context_proj(contextual_tokens)
+        # Keep pre-FiLM states for weak alignment so the alignment target does
+        # not trivially inherit the question modulation.
+        raw_visual_states = self.raw_proj(video_tokens)
+        contextual_visual_states = self.context_proj(contextual_tokens)
 
         qa_summary = self._summarize_qa(question_features)
         qa_state = self.qa_proj(qa_summary)
@@ -744,11 +863,14 @@ class QBoundCore(nn.Module):
         gamma, beta = self.qa_film(qa_state).chunk(2, dim=-1)
         gamma = 0.1 * torch.tanh(gamma)
         beta = 0.1 * torch.tanh(beta)
+
         raw_states = (
-            raw_states * (1.0 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
+            raw_visual_states * (1.0 + gamma.unsqueeze(1))
+            + beta.unsqueeze(1)
         )
         contextual_states = (
-            contextual_states * (1.0 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
+            contextual_visual_states * (1.0 + gamma.unsqueeze(1))
+            + beta.unsqueeze(1)
         )
 
         left_context = contextual_states[:, :-1]
@@ -758,7 +880,6 @@ class QBoundCore(nn.Module):
             -1, time_steps - 1, -1
         )
 
-        # Optional prior features. When no prior is used they are all zero.
         prior_left = temporal_prior_used[:, :-1]
         prior_right = temporal_prior_used[:, 1:]
         prior_change = prior_right - prior_left
@@ -793,30 +914,54 @@ class QBoundCore(nn.Module):
             boundary_logits / self.boundary_temperature
         )
         boundary_prob = boundary_prob * boundary_mask.to(boundary_prob.dtype)
-        boundary_mass = self._cap_boundary_mass(boundary_prob, boundary_mask)
+
+        (
+            boundary_mass,
+            boundary_hard,
+            boundary_candidate_mask,
+            boundary_local_peak,
+        ) = self._select_dynamic_boundaries(
+            boundary_prob=boundary_prob,
+            boundary_mask=boundary_mask,
+        )
+
+        # Question-aware frame semantics, independent of the event slot score.
+        qa_frames = qa_state.unsqueeze(1).expand(-1, time_steps, -1)
+        frame_hidden = self.frame_evidence_encoder(
+            torch.cat(
+                [
+                    contextual_states,
+                    raw_states,
+                    contextual_states * qa_frames,
+                    qa_frames,
+                ],
+                dim=-1,
+            )
+        )
+        frame_semantic_logits = self.frame_evidence_score(
+            frame_hidden
+        ).squeeze(-1)
+        frame_semantic_logits = (
+            frame_semantic_logits
+            * video_mask.to(frame_semantic_logits.dtype)
+        )
 
         original = self._encode_partition(
             raw_states=raw_states,
             contextual_states=contextual_states,
+            raw_visual_states=raw_visual_states,
+            contextual_visual_states=contextual_visual_states,
             qa_state=qa_state,
             video_mask=video_mask,
             temporal_prior=temporal_prior_used,
             boundary_mass=boundary_mass,
             boundary_hidden=boundary_hidden,
             boundary_mask=boundary_mask,
+            frame_semantic_logits=frame_semantic_logits,
         )
 
-        # --------------------------------------------------------------
-        # Transition-level counterfactual merge.
-        #
-        # V1.1 removed only one frame edge (~0.05 mass), while the event
-        # coordinate was created by the cumulative mass of many such edges.
-        # That intervention barely changed the partition. V1.1.3 keeps the
-        # transition-level intervention introduced in V1.1.1:
-        #   1) groups frame-edge mass into K-1 ordered transition slots,
-        #   2) selects the strongest transition,
-        #   3) removes all boundary mass attributed to that transition.
-        # --------------------------------------------------------------
+        # Transition-level counterfactual merge. With dynamic hard boundaries,
+        # removing one selected transition now really changes M -> M-1.
         merge_transition_selector = self._build_hard_selector(
             scores=original["transition_strength"],
             mask=original["transition_counterfactual_mask"],
@@ -832,9 +977,6 @@ class QBoundCore(nn.Module):
             * boundary_mask.to(selected_transition_profile.dtype)
         )
 
-        # Because transition_slot_affinity sums to one over transition slots,
-        # this removes exactly the component of boundary_mass attributed to
-        # the selected transition, rather than deleting one arbitrary frame edge.
         merge_boundary_mass = boundary_mass * (
             1.0 - selected_transition_profile
         )
@@ -842,15 +984,20 @@ class QBoundCore(nn.Module):
         merge_output = self._encode_partition(
             raw_states=raw_states,
             contextual_states=contextual_states,
+            raw_visual_states=raw_visual_states,
+            contextual_visual_states=contextual_visual_states,
             qa_state=qa_state,
             video_mask=video_mask,
             temporal_prior=temporal_prior_used,
             boundary_mass=merge_boundary_mass,
             boundary_hidden=boundary_hidden,
             boundary_mask=boundary_mask,
+            frame_semantic_logits=frame_semantic_logits,
         )
 
-        boundary_count = boundary_mass.sum(dim=-1)
+        # Actual discrete transition count in the forward pass.
+        boundary_count = boundary_hard.sum(dim=-1)
+        event_count = boundary_count + 1.0
 
         selected_transition_mass = torch.sum(
             merge_transition_selector * original["transition_mass"],
@@ -869,57 +1016,83 @@ class QBoundCore(nn.Module):
             dim=-1,
         )
 
+        selected_boundary_prob_sum = (
+            boundary_prob * boundary_hard
+        ).sum(dim=-1)
+        selected_boundary_count = boundary_hard.sum(dim=-1).clamp_min(1.0)
+        selected_boundary_prob_mean = (
+            selected_boundary_prob_sum / selected_boundary_count
+        )
+        selected_boundary_prob_mean = torch.where(
+            boundary_count > 0,
+            selected_boundary_prob_mean,
+            torch.zeros_like(selected_boundary_prob_mean),
+        )
+
         return {
             "qa_state": qa_state,
 
+            # Dynamic boundary diagnostics.
             "boundary_logits": boundary_logits,
             "boundary_prob": boundary_prob,
             "boundary_mass": boundary_mass,
+            "boundary_hard": boundary_hard,
+            "boundary_candidate_mask": boundary_candidate_mask,
+            "boundary_local_peak": boundary_local_peak,
             "boundary_mask": boundary_mask,
             "boundary_count": boundary_count,
+            "event_count": event_count,
             "boundary_prob_mean": (
                 boundary_prob.sum(dim=-1)
                 / boundary_mask.sum(dim=-1).clamp_min(1).to(boundary_prob.dtype)
             ),
+            "selected_boundary_prob_mean": selected_boundary_prob_mean,
 
             "event_coordinate": original["event_coordinate"],
+            "hard_event_index": original["hard_event_index"],
             "event_assignment": original["event_assignment"],
             "event_tokens": original["event_tokens"],
+            "event_visual_tokens": original["event_visual_tokens"],
+            "evidence_visual_token": original["evidence_visual_token"],
             "transition_tokens": original["transition_tokens"],
             "ordered_tokens": original["ordered_tokens"],
             "event_mass": original["event_mass"],
             "event_mass_distribution": original["event_mass_distribution"],
             "event_valid_mask": original["event_valid_mask"],
-            "transition_valid_mask": original["transition_valid_mask"],
             "event_prior_mass": original["event_prior_mass"],
             "transition_slot_affinity": original["transition_slot_affinity"],
             "transition_mass": original["transition_mass"],
             "transition_strength": original["transition_strength"],
-            "transition_counterfactual_mask": (
-                original["transition_counterfactual_mask"]
-            ),
+            "transition_counterfactual_mask": original[
+                "transition_counterfactual_mask"
+            ],
+            "transition_valid_mask": original["transition_valid_mask"],
             "token_mask": original["token_mask"],
             "token_logits": original["token_logits"],
             "token_weights": original["token_weights"],
+
+            # Compatibility keys from V1.1.3.
             "event_activity": original["event_activity"],
             "active_assignment": original["active_assignment"],
             "transition_activity": original["transition_activity"],
             "raw_event_token_logits": original["raw_event_token_logits"],
-            "raw_transition_token_logits": (
-                original["raw_transition_token_logits"]
-            ),
+            "raw_transition_token_logits": original[
+                "raw_transition_token_logits"
+            ],
             "event_token_scores": original["event_token_scores"],
-            "transition_token_scores": (
-                original["transition_token_scores"]
-            ),
+            "transition_token_scores": original["transition_token_scores"],
+
+            # V1.2 evidence decomposition.
+            "event_relevance_weights": original["event_relevance_weights"],
+            "transition_relevance_weights": original[
+                "transition_relevance_weights"
+            ],
+            "frame_event_gate": original["frame_event_gate"],
+            "frame_semantic_logits": original["frame_semantic_logits"],
             "event_frame_logits": original["event_frame_logits"],
-            "frame_transition_logits": (
-                original["frame_transition_logits"]
-            ),
+            "frame_transition_logits": original["frame_transition_logits"],
 
             "event_temporal_logits": original["event_temporal_logits"],
-            # Preferred V1.1.3 name for the single-softmax Q-Bound temporal
-            # distribution. Keep frame_event_relevance as a compatibility alias.
             "event_temporal_prob": original["frame_event_relevance"],
             "frame_event_relevance": original["frame_event_relevance"],
 
@@ -939,9 +1112,7 @@ class QBoundCore(nn.Module):
             "merge_transition_selector": (
                 merge_transition_selector.unsqueeze(1)
             ),
-            "merge_transition_index": (
-                merge_transition_index.unsqueeze(-1)
-            ),
+            "merge_transition_index": merge_transition_index.unsqueeze(-1),
             "selected_transition_profile": (
                 selected_transition_profile.unsqueeze(1)
             ),
@@ -951,9 +1122,13 @@ class QBoundCore(nn.Module):
 
             "assignment_entropy": original["assignment_entropy"],
             "effective_event_count": original["effective_event_count"],
+            "soft_effective_event_count": original[
+                "soft_effective_event_count"
+            ],
             "token_entropy": original["token_entropy"],
+            "event_relevance_entropy": original["event_relevance_entropy"],
 
-            # Diagnostics for the CRA-prior ablation.
+            # Optional prior diagnostics.
             "temporal_prior_used": temporal_prior_used,
             "temporal_prior_enabled": torch.as_tensor(
                 float(self.use_temporal_prior),
@@ -961,4 +1136,3 @@ class QBoundCore(nn.Module):
                 device=video_tokens.device,
             ),
         }
-
