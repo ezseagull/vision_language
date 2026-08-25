@@ -21,9 +21,9 @@ from utils.misc.misc import (
 
 class CRAPipeline(BasePipeline):
     """
-    CRA training pipeline with Q-Bound Version 1.2.
+    CRA training pipeline with Q-Bound Version 1.3 ordered-event reasoning.
 
-    V1.2 preserves the repository task objectives and adds one Q-Bound-specific weak event alignment objective:
+    V1.3 preserves the repository task objectives and adds one Q-Bound-specific weak event alignment objective:
 
         L =
             L_CRA_original
@@ -53,10 +53,19 @@ class CRAPipeline(BasePipeline):
     lambda=1.0 so reported/checkpoint metrics are pure Q-Bound temporal
     results and never benefit from the CRA teacher mixture.
 
-    Transition-level MERGE is retained only as a diagnostic counterfactual.
+    Transition-level MERGE is retained only as a temporal-topology diagnostic
+    counterfactual.  In V1.3 the current merge path deliberately reuses the same
+    ordered-reasoning residual on original and merge features, so it must NOT be
+    interpreted as a true merge/reasoning intervention.
 
-    Dynamic boundary count and event-count histograms are monitored explicitly
-    because V1.2 must not regress to either 1-event collapse or max-event saturation.
+    V1.3 adds NO new reasoning-specific training loss.  Ordered-event interaction
+    is optimized through the repository's main VQA/alignment path.  The pipeline
+    instead measures whether that new path is actually useful by comparing the
+    reasoning-enriched answer representation against the same temporal feature
+    with the reasoning residual removed.
+
+    Dynamic boundary count and event-count histograms are still monitored
+    explicitly because V1.3 must preserve the dynamic topology learned in V1.2.
     """
 
     def __init__(self, cfgs) -> None:
@@ -84,7 +93,7 @@ class CRAPipeline(BasePipeline):
 
     def _qbound_handover_settings(self):
         """
-        Read the deterministic V1.2 CRA -> Q-Bound curriculum.
+        Read the deterministic V1.3 CRA -> Q-Bound curriculum.
 
         Preferred config:
             model:
@@ -93,7 +102,7 @@ class CRAPipeline(BasePipeline):
                 handover_epochs: 5
 
         Model-level fallbacks are kept only so older YAML files fail softly
-        until the final V1.2 config is installed.
+        until the final V1.3 config is installed.
         """
         model_cfg = self.cfgs.get("model", {})
         qbound_cfg = model_cfg.get("qbound", {})
@@ -133,8 +142,8 @@ class CRAPipeline(BasePipeline):
 
         return handover_start, handover_epochs
 
-    def _qbound_v12_loss_settings(self):
-        """Read the small set of V1.2-specific auxiliary-loss settings."""
+    def _qbound_v13_loss_settings(self):
+        """Read the small set of V1.3-specific auxiliary-loss settings."""
         model_cfg = self.cfgs.get("model", {})
         qbound_cfg = model_cfg.get("qbound", {})
         if not isinstance(qbound_cfg, dict):
@@ -188,7 +197,7 @@ class CRAPipeline(BasePipeline):
         """
         if evidence_visual_token is None or question_state is None:
             raise ValueError(
-                "Q-Bound V1.2 weak alignment requires evidence_visual_token "
+                "Q-Bound V1.3 weak alignment requires evidence_visual_token "
                 "and qa_state."
             )
         if evidence_visual_token.ndim != 2 or question_state.ndim != 2:
@@ -237,7 +246,7 @@ class CRAPipeline(BasePipeline):
     @staticmethod
     def _qbound_boundary_sparse_loss(qbound_aux):
         """
-        Optional soft boundary-density penalty. Disabled by default in V1.2.
+        Optional soft boundary-density penalty. Disabled by default in V1.3.
 
         This must stay optional because a sparsity force can collapse dynamic
         topology back to one event before event reasoning becomes necessary.
@@ -322,7 +331,7 @@ class CRAPipeline(BasePipeline):
         )
 
     def _get_qbound_aux(self, gqa_output):
-        """Safely extract Q-Bound V1.2 outputs from a CRA VQA forward."""
+        """Safely extract Q-Bound V1.3 outputs from a CRA VQA forward."""
         if not self._qbound_enabled():
             return None
 
@@ -372,7 +381,7 @@ class CRAPipeline(BasePipeline):
             [B, C] or [B, M, C]
 
         `prop_num` aggregation is exactly the same operation used by the main
-        VQA path.  V1.2 counterfactuals therefore do not use a separate
+        VQA path.  V1.3 counterfactuals therefore do not use a separate
         auxiliary answer head.
         """
         if answer_proj.ndim != 3:
@@ -485,7 +494,7 @@ class CRAPipeline(BasePipeline):
         eps=1e-8,
     ):
         """
-        Diagnostic only in V1.2.
+        Diagnostic only in V1.3.
 
         There is NO CRA-event grounding consistency loss.
         """
@@ -522,7 +531,7 @@ class CRAPipeline(BasePipeline):
         return 0.5 * (first_kl + second_kl)
 
     # ------------------------------------------------------------------
-    # Q-Bound V1.2 counterfactual diagnostics
+    # Q-Bound V1.3 counterfactual diagnostics
     # ------------------------------------------------------------------
     @staticmethod
     def _distribution_entropy(
@@ -546,7 +555,7 @@ class CRAPipeline(BasePipeline):
             dim=-1,
         )
 
-    def _compute_qbound_v12_diagnostics(
+    def _compute_qbound_v13_diagnostics(
         self,
         gqa_output,
         answer_proj,
@@ -554,30 +563,45 @@ class CRAPipeline(BasePipeline):
         main_logits,
     ):
         """
-        Measure Q-Bound behavior WITHOUT adding any optimization loss.
+        Measure V1.3 behavior WITHOUT adding an optimization loss.
 
-        The strongest learned event transition is removed in QBoundCore.
-        refine.py recomputes the merge distribution through:
-            Q-Bound probability smoothing
-            -> same CRA/Q-Bound handover
-            -> same video projection
-            -> same main answer scorer
+        Two different questions are diagnosed.
 
-        We log answer harm and temporal changes only.  In particular,
-        ``necessity`` remains a descriptive statistic:
+        (A) Does ordered-event reasoning help the answer task?
 
-            necessity = 1 - exp(-relu(CE_merge - CE_original))
+            temporal_main_video_proj
+                = the actually-used temporal feature BEFORE the V1.3
+                  ordered-event residual.
 
-        It remains diagnostic-only in V1.2.
+            main_video_proj
+                = temporal_main_video_proj + curriculum-scaled reasoning
+                  residual and is the feature used by the real VQA scorer.
+
+        We therefore compare CE/accuracy/correct-answer logits between those
+        two paths.  Positive ``qbound_reasoning_ce_gain`` means that adding
+        ordered-event reasoning lowers CE.
+
+        A second comparison uses the pure-QBound endpoints
+        ``qbound_video_proj`` and ``qbound_reasoned_video_proj``.  This removes
+        the CRA->Q-Bound curriculum from the diagnosis and tells us whether the
+        reasoning residual is useful once Q-Bound is fully responsible.
+
+        (B) Does removing a learned transition change temporal grounding?
+
+        The existing MERGE path remains a temporal-topology diagnostic only.
+        RefineDecoder currently reuses the SAME original reasoning residual for
+        both original and merge features.  ``merge_reasoning_counterfactual`` is
+        therefore expected to be 0.  We explicitly log that flag so merge CE is
+        never misreported as evidence of order-sensitive reasoning.
+
+        No diagnostic returned by this function is added to total_loss.
         """
-        qbound_aux = self._get_qbound_aux(
-            gqa_output
-        )
-
+        qbound_aux = self._get_qbound_aux(gqa_output)
         if qbound_aux is None:
             return {}
 
         required_keys = {
+            # V1.2/V1.3 temporal diagnostics.
             "merge_video_proj",
             "selected_transition_strength",
             "selected_transition_mass",
@@ -592,17 +616,21 @@ class CRAPipeline(BasePipeline):
             "pure_qbound_merge_key_l1",
             "cra_qbound_key_l1",
             "qbound_mix",
+
+            # V1.3 answer-side reasoning diagnostics.
+            "temporal_main_video_proj",
+            "main_video_proj",
+            "qbound_video_proj",
+            "qbound_reasoned_video_proj",
+            "qbound_reasoning_residual",
+            "qbound_reasoning_residual_used",
+            "merge_reasoning_counterfactual",
         }
 
-        missing = sorted(
-            required_keys.difference(
-                qbound_aux
-            )
-        )
-
+        missing = sorted(required_keys.difference(qbound_aux))
         if missing:
             raise KeyError(
-                "Missing Q-Bound V1.2 outputs: "
+                "Missing Q-Bound V1.3 outputs: "
                 + ", ".join(missing)
             )
 
@@ -610,32 +638,125 @@ class CRAPipeline(BasePipeline):
             answer_id,
             answer_proj.device,
         )
-
         if main_logits.size(0) != labels.numel():
             raise ValueError(
                 "answer_id size does not match main VQA logits."
             )
 
-        # Diagnostics must not create a second training graph.
         with torch.no_grad():
-            merge_logits = (
-                self._score_answer_candidates(
-                    answer_proj=answer_proj,
-                    representation=qbound_aux[
-                        "merge_video_proj"
-                    ],
-                    detach_answer=True,
-                )
-            )
+            # ----------------------------------------------------------
+            # 1) Ordered-reasoning utilization: main path.
+            # ----------------------------------------------------------
+            original_logits = main_logits.detach()
 
-            original_logits = (
-                main_logits.detach()
+            temporal_only_logits = self._score_answer_candidates(
+                answer_proj=answer_proj,
+                representation=qbound_aux["temporal_main_video_proj"],
+                detach_answer=True,
             )
 
             original_ce = F.cross_entropy(
                 original_logits,
                 labels,
                 reduction="none",
+            )
+            temporal_only_ce = F.cross_entropy(
+                temporal_only_logits,
+                labels,
+                reduction="none",
+            )
+
+            original_pred = original_logits.argmax(dim=-1)
+            temporal_only_pred = temporal_only_logits.argmax(dim=-1)
+
+            reasoning_ce_gain = temporal_only_ce - original_ce
+            reasoning_positive_gain = reasoning_ce_gain > 0
+
+            batch_index = torch.arange(
+                labels.size(0),
+                device=labels.device,
+            )
+            original_correct_logit = original_logits[
+                batch_index, labels
+            ]
+            temporal_correct_logit = temporal_only_logits[
+                batch_index, labels
+            ]
+            reasoning_correct_logit_delta = (
+                original_correct_logit - temporal_correct_logit
+            )
+
+            reasoning_logit_l1 = (
+                original_logits - temporal_only_logits
+            ).abs().mean(dim=-1)
+
+            flip_to_correct = (
+                (temporal_only_pred != labels)
+                & (original_pred == labels)
+            )
+            flip_to_wrong = (
+                (temporal_only_pred == labels)
+                & (original_pred != labels)
+            )
+
+            # ----------------------------------------------------------
+            # 2) Pure-QBound reasoning utilization, independent of mix.
+            # ----------------------------------------------------------
+            pure_temporal_logits = self._score_answer_candidates(
+                answer_proj=answer_proj,
+                representation=qbound_aux["qbound_video_proj"],
+                detach_answer=True,
+            )
+            pure_reasoned_logits = self._score_answer_candidates(
+                answer_proj=answer_proj,
+                representation=qbound_aux["qbound_reasoned_video_proj"],
+                detach_answer=True,
+            )
+
+            pure_temporal_ce = F.cross_entropy(
+                pure_temporal_logits,
+                labels,
+                reduction="none",
+            )
+            pure_reasoned_ce = F.cross_entropy(
+                pure_reasoned_logits,
+                labels,
+                reduction="none",
+            )
+            pure_reasoning_ce_gain = (
+                pure_temporal_ce - pure_reasoned_ce
+            )
+
+            pure_temporal_pred = pure_temporal_logits.argmax(dim=-1)
+            pure_reasoned_pred = pure_reasoned_logits.argmax(dim=-1)
+
+            # Reasoning residual magnitude.  ``used`` contains qbound_mix and
+            # reasoning_residual_scale, while ``raw`` is the adapter output.
+            reasoning_residual = qbound_aux[
+                "qbound_reasoning_residual"
+            ].detach()
+            reasoning_residual_used = qbound_aux[
+                "qbound_reasoning_residual_used"
+            ].detach()
+            temporal_main_feature = qbound_aux[
+                "temporal_main_video_proj"
+            ].detach()
+
+            raw_reasoning_norm = reasoning_residual.norm(dim=-1)
+            used_reasoning_norm = reasoning_residual_used.norm(dim=-1)
+            temporal_feature_norm = temporal_main_feature.norm(dim=-1)
+            reasoning_residual_ratio = (
+                used_reasoning_norm
+                / temporal_feature_norm.clamp_min(1e-6)
+            )
+
+            # ----------------------------------------------------------
+            # 3) Existing temporal MERGE diagnostic.
+            # ----------------------------------------------------------
+            merge_logits = self._score_answer_candidates(
+                answer_proj=answer_proj,
+                representation=qbound_aux["merge_video_proj"],
+                detach_answer=True,
             )
 
             if merge_logits.ndim == 2:
@@ -644,178 +765,81 @@ class CRAPipeline(BasePipeline):
                     labels,
                     reduction="none",
                 )
-                merge_pred_logits = (
-                    merge_logits
-                )
-
+                merge_pred_logits = merge_logits
             elif merge_logits.ndim == 3:
-                num_merge = (
-                    merge_logits.size(1)
+                num_merge = merge_logits.size(1)
+                merge_labels = labels.unsqueeze(1).expand(
+                    -1, num_merge
                 )
-
-                merge_labels = (
-                    labels.unsqueeze(1)
-                    .expand(-1, num_merge)
-                )
-
                 merge_ce = F.cross_entropy(
                     merge_logits.reshape(
-                        -1,
-                        merge_logits.size(-1),
+                        -1, merge_logits.size(-1)
                     ),
                     merge_labels.reshape(-1),
                     reduction="none",
                 ).reshape(
-                    labels.size(0),
-                    num_merge,
+                    labels.size(0), num_merge
                 ).mean(dim=1)
-
-                merge_pred_logits = (
-                    merge_logits.mean(dim=1)
-                )
-
+                merge_pred_logits = merge_logits.mean(dim=1)
             else:
                 raise ValueError(
                     "merge logits must be [B,C] or [B,M,C], got "
                     f"{tuple(merge_logits.shape)}."
                 )
 
-            answer_harm = (
-                merge_ce - original_ce
+            answer_harm = merge_ce - original_ce
+            necessity = 1.0 - torch.exp(-F.relu(answer_harm))
+            merge_pred = merge_pred_logits.argmax(dim=-1)
+
+            base_logits = self._score_answer_candidates(
+                answer_proj=answer_proj,
+                representation=qbound_aux["cra_video_proj"],
+                detach_answer=True,
+            )
+            base_pred = base_logits.argmax(dim=-1)
+
+            # ----------------------------------------------------------
+            # 4) Temporal-key diagnostics retained from V1.2.
+            # ----------------------------------------------------------
+            cra_key = self._normalize_distribution(
+                qbound_aux["cra_key"]
+            )
+            qbound_key = self._normalize_distribution(
+                qbound_aux["qbound_key"]
+            )
+            final_key = self._normalize_distribution(
+                qbound_aux["final_key"]
+            )
+            merge_qbound_key = self._normalize_distribution(
+                qbound_aux["merge_qbound_key"].squeeze(1)
+            )
+            merge_final_key = self._normalize_distribution(
+                qbound_aux["merge_final_key"].squeeze(1)
             )
 
-            necessity = (
-                1.0
-                - torch.exp(
-                    -F.relu(answer_harm)
-                )
-            )
+            cra_qbound_js = self._js_divergence(
+                cra_key, qbound_key
+            ).mean()
+            cra_final_js = self._js_divergence(
+                cra_key, final_key
+            ).mean()
+            qbound_final_js = self._js_divergence(
+                qbound_key, final_key
+            ).mean()
+            merge_final_js = self._js_divergence(
+                final_key, merge_final_key
+            ).mean()
+            pure_merge_js = self._js_divergence(
+                qbound_key, merge_qbound_key
+            ).mean()
 
-            original_pred = (
-                original_logits.argmax(
-                    dim=-1
-                )
-            )
+            cra_entropy = self._distribution_entropy(cra_key)
+            qbound_entropy = self._distribution_entropy(qbound_key)
+            final_entropy = self._distribution_entropy(final_key)
 
-            merge_pred = (
-                merge_pred_logits.argmax(
-                    dim=-1
-                )
-            )
-
-            base_logits = (
-                self._score_answer_candidates(
-                    answer_proj=answer_proj,
-                    representation=qbound_aux[
-                        "cra_video_proj"
-                    ],
-                    detach_answer=True,
-                )
-            )
-
-            base_pred = (
-                base_logits.argmax(
-                    dim=-1
-                )
-            )
-
-            cra_key = (
-                self._normalize_distribution(
-                    qbound_aux["cra_key"]
-                )
-            )
-
-            qbound_key = (
-                self._normalize_distribution(
-                    qbound_aux["qbound_key"]
-                )
-            )
-
-            final_key = (
-                self._normalize_distribution(
-                    qbound_aux["final_key"]
-                )
-            )
-
-            merge_qbound_key = (
-                self._normalize_distribution(
-                    qbound_aux[
-                        "merge_qbound_key"
-                    ].squeeze(1)
-                )
-            )
-
-            merge_final_key = (
-                self._normalize_distribution(
-                    qbound_aux[
-                        "merge_final_key"
-                    ].squeeze(1)
-                )
-            )
-
-            cra_qbound_js = (
-                self._js_divergence(
-                    cra_key,
-                    qbound_key,
-                ).mean()
-            )
-
-            cra_final_js = (
-                self._js_divergence(
-                    cra_key,
-                    final_key,
-                ).mean()
-            )
-
-            qbound_final_js = (
-                self._js_divergence(
-                    qbound_key,
-                    final_key,
-                ).mean()
-            )
-
-            merge_final_js = (
-                self._js_divergence(
-                    final_key,
-                    merge_final_key,
-                ).mean()
-            )
-
-            pure_merge_js = (
-                self._js_divergence(
-                    qbound_key,
-                    merge_qbound_key,
-                ).mean()
-            )
-
-            cra_entropy = (
-                self._distribution_entropy(
-                    cra_key
-                )
-            )
-
-            qbound_entropy = (
-                self._distribution_entropy(
-                    qbound_key
-                )
-            )
-
-            final_entropy = (
-                self._distribution_entropy(
-                    final_key
-                )
-            )
-
-            boundary_mask = (
-                qbound_aux.get(
-                    "boundary_mask"
-                )
-            )
-
+            boundary_mask = qbound_aux.get("boundary_mask")
             if (
-                torch.is_tensor(
-                    boundary_mask
-                )
+                torch.is_tensor(boundary_mask)
                 and boundary_mask.ndim == 2
             ):
                 valid_length = (
@@ -825,206 +849,182 @@ class CRAPipeline(BasePipeline):
                     + 1.0
                 )
             else:
-                valid_length = (
-                    torch.full(
-                        (cra_key.size(0),),
-                        float(cra_key.size(-1)),
-                        dtype=cra_key.dtype,
-                        device=cra_key.device,
-                    )
+                valid_length = torch.full(
+                    (cra_key.size(0),),
+                    float(cra_key.size(-1)),
+                    dtype=cra_key.dtype,
+                    device=cra_key.device,
                 )
 
-            valid_length = (
-                valid_length.clamp_min(2.0)
-            )
+            valid_length = valid_length.clamp_min(2.0)
+            uniform_entropy = torch.log(valid_length)
 
-            uniform_entropy = (
-                torch.log(valid_length)
-            )
+            cra_peak = cra_key.max(dim=-1).values
+            qbound_peak = qbound_key.max(dim=-1).values
+            final_peak = final_key.max(dim=-1).values
 
-            cra_peak = (
-                cra_key.max(
-                    dim=-1
-                ).values
-            )
-            qbound_peak = (
-                qbound_key.max(
-                    dim=-1
-                ).values
-            )
-            final_peak = (
-                final_key.max(
-                    dim=-1
-                ).values
-            )
-
-            cra_peak_idx = (
-                cra_key.argmax(
-                    dim=-1
-                ).to(cra_key.dtype)
-            )
-            qbound_peak_idx = (
-                qbound_key.argmax(
-                    dim=-1
-                ).to(cra_key.dtype)
-            )
-            final_peak_idx = (
-                final_key.argmax(
-                    dim=-1
-                ).to(cra_key.dtype)
-            )
+            cra_peak_idx = cra_key.argmax(dim=-1).to(cra_key.dtype)
+            qbound_peak_idx = qbound_key.argmax(dim=-1).to(cra_key.dtype)
+            final_peak_idx = final_key.argmax(dim=-1).to(cra_key.dtype)
 
             peak_denominator = (
                 valid_length - 1.0
             ).clamp_min(1.0)
 
             cra_qbound_peak_shift = (
-                (
-                    cra_peak_idx
-                    - qbound_peak_idx
-                ).abs()
+                (cra_peak_idx - qbound_peak_idx).abs()
                 / peak_denominator
             )
-
             cra_final_peak_shift = (
-                (
-                    cra_peak_idx
-                    - final_peak_idx
-                ).abs()
+                (cra_peak_idx - final_peak_idx).abs()
                 / peak_denominator
             )
 
             qbound_mix = (
-                qbound_aux[
-                    "qbound_mix"
-                ]
+                qbound_aux["qbound_mix"]
                 .detach()
                 .float()
                 .mean()
             )
+            merge_reasoning_counterfactual = self._scalar_mean(
+                qbound_aux.get("merge_reasoning_counterfactual")
+            )
 
         return {
+            # Main answer path.
             "qbound_original_acc": (
-                (original_pred == labels)
-                .float().mean().item()
+                (original_pred == labels).float().mean().item()
             ),
             "qbound_base_only_acc": (
-                (base_pred == labels)
-                .float().mean().item()
+                (base_pred == labels).float().mean().item()
             ),
+            "qbound_original_ce": original_ce.mean().item(),
+
+            # V1.3: Does ordered reasoning actually help?
+            "qbound_temporal_only_acc": (
+                (temporal_only_pred == labels).float().mean().item()
+            ),
+            "qbound_temporal_only_ce": temporal_only_ce.mean().item(),
+            "qbound_reasoning_acc_gain": (
+                (
+                    (original_pred == labels).float()
+                    - (temporal_only_pred == labels).float()
+                ).mean().item()
+            ),
+            "qbound_reasoning_ce_gain": (
+                reasoning_ce_gain.mean().item()
+            ),
+            "qbound_reasoning_positive_gain_ratio": (
+                reasoning_positive_gain.float().mean().item()
+            ),
+            "qbound_reasoning_flip_to_correct_ratio": (
+                flip_to_correct.float().mean().item()
+            ),
+            "qbound_reasoning_flip_to_wrong_ratio": (
+                flip_to_wrong.float().mean().item()
+            ),
+            "qbound_reasoning_correct_logit_delta": (
+                reasoning_correct_logit_delta.mean().item()
+            ),
+            "qbound_reasoning_logit_l1": (
+                reasoning_logit_l1.mean().item()
+            ),
+
+            # V1.3: Pure-QBound endpoint, independent of handover.
+            "qbound_pure_temporal_acc": (
+                (pure_temporal_pred == labels).float().mean().item()
+            ),
+            "qbound_pure_reasoned_acc": (
+                (pure_reasoned_pred == labels).float().mean().item()
+            ),
+            "qbound_pure_temporal_ce": pure_temporal_ce.mean().item(),
+            "qbound_pure_reasoned_ce": pure_reasoned_ce.mean().item(),
+            "qbound_pure_reasoning_ce_gain": (
+                pure_reasoning_ce_gain.mean().item()
+            ),
+            "qbound_pure_reasoning_positive_gain_ratio": (
+                (pure_reasoning_ce_gain > 0).float().mean().item()
+            ),
+
+            # Magnitude/use diagnostics.
+            "qbound_reasoning_residual_norm": (
+                raw_reasoning_norm.mean().item()
+            ),
+            "qbound_reasoning_residual_used_norm": (
+                used_reasoning_norm.mean().item()
+            ),
+            "qbound_temporal_feature_norm": (
+                temporal_feature_norm.mean().item()
+            ),
+            "qbound_reasoning_residual_ratio": (
+                reasoning_residual_ratio.mean().item()
+            ),
+
+            # Existing temporal-only MERGE diagnostic.
             "qbound_merge_acc": (
-                (merge_pred == labels)
-                .float().mean().item()
+                (merge_pred == labels).float().mean().item()
             ),
-            "qbound_original_ce": (
-                original_ce.mean().item()
-            ),
-            "qbound_merge_ce": (
-                merge_ce.mean().item()
-            ),
-            "qbound_answer_harm": (
-                answer_harm.mean().item()
-            ),
-            "qbound_abs_answer_harm": (
-                answer_harm.abs()
-                .mean().item()
-            ),
+            "qbound_merge_ce": merge_ce.mean().item(),
+            "qbound_answer_harm": answer_harm.mean().item(),
+            "qbound_abs_answer_harm": answer_harm.abs().mean().item(),
             "qbound_positive_harm_ratio": (
-                (answer_harm > 0)
-                .float().mean().item()
+                (answer_harm > 0).float().mean().item()
             ),
-            "qbound_necessity_diagnostic": (
-                necessity.mean().item()
-            ),
-            "qbound_mix": (
-                qbound_mix.item()
-            ),
-
-            "qbound_cra_qbound_js": (
-                cra_qbound_js.item()
-            ),
-            "qbound_cra_final_js": (
-                cra_final_js.item()
-            ),
-            "qbound_qbound_final_js": (
-                qbound_final_js.item()
-            ),
-            "qbound_original_merge_js": (
-                merge_final_js.item()
-            ),
-            "qbound_pure_merge_js": (
-                pure_merge_js.item()
+            "qbound_necessity_diagnostic": necessity.mean().item(),
+            "qbound_merge_reasoning_counterfactual": (
+                0.0
+                if merge_reasoning_counterfactual is None
+                else float(merge_reasoning_counterfactual)
             ),
 
-            "qbound_cra_key_entropy": (
-                cra_entropy.mean().item()
-            ),
-            "qbound_key_entropy": (
-                qbound_entropy.mean().item()
-            ),
-            "qbound_final_key_entropy": (
-                final_entropy.mean().item()
-            ),
+            "qbound_mix": qbound_mix.item(),
+
+            # Temporal-distribution diagnostics.
+            "qbound_cra_qbound_js": cra_qbound_js.item(),
+            "qbound_cra_final_js": cra_final_js.item(),
+            "qbound_qbound_final_js": qbound_final_js.item(),
+            "qbound_original_merge_js": merge_final_js.item(),
+            "qbound_pure_merge_js": pure_merge_js.item(),
+
+            "qbound_cra_key_entropy": cra_entropy.mean().item(),
+            "qbound_key_entropy": qbound_entropy.mean().item(),
+            "qbound_final_key_entropy": final_entropy.mean().item(),
             "qbound_cra_key_entropy_ratio": (
                 (
                     cra_entropy
-                    / uniform_entropy.clamp_min(
-                        1e-6
-                    )
+                    / uniform_entropy.clamp_min(1e-6)
                 ).mean().item()
             ),
             "qbound_key_entropy_ratio": (
                 (
                     qbound_entropy
-                    / uniform_entropy.clamp_min(
-                        1e-6
-                    )
+                    / uniform_entropy.clamp_min(1e-6)
                 ).mean().item()
             ),
             "qbound_final_key_entropy_ratio": (
                 (
                     final_entropy
-                    / uniform_entropy.clamp_min(
-                        1e-6
-                    )
+                    / uniform_entropy.clamp_min(1e-6)
                 ).mean().item()
             ),
 
-            "qbound_cra_key_max": (
-                cra_peak.mean().item()
-            ),
-            "qbound_key_max": (
-                qbound_peak.mean().item()
-            ),
-            "qbound_final_key_max": (
-                final_peak.mean().item()
-            ),
+            "qbound_cra_key_max": cra_peak.mean().item(),
+            "qbound_key_max": qbound_peak.mean().item(),
+            "qbound_final_key_max": final_peak.mean().item(),
             "qbound_cra_peak_ratio": (
-                (
-                    cra_peak
-                    * valid_length
-                ).mean().item()
+                (cra_peak * valid_length).mean().item()
             ),
             "qbound_peak_ratio": (
-                (
-                    qbound_peak
-                    * valid_length
-                ).mean().item()
+                (qbound_peak * valid_length).mean().item()
             ),
             "qbound_final_peak_ratio": (
-                (
-                    final_peak
-                    * valid_length
-                ).mean().item()
+                (final_peak * valid_length).mean().item()
             ),
-
             "qbound_cra_qbound_peak_shift": (
-                cra_qbound_peak_shift
-                .mean().item()
+                cra_qbound_peak_shift.mean().item()
             ),
             "qbound_cra_final_peak_shift": (
-                cra_final_peak_shift
-                .mean().item()
+                cra_final_peak_shift.mean().item()
             ),
         }
 
@@ -1077,6 +1077,14 @@ class CRAPipeline(BasePipeline):
             "effective_event_count",
             "soft_effective_event_count",
             "event_relevance_entropy",
+            "event_relevance_gate_mean",
+            "event_relevance_gate_sum",
+            "event_relevance_active_count",
+            "event_relevance_effective_count",
+            "ordered_relation_gate_mean",
+            "ordered_update_gate_mean",
+            "ordered_relation_past_mass",
+            "ordered_relation_future_mass",
             "token_entropy",
             "selected_transition_mass",
             "selected_transition_strength",
@@ -1133,7 +1141,7 @@ class CRAPipeline(BasePipeline):
                     .float().max().item()
                 )
 
-        # V1.2 dynamic-topology diagnostics. The histogram is the primary
+        # V1.3 dynamic-topology diagnostics. The histogram is the primary
         # signal for detecting both max-event saturation and 1-event collapse.
         event_count = qbound_aux.get("event_count")
         if torch.is_tensor(event_count):
@@ -1342,7 +1350,139 @@ class CRAPipeline(BasePipeline):
                     .float().max().item()
                 )
 
-        # Monitor semantic score scale; V1.2 no longer applies tanh bounding.
+        # --------------------------------------------------------------
+        # V1.3 ordered-event reasoning / multi-event utilization.
+        # --------------------------------------------------------------
+        event_relevance_gates = qbound_aux.get(
+            "event_relevance_gates"
+        )
+        event_valid_mask = qbound_aux.get(
+            "event_valid_mask"
+        )
+
+        if (
+            torch.is_tensor(event_relevance_gates)
+            and torch.is_tensor(event_valid_mask)
+        ):
+            valid_event_values = event_relevance_gates[
+                event_valid_mask.bool()
+            ]
+            if valid_event_values.numel() > 0:
+                stats["qbound_event_relevance_gate_valid_mean"] = (
+                    valid_event_values.detach().float().mean().item()
+                )
+                stats["qbound_event_relevance_gate_valid_min"] = (
+                    valid_event_values.detach().float().min().item()
+                )
+                stats["qbound_event_relevance_gate_valid_max"] = (
+                    valid_event_values.detach().float().max().item()
+                )
+
+            valid_count = event_valid_mask.bool().sum(dim=-1)
+            active_count = (
+                (event_relevance_gates >= 0.5)
+                & event_valid_mask.bool()
+            ).sum(dim=-1)
+
+            multi_event_samples = valid_count >= 2
+            if multi_event_samples.any():
+                stats["qbound_multi_event_relevance_ratio"] = (
+                    (
+                        active_count[multi_event_samples] >= 2
+                    ).float().mean().item()
+                )
+            else:
+                stats["qbound_multi_event_relevance_ratio"] = 0.0
+
+        ordered_relation_gates = qbound_aux.get(
+            "ordered_relation_gates"
+        )
+        ordered_relation_mask = qbound_aux.get(
+            "ordered_relation_valid_mask"
+        )
+
+        if (
+            torch.is_tensor(ordered_relation_gates)
+            and torch.is_tensor(ordered_relation_mask)
+        ):
+            valid_relation_values = ordered_relation_gates[
+                ordered_relation_mask.bool()
+            ]
+            if valid_relation_values.numel() > 0:
+                relation_values = valid_relation_values.detach().float()
+                stats["qbound_ordered_relation_gate_valid_mean"] = (
+                    relation_values.mean().item()
+                )
+                stats["qbound_ordered_relation_gate_valid_std"] = (
+                    relation_values.std(unbiased=False).item()
+                )
+                stats["qbound_ordered_relation_gate_valid_max"] = (
+                    relation_values.max().item()
+                )
+                stats["qbound_ordered_relation_active_ratio"] = (
+                    (relation_values >= 0.5).float().mean().item()
+                )
+
+        ordered_update_gate = qbound_aux.get(
+            "ordered_update_gate"
+        )
+        if (
+            torch.is_tensor(ordered_update_gate)
+            and torch.is_tensor(event_valid_mask)
+        ):
+            valid_update_values = ordered_update_gate[
+                event_valid_mask.bool()
+            ]
+            if valid_update_values.numel() > 0:
+                update_values = valid_update_values.detach().float()
+                stats["qbound_ordered_update_gate_valid_mean"] = (
+                    update_values.mean().item()
+                )
+                stats["qbound_ordered_update_gate_valid_max"] = (
+                    update_values.max().item()
+                )
+
+        relation_past_mass = qbound_aux.get(
+            "ordered_relation_past_mass"
+        )
+        relation_future_mass = qbound_aux.get(
+            "ordered_relation_future_mass"
+        )
+        if (
+            torch.is_tensor(relation_past_mass)
+            and torch.is_tensor(relation_future_mass)
+        ):
+            stats["qbound_order_direction_asymmetry"] = (
+                (
+                    relation_past_mass.detach().float()
+                    - relation_future_mass.detach().float()
+                ).abs().mean().item()
+            )
+
+        original_event_tokens = qbound_aux.get("event_tokens")
+        reasoned_event_tokens = qbound_aux.get("reasoned_event_tokens")
+        if (
+            torch.is_tensor(original_event_tokens)
+            and torch.is_tensor(reasoned_event_tokens)
+            and original_event_tokens.shape == reasoned_event_tokens.shape
+        ):
+            token_delta = (
+                reasoned_event_tokens.detach().float()
+                - original_event_tokens.detach().float()
+            ).norm(dim=-1)
+
+            if torch.is_tensor(event_valid_mask):
+                mask = event_valid_mask.bool()
+                if mask.any():
+                    stats["qbound_reasoned_event_token_delta_norm"] = (
+                        token_delta[mask].mean().item()
+                    )
+            else:
+                stats["qbound_reasoned_event_token_delta_norm"] = (
+                    token_delta.mean().item()
+                )
+
+        # Monitor semantic score scale; V1.3 no longer applies tanh bounding.
         for source_key, stat_prefix in [
             (
                 "event_token_scores",
@@ -1467,15 +1607,40 @@ class CRAPipeline(BasePipeline):
             "qbound_mix",
             "qbound_grad_norm",
 
+            # V1.3: is ordered reasoning useful to the real answer path?
             "qbound_original_acc",
+            "qbound_temporal_only_acc",
+            "qbound_reasoning_acc_gain",
             "qbound_base_only_acc",
-            "qbound_merge_acc",
             "qbound_original_ce",
+            "qbound_temporal_only_ce",
+            "qbound_reasoning_ce_gain",
+            "qbound_reasoning_positive_gain_ratio",
+            "qbound_reasoning_flip_to_correct_ratio",
+            "qbound_reasoning_flip_to_wrong_ratio",
+            "qbound_reasoning_correct_logit_delta",
+            "qbound_reasoning_logit_l1",
+
+            # Pure-QBound endpoint, independent of handover.
+            "qbound_pure_temporal_acc",
+            "qbound_pure_reasoned_acc",
+            "qbound_pure_temporal_ce",
+            "qbound_pure_reasoned_ce",
+            "qbound_pure_reasoning_ce_gain",
+            "qbound_pure_reasoning_positive_gain_ratio",
+            "qbound_reasoning_residual_norm",
+            "qbound_reasoning_residual_used_norm",
+            "qbound_temporal_feature_norm",
+            "qbound_reasoning_residual_ratio",
+
+            # Existing merge remains temporal-only in this V1.3 core.
+            "qbound_merge_acc",
             "qbound_merge_ce",
             "qbound_answer_harm",
             "qbound_abs_answer_harm",
             "qbound_positive_harm_ratio",
             "qbound_necessity_diagnostic",
+            "qbound_merge_reasoning_counterfactual",
 
             "qbound_selected_transition_strength",
             "qbound_selected_transition_mass",
@@ -1506,6 +1671,7 @@ class CRAPipeline(BasePipeline):
             "qbound_cra_qbound_peak_shift",
             "qbound_cra_final_peak_shift",
 
+            # Dynamic topology inherited from V1.2.
             "qbound_boundary_prob_mean",
             "qbound_boundary_count",
             "qbound_event_count",
@@ -1520,7 +1686,32 @@ class CRAPipeline(BasePipeline):
             "qbound_assignment_entropy",
             "qbound_effective_event_count",
             "qbound_soft_effective_event_count",
+
+            # V1.3 multi-event relevance.
             "qbound_event_relevance_entropy",
+            "qbound_event_relevance_gate_mean",
+            "qbound_event_relevance_gate_sum",
+            "qbound_event_relevance_active_count",
+            "qbound_event_relevance_effective_count",
+            "qbound_event_relevance_gate_valid_mean",
+            "qbound_event_relevance_gate_valid_min",
+            "qbound_event_relevance_gate_valid_max",
+            "qbound_multi_event_relevance_ratio",
+
+            # V1.3 ordered interaction.
+            "qbound_ordered_relation_gate_mean",
+            "qbound_ordered_update_gate_mean",
+            "qbound_ordered_relation_past_mass",
+            "qbound_ordered_relation_future_mass",
+            "qbound_ordered_relation_gate_valid_mean",
+            "qbound_ordered_relation_gate_valid_std",
+            "qbound_ordered_relation_gate_valid_max",
+            "qbound_ordered_relation_active_ratio",
+            "qbound_ordered_update_gate_valid_mean",
+            "qbound_ordered_update_gate_valid_max",
+            "qbound_order_direction_asymmetry",
+            "qbound_reasoned_event_token_delta_norm",
+
             "qbound_token_entropy",
             "qbound_pre_post_smooth_l1",
             "qbound_smoothing_peak_change_ratio",
@@ -1743,14 +1934,14 @@ class CRAPipeline(BasePipeline):
             ]
         )
 
-        # Repository CRA task loss is preserved exactly; Q-Bound V1.2 auxiliary objectives are added below.
+        # Repository CRA task loss is preserved exactly; the V1.2 weak alignment is retained, while V1.3 ordered reasoning is trained only through the main task/alignment path.
         loss = self.criterion(
             prediction_dict,
             target_dict,
         )
 
         # --------------------------------------------------------------
-        # Q-Bound V1.2 weak event alignment.
+        # Q-Bound weak event alignment retained from V1.2.
         #
         # This is intentionally different from CRA's existing global alignment:
         # it acts on the topology-pooled event evidence inside QBoundCore and a
@@ -1767,7 +1958,7 @@ class CRAPipeline(BasePipeline):
                 align_weight,
                 align_temperature,
                 boundary_sparse_weight,
-            ) = self._qbound_v12_loss_settings()
+            ) = self._qbound_v13_loss_settings()
 
             if align_weight > 0.0:
                 qbound_align_loss, weak_align_retrieval_acc = (
@@ -1785,7 +1976,7 @@ class CRAPipeline(BasePipeline):
                     + align_weight * qbound_align_loss
                 )
 
-            # Disabled by default for the first V1.2 run. Turn this on only if
+            # Keep disabled by default in V1.3. Turn this on only if
             # event_count again saturates at max_events.
             if boundary_sparse_weight > 0.0:
                 qbound_boundary_sparse_loss = (
@@ -1802,7 +1993,7 @@ class CRAPipeline(BasePipeline):
         # Counterfactuals are diagnostic only. No value returned here is
         # added to loss["total_loss"].
         qbound_logs = (
-            self._compute_qbound_v12_diagnostics(
+            self._compute_qbound_v13_diagnostics(
                 gqa_output=gqa_output,
                 answer_proj=answer_proj,
                 answer_id=answer_id,
@@ -2265,7 +2456,7 @@ class CRAPipeline(BasePipeline):
         keyframe = {}
         ori_keyframe = {}
 
-        # Q-Bound V1.2 temporal-key diagnostics.
+        # Q-Bound V1.3 temporal-key diagnostics.
         # Keep the pure Q-Bound and CRA teacher keys separately so we can
         # directly test whether Q-Bound is selective AND temporally correct.
         qbound_keyframe = {}
@@ -2340,7 +2531,7 @@ class CRAPipeline(BasePipeline):
                     answer_id=answer_id,
                     mode="VQA",
                     question=question,
-                    # V1.2 checkpoint selection/reporting is ALWAYS
+                    # V1.3 checkpoint selection/reporting is ALWAYS
                     # evaluated on the pure Q-Bound temporal path.
                     qbound_mix=(
                         1.0
@@ -2387,7 +2578,7 @@ class CRAPipeline(BasePipeline):
 
                 if qbound_aux is not None:
                     counterfactual_logs = (
-                        self._compute_qbound_v12_diagnostics(
+                        self._compute_qbound_v13_diagnostics(
                             gqa_output=eval_wrapper,
                             answer_proj=answer_proj,
                             answer_id=answer_id,
@@ -2638,7 +2829,7 @@ class CRAPipeline(BasePipeline):
         )
 
         # --------------------------------------------------------------
-        # Q-Bound V1.2 temporal-faithfulness diagnostics.
+        # Q-Bound V1.3 temporal-faithfulness diagnostics.
         #
         # Official benchmark metrics above remain untouched. These extra
         # diagnostics answer the failure mode seen in V1.1.3:
@@ -2648,8 +2839,8 @@ class CRAPipeline(BasePipeline):
         if qbound_keyframe:
             if not hasattr(self.metric, "temporal_key_metrics"):
                 raise AttributeError(
-                    "Q-Bound V1.2 requires Metric.temporal_key_metrics(). "
-                    "Please use metrics_qbound_v1_2.py."
+                    "Q-Bound V1.3 requires Metric.temporal_key_metrics(). "
+                    "Please use metrics_qbound_v1_3.py."
                 )
 
             score.update(

@@ -11,7 +11,7 @@ from modules.m_cra.causal_module import LinguisticInterventionGraph
 
 class CRA(nn.Module):
     """
-    CRA wrapper with optional Q-Bound Version 1.2 temporal reasoning.
+    CRA wrapper with optional Q-Bound Version 1.3 ordered-event reasoning.
 
     Responsibilities of this wrapper are deliberately limited:
 
@@ -20,9 +20,13 @@ class CRA(nn.Module):
     * pass the deterministic CRA -> Q-Bound handover weight ``qbound_mix``
       to the refine decoder;
     * expose pure-Q-Bound grounding/event features for weak alignment;
+    * expose V1.3 reasoned event states and directional interaction diagnostics;
+    * keep the repository's original candidate dot-product answer head: the
+      decoder's returned ``video_proj`` is already enriched by ordered-event
+      reasoning, so there is no auxiliary answer classifier or answer leakage;
     * expose the decoder's final temporal key and diagnostics unchanged.
 
-    Version 1.2 keeps CRA-specific training/inference logic outside QBoundCore.
+    Version 1.3 keeps CRA-specific training/inference logic outside QBoundCore.
     The topology module receives only generic video/context tokens plus a
     question-only representation. Ground-truth answer/QA features may be
     exposed as TRAINING-ONLY weak-alignment targets, but are never passed into
@@ -65,7 +69,7 @@ class CRA(nn.Module):
                 "version",
                 model_cfg.get(
                     "qbound_version",
-                    model_cfg.get("gpeb_version", "1.2"),
+                    model_cfg.get("gpeb_version", "1.3"),
                 ),
             )
         )
@@ -287,7 +291,7 @@ class CRA(nn.Module):
         qbound_mix=1.0,
     ):
         """
-        Refined CRA/Q-Bound V1.2 forward.
+        Refined CRA/Q-Bound V1.3 forward.
 
         ``question`` is required by default whenever Q-Bound is active,
         because topology induction must remain question-only.
@@ -359,7 +363,7 @@ class CRA(nn.Module):
             if question is None:
                 if self.qbound_require_question_only:
                     raise ValueError(
-                        "Q-Bound V1.2 requires question-only token ids. "
+                        "Q-Bound V1.3 requires question-only token ids. "
                         "Pass them through CRA.forward(..., question=...). "
                         "Do not silently reuse candidate answer features, "
                         "because that would leak answer-choice semantics "
@@ -407,7 +411,7 @@ class CRA(nn.Module):
         answer_proj = answer_g
 
         # --------------------------------------------------------------
-        # Q-Bound V1.2 outputs for the training pipeline.
+        # Q-Bound V1.3 outputs for the training pipeline.
         #
         # The new weak-alignment objective must consume PURE Q-Bound evidence,
         # not the mixed CRA->Q-Bound main representation.  We therefore expose
@@ -421,28 +425,44 @@ class CRA(nn.Module):
 
         if use_qbound:
             required_time_keys = {
+                # V1.2-compatible evidence outputs.
                 "qbound_grounding_feature",
                 "qbound_event_visual_tokens",
                 "qbound_evidence_visual_token",
                 "qbound_event_valid_mask",
                 "qbound_event_relevance_weights",
                 "qbound_frame_semantic_logits",
+
+                # V1.3 answer-side ordered-event reasoning outputs.
+                "qbound_reasoned_video_feature",
+                "qbound_temporal_main_feature",
+                "qbound_reasoning_residual",
+                "qbound_reasoning_residual_used",
+                "qbound_reasoning_scale",
+                "qbound_reasoned_event_tokens",
+                "qbound_reasoned_event_repr",
+                "qbound_ordered_relation_gates",
+                "qbound_ordered_relation_valid_mask",
+                "qbound_ordered_update_gate",
+                "qbound_event_relevance_gates",
+                "qbound_event_relevance_effective_count",
             }
             missing_time_keys = sorted(
                 required_time_keys.difference(time_param)
             )
             if missing_time_keys:
                 raise KeyError(
-                    "RefineDecoder/Q-Bound V1.2 time_param is missing: "
+                    "RefineDecoder/Q-Bound V1.3 time_param is missing: "
                     + ", ".join(missing_time_keys)
                 )
 
             if qbound_aux is None:
                 raise KeyError(
-                    "RefineDecoder/Q-Bound V1.2 must expose time_param['qbound_aux']."
+                    "RefineDecoder/Q-Bound V1.3 must expose time_param['qbound_aux']."
                 )
 
             required_aux_keys = {
+                # Dynamic topology / temporal evidence.
                 "boundary_hard",
                 "boundary_count",
                 "event_count",
@@ -450,13 +470,26 @@ class CRA(nn.Module):
                 "event_temporal_prob",
                 "event_visual_tokens",
                 "evidence_visual_token",
+
+                # Native V1.3 ordered-event reasoning.
+                "reasoned_event_tokens",
+                "reasoned_event_repr",
+                "ordered_relation_gates",
+                "ordered_relation_valid_mask",
+                "ordered_update_gate",
+                "event_relevance_gates",
+                "event_relevance_effective_count",
+
+                # RefineDecoder marks the current merge diagnostic explicitly
+                # as temporal-only until a re-reasoned counterfactual is added.
+                "merge_reasoning_counterfactual",
             }
             missing_aux_keys = sorted(
                 required_aux_keys.difference(qbound_aux)
             )
             if missing_aux_keys:
                 raise KeyError(
-                    "Q-Bound V1.2 auxiliary output is missing: "
+                    "Q-Bound V1.3 auxiliary output is missing: "
                     + ", ".join(missing_aux_keys)
                 )
 
@@ -491,6 +524,73 @@ class CRA(nn.Module):
             else None
         )
 
+        # V1.3 ordered-event reasoning outputs.  ``video_proj`` returned by the
+        # decoder already contains the curriculum-scaled reasoning residual and
+        # is therefore the ONLY representation used by the repository's main
+        # answer scorer.  The tensors below are exposed for diagnostics,
+        # ablations, and the later frozen-LLM adapter; no auxiliary answer head
+        # is introduced here.
+        qbound_reasoned_video_feature = (
+            time_param.get("qbound_reasoned_video_feature")
+            if isinstance(time_param, dict)
+            else None
+        )
+        qbound_temporal_main_feature = (
+            time_param.get("qbound_temporal_main_feature")
+            if isinstance(time_param, dict)
+            else None
+        )
+        qbound_reasoning_residual = (
+            time_param.get("qbound_reasoning_residual")
+            if isinstance(time_param, dict)
+            else None
+        )
+        qbound_reasoning_residual_used = (
+            time_param.get("qbound_reasoning_residual_used")
+            if isinstance(time_param, dict)
+            else None
+        )
+        qbound_reasoning_scale = (
+            time_param.get("qbound_reasoning_scale")
+            if isinstance(time_param, dict)
+            else None
+        )
+        qbound_reasoned_event_tokens = (
+            time_param.get("qbound_reasoned_event_tokens")
+            if isinstance(time_param, dict)
+            else None
+        )
+        qbound_reasoned_event_repr = (
+            time_param.get("qbound_reasoned_event_repr")
+            if isinstance(time_param, dict)
+            else None
+        )
+        qbound_ordered_relation_gates = (
+            time_param.get("qbound_ordered_relation_gates")
+            if isinstance(time_param, dict)
+            else None
+        )
+        qbound_ordered_relation_valid_mask = (
+            time_param.get("qbound_ordered_relation_valid_mask")
+            if isinstance(time_param, dict)
+            else None
+        )
+        qbound_ordered_update_gate = (
+            time_param.get("qbound_ordered_update_gate")
+            if isinstance(time_param, dict)
+            else None
+        )
+        qbound_event_relevance_gates = (
+            time_param.get("qbound_event_relevance_gates")
+            if isinstance(time_param, dict)
+            else None
+        )
+        qbound_event_relevance_effective_count = (
+            time_param.get("qbound_event_relevance_effective_count")
+            if isinstance(time_param, dict)
+            else None
+        )
+
         outs = {
             "fatt": video_attn,
             "time_param": time_param,
@@ -508,7 +608,7 @@ class CRA(nn.Module):
                 dtype=video_proj.dtype,
             ),
 
-            # V1.2 weak-alignment candidates.
+            # V1.3 weak-alignment + ordered-reasoning candidates.
             #
             # qbound_align_question:
             #   strict question-only alignment target.
@@ -527,6 +627,29 @@ class CRA(nn.Module):
             "qbound_event_valid_mask": qbound_event_valid_mask,
             "qbound_event_relevance_weights": qbound_event_relevance_weights,
             "qbound_frame_semantic_logits": qbound_frame_semantic_logits,
+
+            # V1.3 ordered multi-event reasoning.  These are surfaced without
+            # defining any CRA-specific operation inside QBoundCore.
+            "qbound_reasoned_video_feature": qbound_reasoned_video_feature,
+            "qbound_temporal_main_feature": qbound_temporal_main_feature,
+            "qbound_reasoning_residual": qbound_reasoning_residual,
+            "qbound_reasoning_residual_used": qbound_reasoning_residual_used,
+            "qbound_reasoning_scale": qbound_reasoning_scale,
+            "qbound_reasoned_event_tokens": qbound_reasoned_event_tokens,
+            "qbound_reasoned_event_repr": qbound_reasoned_event_repr,
+            "qbound_ordered_relation_gates": qbound_ordered_relation_gates,
+            "qbound_ordered_relation_valid_mask": (
+                qbound_ordered_relation_valid_mask
+            ),
+            "qbound_ordered_update_gate": qbound_ordered_update_gate,
+            "qbound_event_relevance_gates": qbound_event_relevance_gates,
+            "qbound_event_relevance_effective_count": (
+                qbound_event_relevance_effective_count
+            ),
+
+            # Keep the complete diagnostic package for the pipeline.  In V1.3
+            # merge/reverse/shuffle reasoning counterfactuals are diagnostics;
+            # they are not separate answer heads or training targets here.
             "qbound_aux": qbound_aux,
 
             "qbound_active": use_qbound,

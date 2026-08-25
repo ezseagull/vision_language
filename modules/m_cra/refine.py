@@ -109,7 +109,7 @@ class DecoderLayer(nn.Module):
 
 class Decoder(nn.Module):
     """
-    CRA refinement decoder with Q-Bound Version 1.2.
+    CRA refinement decoder with Q-Bound Version 1.3.
 
     Design
     ------
@@ -127,6 +127,17 @@ class Decoder(nn.Module):
                          /
         Q-Bound topology -> Q-Bound temporal probability
                          -> probability-preserving Gaussian smoothing
+                         -> temporal grounded feature
+
+        Q-Bound dynamic events
+                         -> ordered event interaction
+                         -> reasoned_event_repr
+                         -> small Q-Bound adapter
+                         -> answer-side residual
+
+        main_video_feature =
+            temporal_grounded_feature
+            + qbound_mix * reasoning_residual
 
     During training, ``qbound_mix`` is supplied externally by the pipeline.
     It must follow a fixed schedule and eventually reach 1.0.
@@ -138,14 +149,18 @@ class Decoder(nn.Module):
     Validation/test should use qbound_mix=1.0 so checkpoint selection never
     benefits from a permanent CRA temporal shortcut.
 
-    Important V1.2 properties
+    Important V1.3 properties
     -------------------------
     * Q-Bound core owns dynamic 0..K-1 boundary selection and contiguous events;
     * CRA never defines Q-Bound topology and remains outside the core;
     * no alpha/beta gate and no CRA + Q-Bound temporal-logit addition;
     * no second softmax on the Q-Bound Gaussian branch;
     * CRA sigma is detached on the Q-Bound smoothing branch;
-    * main VQA still follows the deterministic CRA->Q-Bound handover;
+    * main VQA still follows the deterministic CRA->Q-Bound temporal handover;
+    * unlike V1.2, ordered-event reasoning has a direct residual path to the
+      main answer representation, scaled by the same deterministic curriculum;
+    * the residual adapter is small-initialized and has no learnable scalar
+      bypass gate that can trivially disable ordered reasoning;
     * a PURE-QBound grounded feature is exposed for weak alignment so the
       alignment objective cannot be solved by the temporary CRA teacher;
     * event_visual_tokens/evidence_visual_token are propagated for future
@@ -221,7 +236,7 @@ class Decoder(nn.Module):
         )
 
         # --------------------------------------------------------------
-        # Q-Bound V1.2
+        # Q-Bound V1.3
         # --------------------------------------------------------------
         self.qbound_enabled = bool(
             qbound_cfg.get(
@@ -235,6 +250,11 @@ class Decoder(nn.Module):
                 ),
             )
         )
+
+        # Safe defaults keep the CRA-only / qbound-disabled path fully
+        # functional. They are overwritten below when Q-Bound is enabled.
+        self.qbound_hidden_dim = None
+        self.qbound_reasoning_scale = 0.0
 
         self.qbound_require_question_only = bool(
             qbound_cfg.get(
@@ -255,12 +275,17 @@ class Decoder(nn.Module):
             # boundary_bias_init=-2.0 was appropriate for dense soft boundary
             # mass but can collapse hard dynamic selection to zero transitions.
             # Explicit values under model.qbound still override these defaults.
-            self.qbound = QBoundCore(
-                input_dim=embed_dim,
-                hidden_dim=qbound_cfg.get(
+            qbound_hidden_dim = int(
+                qbound_cfg.get(
                     "hidden_dim",
                     model_cfg.get("qbound_hidden_dim", 256),
-                ),
+                )
+            )
+            self.qbound_hidden_dim = qbound_hidden_dim
+
+            self.qbound = QBoundCore(
+                input_dim=embed_dim,
+                hidden_dim=qbound_hidden_dim,
                 max_events=qbound_cfg.get(
                     "max_events",
                     model_cfg.get("qbound_max_events", 4),
@@ -303,6 +328,42 @@ class Decoder(nn.Module):
                     model_cfg.get("qbound_min_event_mass", 0.25),
                 ),
             )
+
+            # ----------------------------------------------------------
+            # V1.3 adapter: native Q-Bound ordered-event representation
+            # [B,H] -> CRA answer space [B,D].
+            #
+            # The adapter is intentionally tiny and initialized with a small
+            # weight.  Therefore V1.3 starts close to the already-stable V1.2
+            # temporal path, while the main VQA loss can directly train the
+            # ordered-event reasoner through this residual route.  Its module
+            # name contains ``qbound`` so BasePipeline's existing Q-Bound
+            # optimizer-group logic automatically includes these parameters.
+            # ----------------------------------------------------------
+            self.qbound_reasoning_adapter = nn.Sequential(
+                nn.LayerNorm(qbound_hidden_dim),
+                nn.Linear(qbound_hidden_dim, embed_dim, bias=False),
+            )
+            nn.init.normal_(
+                self.qbound_reasoning_adapter[-1].weight,
+                mean=0.0,
+                std=1e-2,
+            )
+
+            # Fixed residual strength, not a learnable bypass gate. During the
+            # CRA->Q-Bound curriculum it is additionally multiplied by
+            # qbound_mix, so validation/test (mix=1) use the full event-
+            # reasoning contribution while early training remains stable.
+            self.qbound_reasoning_scale = float(
+                qbound_cfg.get(
+                    "reasoning_residual_scale",
+                    model_cfg.get("qbound_reasoning_residual_scale", 1.0),
+                )
+            )
+            if self.qbound_reasoning_scale < 0.0:
+                raise ValueError(
+                    "qbound.reasoning_residual_scale must be >= 0."
+                )
 
             # Keep backbone detachment configurable. For the first controlled
             # V1.2 run, True isolates whether dynamic topology + weak alignment
@@ -619,8 +680,64 @@ class Decoder(nn.Module):
 
         return projected
 
+    def _project_qbound_reasoning(self, reasoned_event_repr):
+        """Project Q-Bound's native [B,H] ordered-event state to [B,D]."""
+        if reasoned_event_repr.ndim != 2:
+            raise ValueError(
+                "reasoned_event_repr must be [B,H], got "
+                f"{tuple(reasoned_event_repr.shape)}."
+            )
+        if reasoned_event_repr.size(-1) != self.qbound_hidden_dim:
+            raise ValueError(
+                "reasoned_event_repr hidden size mismatch. Expected "
+                f"{self.qbound_hidden_dim}, got "
+                f"{reasoned_event_repr.size(-1)}."
+            )
+        return self.qbound_reasoning_adapter(reasoned_event_repr)
+
+    def _inject_qbound_reasoning(
+        self,
+        temporal_video_proj,
+        reasoning_residual,
+        qbound_mix,
+    ):
+        """
+        Add ordered-event reasoning to the main answer representation.
+
+        This is deliberately a deterministic residual, not a learnable scalar
+        gate that could trivially collapse to zero and recreate V1.2's bypass.
+        The same CRA->Q-Bound curriculum value controls when the new path is
+        introduced:
+
+            main = temporal_feature
+                   + mix * scale * ordered_event_residual
+
+        At validation/test mix=1, CRA temporal grounding is already absent and
+        the full ordered-event residual participates in answer prediction.
+        """
+        if temporal_video_proj.shape != reasoning_residual.shape:
+            raise ValueError(
+                "temporal_video_proj and reasoning_residual must both be "
+                f"[B,D], got {tuple(temporal_video_proj.shape)} and "
+                f"{tuple(reasoning_residual.shape)}."
+            )
+        if qbound_mix.ndim != 2 or qbound_mix.shape != (
+            temporal_video_proj.size(0), 1
+        ):
+            raise ValueError(
+                "qbound_mix must be normalized to [B,1] before reasoning "
+                "injection."
+            )
+
+        scaled_residual = (
+            self.qbound_reasoning_scale
+            * qbound_mix
+            * reasoning_residual
+        )
+        return temporal_video_proj + scaled_residual, scaled_residual
+
     # ------------------------------------------------------------------
-    # V1.2 temporal handover helpers
+    # V1.3 temporal handover helpers
     # ------------------------------------------------------------------
     def _mix_temporal_keys(
         self,
@@ -706,7 +823,7 @@ class Decoder(nn.Module):
             base_temporal["cra_key"]
         )
 
-        # V1.2 branch diagnostics.
+        # V1.3 branch diagnostics.
         time_param["qbound_key"] = (
             qbound_key
         )
@@ -952,7 +1069,7 @@ class Decoder(nn.Module):
                 and self.qbound_require_question_only
             ):
                 raise ValueError(
-                    "Q-Bound V1.2 requires "
+                    "Q-Bound V1.3 requires "
                     "question_feature=[B,D]. Pass question-only "
                     "tokens through CRA.forward(..., question=...)."
                 )
@@ -1014,6 +1131,15 @@ class Decoder(nn.Module):
                 "event_relevance_weights",
                 "frame_semantic_logits",
 
+                # V1.3 ordered reasoning / multi-event utilization.
+                "reasoned_event_tokens",
+                "reasoned_event_repr",
+                "ordered_relation_gates",
+                "ordered_relation_valid_mask",
+                "ordered_update_gate",
+                "event_relevance_gates",
+                "event_relevance_effective_count",
+
                 # Counterfactual diagnostics.
                 "merge_event_temporal_prob",
                 "merge_transition_selector",
@@ -1030,7 +1156,7 @@ class Decoder(nn.Module):
 
             if missing:
                 raise KeyError(
-                    "Q-Bound V1.2 output is missing: "
+                    "Q-Bound V1.3 output is missing: "
                     + ", ".join(missing)
                 )
 
@@ -1106,7 +1232,7 @@ class Decoder(nn.Module):
             )
         )
 
-        video_proj = (
+        temporal_video_proj = (
             self._project_grounded_video(
                 x_bar=x_bar,
                 temporal_weights=final_key,
@@ -1119,6 +1245,43 @@ class Decoder(nn.Module):
             )
         )
 
+        if qbound_aux is not None:
+            qbound_reasoning_residual = (
+                self._project_qbound_reasoning(
+                    qbound_aux["reasoned_event_repr"]
+                )
+            )
+
+            # Main VQA representation. The temporal branch still determines
+            # grounded visual content, but V1.3 now gives the ordered event
+            # state a direct path to the answer scorer. The residual is
+            # introduced with the same deterministic curriculum as Q-Bound.
+            video_proj, reasoning_residual_used = (
+                self._inject_qbound_reasoning(
+                    temporal_video_proj=temporal_video_proj,
+                    reasoning_residual=qbound_reasoning_residual,
+                    qbound_mix=mix,
+                )
+            )
+
+            # Pure-QBound V1.3 answer feature, independent of the temporary CRA
+            # teacher. This is useful for diagnostics/ablation and later LLM
+            # adapters; it is not used by the current weak InfoNCE objective.
+            qbound_reasoned_video_proj = (
+                qbound_video_proj
+                + self.qbound_reasoning_scale
+                * qbound_reasoning_residual
+            )
+        else:
+            qbound_reasoning_residual = torch.zeros_like(
+                temporal_video_proj
+            )
+            reasoning_residual_used = torch.zeros_like(
+                temporal_video_proj
+            )
+            qbound_reasoned_video_proj = qbound_video_proj
+            video_proj = temporal_video_proj
+
         # Existing CRA/CMA-compatible feature: this follows the actually-used
         # main VQA path and therefore still follows the deterministic handover.
         # We keep it unchanged for compatibility until cra_pipeline.py is
@@ -1127,12 +1290,34 @@ class Decoder(nn.Module):
             video_proj
         )
 
-        # V1.2 weak-alignment feature: PURE Q-Bound, independent of qbound_mix.
+        # V1.3 weak-alignment feature: PURE Q-Bound, independent of qbound_mix.
         # New Q-Bound alignment losses should use this field (or the event-level
         # features below), NOT grounding_feature, so early CRA teacher mixing
         # cannot satisfy the new objective.
         time_param["qbound_grounding_feature"] = (
             qbound_video_proj
+        )
+
+        # V1.3 answer-side features. ``qbound_reasoned_video_feature`` is the
+        # pure-QBound endpoint (temporal evidence + ordered-event residual),
+        # while ``qbound_temporal_main_feature`` records the actually-used
+        # temporal feature before the residual is injected.
+        time_param["qbound_reasoned_video_feature"] = (
+            qbound_reasoned_video_proj
+        )
+        time_param["qbound_temporal_main_feature"] = (
+            temporal_video_proj
+        )
+        time_param["qbound_reasoning_residual"] = (
+            qbound_reasoning_residual
+        )
+        time_param["qbound_reasoning_residual_used"] = (
+            reasoning_residual_used
+        )
+        time_param["qbound_reasoning_scale"] = torch.as_tensor(
+            self.qbound_reasoning_scale,
+            device=video_proj.device,
+            dtype=video_proj.dtype,
         )
 
         # Useful CRA diagnostic only; no new Q-Bound loss should attach here.
@@ -1158,6 +1343,30 @@ class Decoder(nn.Module):
             )
             time_param["qbound_frame_semantic_logits"] = (
                 qbound_aux["frame_semantic_logits"]
+            )
+
+            # Native V1.3 reasoning outputs. These stay backbone-independent
+            # and will be surfaced by CRA.forward in the next refactor step.
+            time_param["qbound_reasoned_event_tokens"] = (
+                qbound_aux["reasoned_event_tokens"]
+            )
+            time_param["qbound_reasoned_event_repr"] = (
+                qbound_aux["reasoned_event_repr"]
+            )
+            time_param["qbound_ordered_relation_gates"] = (
+                qbound_aux["ordered_relation_gates"]
+            )
+            time_param["qbound_ordered_relation_valid_mask"] = (
+                qbound_aux["ordered_relation_valid_mask"]
+            )
+            time_param["qbound_ordered_update_gate"] = (
+                qbound_aux["ordered_update_gate"]
+            )
+            time_param["qbound_event_relevance_gates"] = (
+                qbound_aux["event_relevance_gates"]
+            )
+            time_param["qbound_event_relevance_effective_count"] = (
+                qbound_aux["event_relevance_effective_count"]
             )
 
         # --------------------------------------------------------------
@@ -1187,6 +1396,22 @@ class Decoder(nn.Module):
                 x_star_proj=x_star_proj,
             )
 
+            # V1.3 note: QBoundCore currently exposes the MERGE temporal
+            # counterfactual but not a separately re-reasoned merge event state.
+            # To keep the existing merge-CE diagnostic fair, reuse the SAME
+            # original ordered-event residual on both original and merge paths.
+            # Therefore any current merge harm still measures temporal topology
+            # only. A true reasoning counterfactual (merge/reverse/shuffle with
+            # recomputed event reasoning) will be added in the pipeline/core
+            # diagnostic step rather than silently conflating the two effects.
+            merge_temporal_video_proj = merge_video_proj
+            if qbound_aux is not None:
+                merge_video_proj, _ = self._inject_qbound_reasoning(
+                    temporal_video_proj=merge_temporal_video_proj,
+                    reasoning_residual=qbound_reasoning_residual,
+                    qbound_mix=mix,
+                )
+
             qbound_aux.update(
                 {
                     # CRA teacher / pure Q-Bound / actually-used main key.
@@ -1205,6 +1430,18 @@ class Decoder(nn.Module):
                     ),
                     "qbound_video_proj": (
                         qbound_video_proj
+                    ),
+                    "qbound_reasoned_video_proj": (
+                        qbound_reasoned_video_proj
+                    ),
+                    "temporal_main_video_proj": (
+                        temporal_video_proj
+                    ),
+                    "qbound_reasoning_residual": (
+                        qbound_reasoning_residual
+                    ),
+                    "qbound_reasoning_residual_used": (
+                        reasoning_residual_used
                     ),
                     "main_video_proj": (
                         video_proj
@@ -1238,8 +1475,16 @@ class Decoder(nn.Module):
                             "end"
                         ].unsqueeze(1)
                     ),
+                    "merge_temporal_video_proj": (
+                        merge_temporal_video_proj.unsqueeze(1)
+                    ),
                     "merge_video_proj": (
                         merge_video_proj.unsqueeze(1)
+                    ),
+                    "merge_reasoning_counterfactual": torch.as_tensor(
+                        0.0,
+                        device=video_proj.device,
+                        dtype=video_proj.dtype,
                     ),
 
                     # Final-path intervention magnitude. During training this

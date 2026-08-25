@@ -7,39 +7,44 @@ import torch.nn.functional as F
 
 class QBoundCore(nn.Module):
     """
-    Q-Bound Version 1.2 core.
+    Q-Bound Version 1.3 core.
 
-    Main changes from V1.1.3
-    ------------------------
-    1) True dynamic topology.
-       Boundary probabilities are no longer accumulated and rescaled to K-1.
-       Instead, Q-Bound performs local-peak competition, thresholded dynamic
-       activation, and a hard top-(K-1) safety cap. The forward topology is
-       therefore allowed to contain 0..K-1 transitions for each sample.
+    V1.3 keeps the dynamic topology learned in V1.2 and changes the way the
+    discovered events are *used*. V1.2 successfully produced a variable number
+    of contiguous events, but downstream relevance could become nearly
+    winner-takes-all. V1.3 therefore introduces a lightweight Question-
+    Conditioned Ordered Event Interaction (Q-OEI) block.
 
-    2) Actual contiguous events in the forward pass.
-       Selected boundaries create integer event coordinates and hard contiguous
-       event assignments. A straight-through soft surrogate is retained only
-       for gradient propagation.
+    Main changes from V1.2
+    ----------------------
+    1) Preserve dynamic event discovery.
+       Boundary selection, hard contiguous assignment, and the 0..K-1 dynamic
+       transition count are intentionally unchanged from V1.2.
 
-    3) No learned event-activity rescue gate.
-       Event existence follows directly from the selected topology. Empty event
-       slots are inactive; non-empty slots are active.
+    2) Question-conditioned ordered event interaction.
+       Each valid event can exchange information with other valid events. Pair
+       relations explicitly receive signed temporal order/distance features, so
+       E_i<-E_j is different from E_j<-E_i without adding a Transformer/GRU.
 
-    4) No tanh-saturated semantic scoring.
-       Event/transition token logits remain ordinary logits. Main temporal
-       evidence is produced by event relevance together with a question-aware
-       within-event frame scorer.
+    3) Independent multi-event relevance.
+       Event relevance is produced with independent sigmoid gates rather than a
+       softmax competition. Several events may therefore be simultaneously
+       relevant. Normalization is used only where a true distribution is needed
+       (e.g. visual evidence pooling), not to define event existence/relevance.
 
-    5) Weak-alignment-ready outputs.
-       The core exposes event_visual_tokens and evidence_visual_token so the
-       training pipeline can add a weak cross-modal / QA alignment objective
-       without putting dataset-specific supervision inside QBoundCore.
+    4) Reasoned events drive grounding.
+       Temporal grounding uses relevance from the reasoned event states together
+       with the existing question-aware within-event frame evidence scorer.
+
+    5) Reasoning-ready outputs.
+       The core exposes reasoned_event_tokens, reasoned_event_repr, directional
+       relation gates, update gates, and multi-event relevance diagnostics. These
+       can later be consumed by a CRA adapter or by a projector into a frozen LLM.
 
     Backbone independence
     ---------------------
     QBoundCore only consumes generic video/question representations. CRA-specific
-    handover, losses, answer heads, and any optional temporal prior remain outside
+    handover, losses, answer heads, and optional temporal priors remain outside
     the architectural definition of Q-Bound.
 
     Inputs
@@ -68,7 +73,7 @@ class QBoundCore(nn.Module):
         super().__init__()
 
         if max_events < 2:
-            raise ValueError("Version 1.2 requires max_events >= 2.")
+            raise ValueError("Version 1.3 requires max_events >= 2.")
         if not 0.0 <= dropout < 1.0:
             raise ValueError("dropout must be in [0, 1).")
         if boundary_temperature <= 0.0:
@@ -137,6 +142,65 @@ class QBoundCore(nn.Module):
             nn.LayerNorm(hidden_dim),
         )
 
+        # ------------------------------------------------------------------
+        # V1.3: Question-Conditioned Ordered Event Interaction (Q-OEI).
+        # ------------------------------------------------------------------
+        # Pair input = receiver event, source event, difference, interaction,
+        # question, and four explicit order features:
+        # signed distance, absolute distance, source-is-past, source-is-future.
+        # With max_events <= 4 this O(K^2) interaction is negligible in cost.
+        ordered_pair_dim = hidden_dim * 5 + 4
+        self.ordered_relation_score = nn.Sequential(
+            nn.Linear(ordered_pair_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+        nn.init.normal_(
+            self.ordered_relation_score[-1].weight,
+            mean=0.0,
+            std=1e-2,
+        )
+        nn.init.zeros_(self.ordered_relation_score[-1].bias)
+
+        self.ordered_value_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.ordered_event_update = nn.Sequential(
+            nn.Linear(hidden_dim * 4, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.ordered_update_gate = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        nn.init.normal_(
+            self.ordered_update_gate[-1].weight,
+            mean=0.0,
+            std=1e-2,
+        )
+        # Start close to V1.2: interaction is available from the beginning but
+        # does not overwrite the already useful discovered event representation.
+        nn.init.constant_(self.ordered_update_gate[-1].bias, -1.5)
+        self.ordered_event_norm = nn.LayerNorm(hidden_dim)
+
+        # Independent event gates are the key V1.3 change that removes the
+        # compulsory winner-takes-all competition of a softmax over events.
+        self.event_relevance_score = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+        nn.init.normal_(
+            self.event_relevance_score[-1].weight,
+            mean=0.0,
+            std=1e-2,
+        )
+        nn.init.zeros_(self.event_relevance_score[-1].bias)
+
         # left event, right event, difference, interaction,
         # local boundary state, question, transition strength.
         self.transition_encoder = nn.Sequential(
@@ -156,9 +220,9 @@ class QBoundCore(nn.Module):
         nn.init.normal_(self.token_score[-1].weight, mean=0.0, std=1e-2)
         nn.init.zeros_(self.token_score[-1].bias)
 
-        # Question-aware within-event frame scorer. This is the main V1.2b
-        # preparation: event relevance decides *which event* matters, while this
-        # scorer decides *where inside that event* the temporal evidence lies.
+        # Question-aware within-event frame scorer retained from V1.2. In V1.3,
+        # reasoned multi-event relevance decides *which events* matter, while
+        # this scorer decides *where inside each event* the evidence lies.
         self.frame_evidence_encoder = nn.Sequential(
             nn.Linear(hidden_dim * 4, hidden_dim),
             nn.GELU(),
@@ -170,7 +234,7 @@ class QBoundCore(nn.Module):
         nn.init.zeros_(self.frame_evidence_score.bias)
 
     def _summarize_qa(self, qa_features: torch.Tensor) -> torch.Tensor:
-        """Compatibility helper. V1.2 should receive question-only [B, D]."""
+        """Compatibility helper. V1.3 should receive question-only [B, D]."""
         if qa_features.ndim < 2:
             raise ValueError("qa_features must have at least two dimensions.")
         if qa_features.size(-1) != self.input_dim:
@@ -465,6 +529,193 @@ class QBoundCore(nn.Module):
         )
         return affinity
 
+    def _ordered_event_interaction(
+        self,
+        event_tokens: torch.Tensor,
+        event_valid_mask: torch.Tensor,
+        qa_state: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Lightweight ordered multi-event reasoning.
+
+        event_tokens: [B,K,H]
+        event_valid_mask: [B,K]
+        qa_state: [B,H]
+
+        For every receiver event i and source event j, the relation scorer sees
+        both semantic states, the question, and explicit signed temporal order.
+        Relations are independent sigmoid gates (not a softmax attention row),
+        so multiple neighboring events can contribute simultaneously.
+        """
+        batch_size, event_slots, hidden_dim = event_tokens.shape
+        if event_slots != self.max_events or hidden_dim != self.hidden_dim:
+            raise ValueError(
+                "event_tokens must be [B,max_events,hidden_dim], got "
+                f"{tuple(event_tokens.shape)}."
+            )
+
+        event_valid_mask = event_valid_mask.bool()
+
+        receiver = event_tokens.unsqueeze(2).expand(
+            -1, -1, event_slots, -1
+        )
+        source = event_tokens.unsqueeze(1).expand(
+            -1, event_slots, -1, -1
+        )
+        qa_pair = qa_state[:, None, None, :].expand(
+            -1, event_slots, event_slots, -1
+        )
+
+        slot = torch.arange(
+            event_slots,
+            dtype=event_tokens.dtype,
+            device=event_tokens.device,
+        )
+        denom = float(max(event_slots - 1, 1))
+        # relative_order[i,j] = j-i: negative means source j is in the past,
+        # positive means source j is in the future of receiver i.
+        relative_order = (
+            slot.view(1, event_slots) - slot.view(event_slots, 1)
+        ) / denom
+        abs_order = relative_order.abs()
+        source_is_past = (relative_order < 0).to(event_tokens.dtype)
+        source_is_future = (relative_order > 0).to(event_tokens.dtype)
+        order_features = torch.stack(
+            [
+                relative_order,
+                abs_order,
+                source_is_past,
+                source_is_future,
+            ],
+            dim=-1,
+        ).unsqueeze(0).expand(batch_size, -1, -1, -1)
+
+        pair_input = torch.cat(
+            [
+                receiver,
+                source,
+                source - receiver,
+                receiver * source,
+                qa_pair,
+                order_features,
+            ],
+            dim=-1,
+        )
+        relation_logits_raw = self.ordered_relation_score(
+            pair_input
+        ).squeeze(-1)
+
+        identity = torch.eye(
+            event_slots,
+            dtype=torch.bool,
+            device=event_tokens.device,
+        ).unsqueeze(0)
+        pair_valid_mask = (
+            event_valid_mask.unsqueeze(2)
+            & event_valid_mask.unsqueeze(1)
+            & (~identity)
+        )
+
+        relation_gates = torch.sigmoid(relation_logits_raw)
+        relation_gates = (
+            relation_gates * pair_valid_mask.to(relation_gates.dtype)
+        )
+
+        source_values = self.ordered_value_proj(event_tokens)
+        relation_context = torch.einsum(
+            "bij,bjh->bih",
+            relation_gates,
+            source_values,
+        )
+        relation_denominator = relation_gates.sum(
+            dim=-1, keepdim=True
+        ).clamp_min(1e-6)
+        relation_context = relation_context / relation_denominator
+
+        qa_events = qa_state.unsqueeze(1).expand(-1, event_slots, -1)
+        event_update = self.ordered_event_update(
+            torch.cat(
+                [
+                    event_tokens,
+                    relation_context,
+                    event_tokens * relation_context,
+                    qa_events,
+                ],
+                dim=-1,
+            )
+        )
+        update_gate = torch.sigmoid(
+            self.ordered_update_gate(
+                torch.cat(
+                    [event_tokens, relation_context, qa_events],
+                    dim=-1,
+                )
+            ).squeeze(-1)
+        )
+
+        has_neighbor = pair_valid_mask.any(dim=-1)
+        update_gate = (
+            update_gate
+            * has_neighbor.to(update_gate.dtype)
+            * event_valid_mask.to(update_gate.dtype)
+        )
+
+        updated_event_tokens = self.ordered_event_norm(
+            event_tokens + update_gate.unsqueeze(-1) * event_update
+        )
+        # For a single-event sample there is no ordered relation to reason over;
+        # keep the V1.2 event token exactly rather than changing it by LayerNorm.
+        reasoned_event_tokens = torch.where(
+            has_neighbor.unsqueeze(-1),
+            updated_event_tokens,
+            event_tokens,
+        )
+        reasoned_event_tokens = (
+            reasoned_event_tokens
+            * event_valid_mask.to(reasoned_event_tokens.dtype).unsqueeze(-1)
+        )
+
+        pair_count = pair_valid_mask.sum(dim=(1, 2)).clamp_min(1).to(
+            relation_gates.dtype
+        )
+        relation_gate_mean = relation_gates.sum(dim=(1, 2)) / pair_count
+
+        valid_event_count = event_valid_mask.sum(dim=-1).clamp_min(1).to(
+            update_gate.dtype
+        )
+        update_gate_mean = update_gate.sum(dim=-1) / valid_event_count
+
+        past_mask = (
+            (relative_order < 0).unsqueeze(0) & pair_valid_mask
+        )
+        future_mask = (
+            (relative_order > 0).unsqueeze(0) & pair_valid_mask
+        )
+        total_relation_mass = relation_gates.sum(dim=(1, 2)).clamp_min(1e-6)
+        relation_past_mass = (
+            relation_gates * past_mask.to(relation_gates.dtype)
+        ).sum(dim=(1, 2)) / total_relation_mass
+        relation_future_mass = (
+            relation_gates * future_mask.to(relation_gates.dtype)
+        ).sum(dim=(1, 2)) / total_relation_mass
+
+        return {
+            "reasoned_event_tokens": reasoned_event_tokens,
+            "ordered_relation_logits": torch.where(
+                pair_valid_mask,
+                relation_logits_raw,
+                torch.zeros_like(relation_logits_raw),
+            ),
+            "ordered_relation_gates": relation_gates,
+            "ordered_relation_valid_mask": pair_valid_mask,
+            "ordered_relation_context": relation_context,
+            "ordered_update_gate": update_gate,
+            "ordered_relation_gate_mean": relation_gate_mean,
+            "ordered_update_gate_mean": update_gate_mean,
+            "ordered_relation_past_mass": relation_past_mass,
+            "ordered_relation_future_mass": relation_future_mass,
+        }
+
     def _encode_partition(
         self,
         raw_states: torch.Tensor,
@@ -553,6 +804,15 @@ class QBoundCore(nn.Module):
             )
         )
 
+        # V1.3: discover first, reason second. Dynamic topology above is unchanged;
+        # this block only lets the already discovered events interact in order.
+        ordered_reasoning = self._ordered_event_interaction(
+            event_tokens=event_tokens,
+            event_valid_mask=event_valid_mask,
+            qa_state=qa_state,
+        )
+        reasoned_event_tokens = ordered_reasoning["reasoned_event_tokens"]
+
         transition_slot_affinity = self._build_transition_affinity(
             event_coordinate=event_coordinate,
             boundary_mass=boundary_mass,
@@ -578,8 +838,10 @@ class QBoundCore(nn.Module):
         # Forward transition mass is 0 or 1 for a valid dynamic topology.
         transition_strength = 1.0 - torch.exp(-transition_mass)
 
-        left_event = event_tokens[:, :-1]
-        right_event = event_tokens[:, 1:]
+        # Transitions are encoded from the reasoned event states so merge and
+        # transition diagnostics test the representation actually used by V1.3.
+        left_event = reasoned_event_tokens[:, :-1]
+        right_event = reasoned_event_tokens[:, 1:]
         qa_transitions = qa_state.unsqueeze(1).expand(
             -1, self.max_transitions, -1
         )
@@ -610,7 +872,7 @@ class QBoundCore(nn.Module):
         token_list = []
         token_mask_list = []
         for event_index in range(self.max_events):
-            token_list.append(event_tokens[:, event_index])
+            token_list.append(reasoned_event_tokens[:, event_index])
             token_mask_list.append(event_valid_mask[:, event_index])
             if event_index < self.max_events - 1:
                 token_list.append(transition_tokens[:, event_index])
@@ -633,33 +895,57 @@ class QBoundCore(nn.Module):
         raw_event_token_logits = token_logits[:, 0::2]
         raw_transition_token_logits = token_logits[:, 1::2]
 
-        # No tanh saturation. Invalid slots are removed by masks when a
-        # probability distribution is required.
-        event_relevance_weights = self._masked_softmax(
-            raw_event_token_logits,
+        # ------------------------------------------------------------------
+        # V1.3 independent multi-event relevance.
+        # ------------------------------------------------------------------
+        # Unlike V1.2, these gates do NOT compete through a softmax. Multiple
+        # events can simultaneously receive high relevance. A normalized copy
+        # is kept only for operations that mathematically require a distribution
+        # (visual evidence pooling and entropy diagnostics).
+        event_relevance_logits = self.event_relevance_score(
+            torch.cat(
+                [
+                    reasoned_event_tokens,
+                    qa_events,
+                    reasoned_event_tokens * qa_events,
+                ],
+                dim=-1,
+            )
+        ).squeeze(-1)
+        event_relevance_gates = torch.sigmoid(event_relevance_logits)
+        event_relevance_gates = (
+            event_relevance_gates
+            * event_valid_mask.to(event_relevance_gates.dtype)
+        )
+        event_relevance_weights = self._normalize_distribution(
+            event_relevance_gates,
             event_valid_mask,
             dim=-1,
         )
+
+        # Transition relevance remains diagnostic-only and can safely retain a
+        # normalized distribution over actual transitions.
         transition_relevance_weights = self._masked_softmax(
             raw_transition_token_logits,
             transition_valid_mask,
             dim=-1,
         )
 
-        # Project event relevance back to frames. Since the forward assignment
-        # is contiguous one-hot, each frame receives the relevance of its event.
+        # Each frame receives the *independent* gate of its contiguous event.
+        # The final temporal softmax happens only after adding within-event frame
+        # semantics, so event-level normalization is not required here.
         frame_event_gate = torch.einsum(
             "btk,bk->bt",
             event_assignment,
-            event_relevance_weights,
+            event_relevance_gates,
         )
         frame_event_gate = (
             frame_event_gate * video_mask.to(frame_event_gate.dtype)
         )
 
-        # Combine event-level selection and within-event semantic evidence in
-        # logit space. This avoids double-softmax while preserving a direct
-        # topology -> evidence dependency.
+        # Combine event-level multi-relevance and within-event semantic evidence
+        # in logit space. Sigmoid-bounded gates avoid the unconstrained logit
+        # race that drove V1.2 event relevance toward a single winner.
         event_frame_logits = torch.log(frame_event_gate.clamp_min(1e-6))
 
         # Transition evidence is retained for diagnostics/counterfactuals, but
@@ -682,7 +968,7 @@ class QBoundCore(nn.Module):
         frame_transition_logits[:, :-1] += 0.5 * transition_edge_logits
         frame_transition_logits[:, 1:] += 0.5 * transition_edge_logits
 
-        # Main V1.2 grounding logits: event selection + within-event evidence.
+        # Main V1.3 grounding logits: reasoned multi-event gates + frame evidence.
         event_temporal_logits = (
             event_frame_logits + frame_semantic_logits
         )
@@ -704,6 +990,25 @@ class QBoundCore(nn.Module):
             event_relevance_weights,
             event_visual_tokens,
         )
+
+        # Native Q-Bound reasoning representation. Backbone-specific adapters
+        # decide how this H-dimensional token is injected into a VQA model/LLM.
+        reasoned_event_repr = torch.einsum(
+            "bk,bkh->bh",
+            event_relevance_weights,
+            reasoned_event_tokens,
+        )
+
+        valid_event_count_float = event_valid_mask.sum(dim=-1).clamp_min(1).to(
+            event_relevance_gates.dtype
+        )
+        event_relevance_gate_mean = (
+            event_relevance_gates.sum(dim=-1) / valid_event_count_float
+        )
+        event_relevance_gate_sum = event_relevance_gates.sum(dim=-1)
+        event_relevance_active_count = (
+            (event_relevance_gates >= 0.5) & event_valid_mask
+        ).sum(dim=-1).to(event_relevance_gates.dtype)
 
         assignment_entropy_per_frame = -torch.sum(
             event_assignment
@@ -737,14 +1042,47 @@ class QBoundCore(nn.Module):
             dim=-1,
         )
 
+        event_relevance_effective_count = torch.exp(
+            event_relevance_entropy
+        )
+
         return {
             "boundary_mass": boundary_mass,
             "event_coordinate": event_coordinate,
             "hard_event_index": hard_event_index,
             "event_assignment": event_assignment,
             "event_tokens": event_tokens,
+            "reasoned_event_tokens": reasoned_event_tokens,
+            "reasoned_event_repr": reasoned_event_repr,
             "event_visual_tokens": event_visual_tokens,
             "evidence_visual_token": evidence_visual_token,
+            "ordered_relation_logits": ordered_reasoning[
+                "ordered_relation_logits"
+            ],
+            "ordered_relation_gates": ordered_reasoning[
+                "ordered_relation_gates"
+            ],
+            "ordered_relation_valid_mask": ordered_reasoning[
+                "ordered_relation_valid_mask"
+            ],
+            "ordered_relation_context": ordered_reasoning[
+                "ordered_relation_context"
+            ],
+            "ordered_update_gate": ordered_reasoning[
+                "ordered_update_gate"
+            ],
+            "ordered_relation_gate_mean": ordered_reasoning[
+                "ordered_relation_gate_mean"
+            ],
+            "ordered_update_gate_mean": ordered_reasoning[
+                "ordered_update_gate_mean"
+            ],
+            "ordered_relation_past_mass": ordered_reasoning[
+                "ordered_relation_past_mass"
+            ],
+            "ordered_relation_future_mass": ordered_reasoning[
+                "ordered_relation_future_mass"
+            ],
             "transition_tokens": transition_tokens,
             "ordered_tokens": ordered_tokens,
             "event_mass": event_mass,
@@ -763,7 +1101,15 @@ class QBoundCore(nn.Module):
             "token_weights": token_weights,
             "raw_event_token_logits": raw_event_token_logits,
             "raw_transition_token_logits": raw_transition_token_logits,
+            "event_relevance_logits": event_relevance_logits,
+            "event_relevance_gates": event_relevance_gates,
             "event_relevance_weights": event_relevance_weights,
+            "event_relevance_gate_mean": event_relevance_gate_mean,
+            "event_relevance_gate_sum": event_relevance_gate_sum,
+            "event_relevance_active_count": event_relevance_active_count,
+            "event_relevance_effective_count": (
+                event_relevance_effective_count
+            ),
             "transition_relevance_weights": transition_relevance_weights,
             "frame_event_gate": frame_event_gate,
             "frame_semantic_logits": frame_semantic_logits,
@@ -772,8 +1118,8 @@ class QBoundCore(nn.Module):
             "event_temporal_logits": event_temporal_logits,
             "frame_event_relevance": frame_event_relevance,
             "assignment_entropy": assignment_entropy,
-            # Compatibility: in V1.2 this is the actual number of non-empty
-            # events, not exp(entropy) of a soft fixed-bin mass distribution.
+            # Compatibility: this remains the actual number of non-empty
+            # dynamic events, not a fixed-bin entropy proxy.
             "effective_event_count": event_count,
             "soft_effective_event_count": soft_effective_event_count,
             "token_entropy": token_entropy,
@@ -836,7 +1182,7 @@ class QBoundCore(nn.Module):
                 f"Expected input_dim={self.input_dim}, got {feature_dim}."
             )
         if time_steps < 2:
-            raise ValueError("Version 1.2 requires at least 2 timesteps.")
+            raise ValueError("Version 1.3 requires at least 2 timesteps.")
 
         video_mask = self._normalize_mask(
             video_mask,
@@ -1052,8 +1398,31 @@ class QBoundCore(nn.Module):
             "hard_event_index": original["hard_event_index"],
             "event_assignment": original["event_assignment"],
             "event_tokens": original["event_tokens"],
+            "reasoned_event_tokens": original["reasoned_event_tokens"],
+            "reasoned_event_repr": original["reasoned_event_repr"],
             "event_visual_tokens": original["event_visual_tokens"],
             "evidence_visual_token": original["evidence_visual_token"],
+            "ordered_relation_logits": original["ordered_relation_logits"],
+            "ordered_relation_gates": original["ordered_relation_gates"],
+            "ordered_relation_valid_mask": original[
+                "ordered_relation_valid_mask"
+            ],
+            "ordered_relation_context": original[
+                "ordered_relation_context"
+            ],
+            "ordered_update_gate": original["ordered_update_gate"],
+            "ordered_relation_gate_mean": original[
+                "ordered_relation_gate_mean"
+            ],
+            "ordered_update_gate_mean": original[
+                "ordered_update_gate_mean"
+            ],
+            "ordered_relation_past_mass": original[
+                "ordered_relation_past_mass"
+            ],
+            "ordered_relation_future_mass": original[
+                "ordered_relation_future_mass"
+            ],
             "transition_tokens": original["transition_tokens"],
             "ordered_tokens": original["ordered_tokens"],
             "event_mass": original["event_mass"],
@@ -1082,8 +1451,22 @@ class QBoundCore(nn.Module):
             "event_token_scores": original["event_token_scores"],
             "transition_token_scores": original["transition_token_scores"],
 
-            # V1.2 evidence decomposition.
+            # V1.3 ordered reasoning + multi-event evidence decomposition.
+            "event_relevance_logits": original["event_relevance_logits"],
+            "event_relevance_gates": original["event_relevance_gates"],
             "event_relevance_weights": original["event_relevance_weights"],
+            "event_relevance_gate_mean": original[
+                "event_relevance_gate_mean"
+            ],
+            "event_relevance_gate_sum": original[
+                "event_relevance_gate_sum"
+            ],
+            "event_relevance_active_count": original[
+                "event_relevance_active_count"
+            ],
+            "event_relevance_effective_count": original[
+                "event_relevance_effective_count"
+            ],
             "transition_relevance_weights": original[
                 "transition_relevance_weights"
             ],
