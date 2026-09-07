@@ -47,10 +47,11 @@ class BasePipeline(object):
         #
         # Build the repository's original optimizer first so that all
         # existing optimizer options remain unchanged. Then move the
-        # Q-Bound V1.1 parameters to their own parameter group.
+        # Q-Bound parameters to their own parameter group.
         self.optimizer = build_optimizer(cfgs, self.model)
         self._configure_qbound_optimizer_groups()
         self._check_qbound_optimizer()
+        self._check_qbound_v17_components()
         self._check_optimizer_coverage()
 
         # Build the scheduler only after the parameter groups are final.
@@ -107,9 +108,11 @@ class BasePipeline(object):
     @staticmethod
     def _is_qbound_parameter_name(name):
         """
-        Q-Bound V1.4 parameters live under:
+        Q-Bound V1.7 trainable parameters live under:
             decoder.qbound.*
-            decoder.qbound.*
+
+        DataParallel may prefix names with ``module.``; substring matching is
+        therefore intentional.
 
         DataParallel may prefix names with ``module.``; substring matching is
         therefore intentional.
@@ -124,7 +127,9 @@ class BasePipeline(object):
         Required only when Q-Bound is enabled:
             optim.qbound_lr
 
-        The grounding module remains a CRA/base parameter.  Only QBoundCore parameters use the Q-Bound learning rate in V1.4.
+        The grounding module and shared CRA projection remain base-model
+        parameters. Only QBoundCore trainable parameters use the dedicated
+        Q-Bound learning rate in V1.7.
         """
         if not self._qbound_enabled():
             return
@@ -157,7 +162,7 @@ class BasePipeline(object):
         if not named_qbound_parameters:
             raise RuntimeError(
                 "Q-Bound is enabled, but no trainable parameter whose "
-                "name contains 'qbound' was found. Check that the V1.1 "
+                "name contains 'qbound' was found. Check that the V1.7 "
                 "refine decoder is instantiated."
             )
 
@@ -236,7 +241,7 @@ class BasePipeline(object):
             qbound_group
         )
 
-        # The last group must be the dedicated V1.4 Q-Bound group.
+        # The last group must be the dedicated Q-Bound group.
         if self.optimizer.param_groups[-1].get("name") != "qbound":
             raise RuntimeError(
                 "Failed to create the dedicated Q-Bound optimizer group."
@@ -441,9 +446,9 @@ class BasePipeline(object):
             f"{actual_qbound_lr}"
         )
 
-        # V1.4 debug summary: all trainable Q-Bound tensors should live under
-        # decoder.qbound.*.  This catches accidental parameters added outside
-        # the dedicated core while keeping substring matching DataParallel-safe.
+        # V1.7 debug summary: all trainable Q-Bound tensors should live under
+        # decoder.qbound.*. This catches accidental trainable Q-Bound tensors
+        # added outside the dedicated core while remaining DataParallel-safe.
         prefix_counts = {}
         for name, parameter in self.model.named_parameters():
             if (
@@ -468,6 +473,147 @@ class BasePipeline(object):
         for prefix, count in sorted(prefix_counts.items()):
             print(f"  {prefix}: {count} tensors")
         print("")
+
+    def _check_qbound_v17_components(self):
+        """
+        V1.7 safety check for the trainable Q-Bound stages.
+
+        V1.7 introduces no new optimizer group beyond ``qbound``. However, the
+        method depends on both COMPOSE and STABLE REFINE being trainable, so fail
+        early if the expected trainable modules are absent or accidentally placed
+        outside the dedicated Q-Bound optimizer group.
+
+        This is intentionally a structural optimizer check only. The coarse answer
+        branch uses the shared CRA ``video_proj`` layer, which should remain in the
+        base optimizer group.
+        """
+        if not self._qbound_enabled():
+            return
+
+        model_cfg = self.cfgs.get("model", {})
+        qbound_cfg = model_cfg.get("qbound", {})
+        if not isinstance(qbound_cfg, dict):
+            qbound_cfg = {}
+
+        version = str(qbound_cfg.get("version", ""))
+        refinement_cfg = qbound_cfg.get("refinement", {})
+        if not isinstance(refinement_cfg, dict):
+            refinement_cfg = {}
+
+        # This base file can still be reused for older Q-Bound versions, but the
+        # stronger component contract is enforced for V1.7.
+        if version != "1.7":
+            return
+
+        required_component_tokens = {
+            "DECOMPOSE": ("boundary_classifier",),
+            "RELATE": ("ordered_relation_score",),
+            "GROUND": ("event_evidence_score",),
+            "COMPOSE": ("span_composer_score",),
+        }
+
+        if bool(refinement_cfg.get("enabled", True)):
+            required_component_tokens["STABLE_REFINE"] = (
+                "boundary_refine_encoder",
+                "boundary_start_score",
+                "boundary_end_score",
+            )
+
+        trainable_named_parameters = [
+            (name, parameter)
+            for name, parameter in self.model.named_parameters()
+            if parameter.requires_grad
+        ]
+
+        qbound_group = None
+        for group in self.optimizer.param_groups:
+            if group.get("name") == "qbound":
+                qbound_group = group
+                break
+
+        if qbound_group is None:
+            raise RuntimeError(
+                "Q-Bound V1.7 is enabled but optimizer group 'qbound' is missing."
+            )
+
+        qbound_group_ids = {
+            id(parameter)
+            for parameter in qbound_group["params"]
+        }
+
+        missing_components = []
+        misplaced_parameters = []
+        component_summary = {}
+
+        for component_name, tokens in required_component_tokens.items():
+            matched = [
+                (name, parameter)
+                for name, parameter in trainable_named_parameters
+                if any(token in name for token in tokens)
+            ]
+
+            if not matched:
+                missing_components.append(
+                    f"{component_name}: expected one of {tokens}"
+                )
+                continue
+
+            component_summary[component_name] = {
+                "tensors": len(matched),
+                "parameters": sum(
+                    parameter.numel()
+                    for _, parameter in matched
+                ),
+            }
+
+            for name, parameter in matched:
+                if id(parameter) not in qbound_group_ids:
+                    misplaced_parameters.append(name)
+
+        if missing_components:
+            raise RuntimeError(
+                "Q-Bound V1.7 expected trainable components are missing:\n"
+                + "\n".join(missing_components)
+            )
+
+        if misplaced_parameters:
+            raise RuntimeError(
+                "Q-Bound V1.7 trainable tensors found outside optimizer group "
+                "'qbound':\n"
+                + "\n".join(misplaced_parameters)
+            )
+
+        expected_qbound_lr = float(
+            self.cfgs["optim"]["qbound_lr"]
+        )
+        actual_qbound_lr = float(qbound_group["lr"])
+
+        if not math.isclose(
+            actual_qbound_lr,
+            expected_qbound_lr,
+            rel_tol=1e-9,
+            abs_tol=0.0,
+        ):
+            raise RuntimeError(
+                "Q-Bound V1.7 component group LR mismatch: "
+                f"expected {expected_qbound_lr}, got {actual_qbound_lr}."
+            )
+
+        print("[Q-Bound V1.7 Component Check]")
+        for component_name, summary in component_summary.items():
+            print(
+                f"  {component_name}: "
+                f"{summary['tensors']} tensors, "
+                f"{summary['parameters']:,} parameters"
+            )
+        print(
+            "  shared CRA video_proj remains in base optimizer group: YES"
+        )
+        print(
+            "  all V1.7 Q-Bound trainable components use qbound_lr: "
+            f"{actual_qbound_lr}\n"
+        )
+
 
     def _check_optimizer_coverage(self):
         """
