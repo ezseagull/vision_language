@@ -5,7 +5,7 @@ import numpy as np
 
 class Metric(object):
     """
-    Original CRA / NExT-GQA grounding metrics + Q-Bound Ver1.2 diagnostics.
+    Original CRA / NExT-GQA grounding metrics + Q-Bound Ver1.4 diagnostics.
 
     Benchmark metrics are intentionally preserved:
         Acc&GQA
@@ -15,7 +15,7 @@ class Metric(object):
         mIoU
         TIoU@0.3 / TIoU@0.5
 
-    Ver1.2 additionally exposes temporal-key diagnostics through
+    Q-Bound additionally exposes temporal-key diagnostics through
     ``temporal_key_metrics()``:
         Key-GT-Mass
         Key-Peak-in-GT
@@ -23,6 +23,10 @@ class Metric(object):
         Key-Peak-Center-Error
         Key-Entropy-Ratio
         Key-Peak-Ratio
+
+    V1.4 decomposition/reasoning health statistics (partition energy, event
+    count/mass, split gain, Q-OEI gates, multi-event evidence, etc.) are logged
+    by CRAPipeline and intentionally do NOT alter these benchmark definitions.
     """
 
     def __init__(self, cfgs) -> None:
@@ -176,7 +180,7 @@ class Metric(object):
         return IoU, IoP
 
     # ------------------------------------------------------------------
-    # Q-Bound Ver1.2 temporal-key diagnostics
+    # Q-Bound Ver1.4 temporal-key diagnostics
     # ------------------------------------------------------------------
     @staticmethod
     def _normalize_key(key, eps=1e-12):

@@ -33,7 +33,23 @@ model:
   n_negs: 1
   prop_num: 1
 
-  # Keep original CRA grounding settings unchanged for fair comparison.
+  # ------------------------------------------------------------
+  # Original CRA settings are kept unchanged for controlled
+  # comparison with CRA / Q-Bound V1.4.
+  #
+  # IMPORTANT V1.5:
+  #   window_sizes remains [1,3,5] ONLY for:
+  #     (1) the original CRA grounding path, and
+  #     (2) detached legacy fixed-window diagnostics.
+  #
+  #   The MAIN Q-Bound V1.5 pre-hoc span no longer uses this
+  #   fixed-window search. It comes from the adaptive event-span
+  #   composer.
+  #
+  # causal_feature_path + do:true still belong to the downstream
+  # CRA testbed. They are not inputs to Q-Bound decomposition,
+  # Q-OEI, or span composition.
+  # ------------------------------------------------------------
   sigma: 3.0
   gamma: 1
   lamb: 0.15
@@ -44,85 +60,141 @@ model:
   vg_loss: 1
   vote: 0
 
-  # ------------------------------------------------------------
-  # Q-Bound V1.3
-  # Dynamic topology + weak alignment + ordered event reasoning
-  # ------------------------------------------------------------
+  # ============================================================
+  # Q-Bound V1.5
+  #
+  #   DECOMPOSE -> RELATE -> COMPOSE -> GROUND
+  #
+  # V1.5 deliberately keeps the healthy V1.4 decomposition and
+  # Q-OEI mechanisms, and replaces the legacy single-short-span
+  # grounding bottleneck with a latent contiguous event-span
+  # composer.
+  # ============================================================
   qbound:
     enabled: true
-    version: "1.3"
+    version: "1.5"
 
     # ----------------------------------------------------------
-    # Core size / generic interface
+    # Generic Q-Bound interface / capacity
     # ----------------------------------------------------------
     hidden_dim: 256
 
-    # Maximum event slots only; event count remains dynamically selected.
+    # Computational upper bound only.
+    # Actual event count is still selected dynamically:
+    #     1 <= M <= max_events
     max_events: 4
 
-    # Event discovery/reasoning is conditioned on question-only semantics.
+    # Decomposition, Q-OEI, and COMPOSE use question-only
+    # semantics. Candidate-answer semantics must not define
+    # temporal topology or latent support.
     require_question_only: true
 
-    # CRA temporal grounding is not consumed by Q-Bound topology.
+    # CRA temporal key/prior is not consumed by the Q-Bound core.
     use_temporal_prior: false
 
-    # Controlled comparison with V1.2:
-    # keep CRA/video backbone detached from the Q-Bound branch.
+    # Keep the same controlled setting as V1.4.
+    # Q-Bound learns its own parameters without sending gradients
+    # through its raw video/question input path into the upstream
+    # backbone encoders.
     detach_backbone_inputs: true
 
     dropout: 0.3
 
     # ----------------------------------------------------------
-    # Dynamic boundary discovery
-    # KEEP IDENTICAL TO THE SUCCESSFUL V1.2 RUN.
+    # Question-conditioned temporal geometry
     # ----------------------------------------------------------
+    question_modulation_scale: 0.10
+
+    # ----------------------------------------------------------
+    # DECOMPOSE: dynamic boundary proposals
+    # ----------------------------------------------------------
+    # Keep V1.4 values unchanged in the first V1.5 run so any
+    # improvement can be attributed primarily to COMPOSE.
     boundary_temperature: 0.7
-    assignment_temperature: 0.5
     boundary_threshold: 0.5
     boundary_radius: 2
     boundary_bias_init: -0.5
+    proposal_candidates: 6
     min_event_mass: 0.25
 
     # ----------------------------------------------------------
-    # V1.3 ordered multi-event reasoning
+    # DECOMPOSE: latent partition objective
     # ----------------------------------------------------------
-    # Q-OEI itself is intentionally lightweight and configured in core.py.
-    # This fixed adapter residual scale controls only how strongly the
-    # reasoned event representation enters the CRA answer space.
-    #
-    # It is NOT learnable, preventing an easy alpha -> 0 bypass.
-    # The effective training contribution is also multiplied by qbound_mix,
-    # and the adapter starts with small weights, so scale=1.0 is conservative.
-    reasoning_residual_scale: 1.0
+    decomposition:
+      enabled: true
+
+      # Outer objective:
+      # total_loss += loss_weight * L_decomp
+      loss_weight: 0.10
+
+      # Internal partition-energy terms.
+      # Deliberately unchanged from V1.4.
+      complexity_weight: 1.25
+      boundary_weight: 0.50
+      temperature: 0.20
 
     # ----------------------------------------------------------
-    # Weak event alignment inherited from V1.2
+    # RELATE: Question-Conditioned Ordered Event Interaction
     # ----------------------------------------------------------
-    # Keep unchanged: V1.2 showed that this objective learns successfully.
+    reasoning:
+      enabled: true
+      type: ordered_event_interaction
+
+    # ----------------------------------------------------------
+    # COMPOSE: Latent Contiguous Event-Span Composer
+    # ----------------------------------------------------------
+    # For M valid ordered events, the composer considers every
+    # contiguous event chain:
+    #   [E1], [E2], ..., [E1,E2], [E2,E3], ...
+    #
+    # With max_events=4 there are at most 10 candidate chains,
+    # so this remains lightweight.
+    #
+    # Training uses the soft span posterior to build the temporal
+    # support. The hard top-1 event chain is used for adaptive
+    # start/end diagnostics/evaluation and future LLM token export.
+    composer:
+      enabled: true
+      type: latent_contiguous_event_span
+
+      # Initial softmax temperature for the span posterior.
+      # This is the only new V1.5 hyperparameter in the first run.
+      temperature: 0.35
+
+    # ----------------------------------------------------------
+    # Weak semantic alignment inherited from V1.2/V1.4
+    # ----------------------------------------------------------
     weak_align_weight: 0.10
     weak_align_temperature: 0.07
 
-    # Keep disabled. V1.2 already achieved dynamic event-count distributions;
-    # adding sparsity now could push the topology toward one-event collapse.
-    boundary_sparse_weight: 0.0
-
     # ----------------------------------------------------------
-    # Deterministic CRA -> Q-Bound temporal handover
+    # Deliberately NOT introduced in first V1.5 run
     # ----------------------------------------------------------
-    # Keep identical to V1.2 for a controlled comparison.
-    # Training: 0.2 -> 1.0 over 5 epochs.
-    # Validation/test: pipeline forces qbound_mix = 1.0.
-    handover_start: 0.2
-    handover_epochs: 5
+    # No:
+    #   composer/span supervision from temporal GT
+    #   composer entropy loss
+    #   composer length loss
+    #   composer sparsity/diversity/balance loss
+    #   CRA -> Q-Bound handover
+    #   direct reasoned-event -> answer residual
+    #   boundary-sparsity loss
+    #   event-balance/diversity loss
+    #   CRA consistency loss
+    #
+    # Goal of the first V1.5 run:
+    # isolate whether adaptive event-span composition fixes the
+    # V1.4 grounding-readout bottleneck.
 
 optim:
   pipeline: cra
   optimizer: Adam
 
   # Original CRA objectives remain unchanged.
-  # Weak Q-Bound alignment is added separately in CRAPipeline.
-  # V1.3 ordered reasoning gets NO extra auxiliary loss:
-  # it must prove useful through the main VQA/alignment path.
+  # CRAPipeline V1.5 still adds only:
+  #   + weak_align_weight * L_align
+  #   + decomposition.loss_weight * L_decomp
+  #
+  # There is NO separate composer loss in the first V1.5 run.
   loss:
     ce:
       vq: 1
@@ -135,11 +207,11 @@ optim:
   weight_decay: 0
   amsgrad: true
 
-  # Includes all parameters whose names contain "qbound", including:
-  # qbound core, Q-OEI modules, and qbound_reasoning_adapter.
+  # All decoder.qbound.* parameters, including the new composer,
+  # are expected to use this Q-Bound optimizer group.
   qbound_lr: 5.e-5
 
-  # Exploratory diagnostic budget kept equal to V1.2.
+  # Keep the same exploratory budget for a controlled comparison.
   epochs: 15
   save_period: 1
 
@@ -156,13 +228,13 @@ stat:
 
   record_dir: ./output
 
-  # Start V1.3 from scratch for a clean architectural comparison.
-  # Do not resume the V1.2 checkpoint because Q-OEI and the reasoning adapter
-  # introduce new parameters and alter the answer representation.
+  # First controlled V1.5 run starts without resuming V1.4.
+  # This avoids partial-checkpoint ambiguity from the new composer
+  # parameters. A later warm-start ablation can be done separately.
   resume: null
 
 misc:
-  running_name: CRA/NextGQA/QBound_v1.3_seed2024
-  info: "CRA + Q-Bound V1.3 | dynamic events + weak alignment + ordered multi-event reasoning"
+  running_name: CRA/NextGQA/QBound_v1.5_seed2024
+  info: "CRA testbed + Q-Bound V1.5 | dynamic latent decomposition + ordered event reasoning + latent contiguous event-span composition + adaptive grounding"
   cuda: "0"
   seed: 2024

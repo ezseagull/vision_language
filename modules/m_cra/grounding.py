@@ -12,7 +12,7 @@ class AdaptiveGaussianFilter(nn.Module):
         -> Gaussian Conv1d
         -> temporal softmax
 
-    Q-Bound V1.2 path:
+    Q-Bound V1.6 probability path:
         input temporal probability
         -> mask-aware Gaussian normalized convolution
         -> sum normalization
@@ -135,7 +135,7 @@ class AdaptiveGaussianFilter(nn.Module):
         eps=1e-6,
     ):
         """
-        Probability-preserving Gaussian smoothing for Q-Bound V1.2.
+        Probability-preserving Gaussian smoothing for Q-Bound V1.6.
 
         Args:
             weights:
@@ -146,7 +146,7 @@ class AdaptiveGaussianFilter(nn.Module):
                 Used only when ``sigma_override`` is None. If True, gradients
                 do not update this filter's learnable sigma.
             sigma_override:
-                Optional fixed scalar/tensor sigma. Ver1.2 uses this for the
+                Optional fixed scalar/tensor sigma. Ver1.6 uses this for the
                 Q-Bound branch so its smoothing width is not inherited from
                 CRA's learnable Gaussian parameter.
             eps:
@@ -313,77 +313,56 @@ class AdaptiveGaussianFilter(nn.Module):
 
 class GroundingModule(nn.Module):
     """
-    CRA grounding plus a separate Q-Bound V1.2 probability path.
+    CRA grounding plus Q-Bound V1.6 coarse-to-fine grounding.
 
-    CRA behavior is preserved exactly:
+    CRA path is preserved exactly:
         raw CRA score
         -> softmax = ori_key
         -> Gaussian Conv1d
         -> second softmax = cra_key
+        -> legacy fixed-window interval extraction
 
-    Q-Bound V1.2 does NOT use CRA temporal-logit fusion. Its main temporal
-    distribution comes directly from QBoundCore.event_temporal_prob:
-
-        Q-Bound temporal probability
-        -> mask-aware Gaussian normalized convolution
-        -> sum normalization
+    Q-Bound V1.6 main path:
+        QBoundCore.refined_temporal_prob
+        -> probability-preserving Gaussian smoothing
         -> qbound_key
+        -> refined frame-level start/end supplied by QBoundCore
 
-    CRA and Q-Bound keys are mixed later in refine.py during the deterministic
-    handover schedule. This module does not contain alpha, beta, a learnable
-    CRA/Q-Bound gate, or a handover parameter.
+    V1.6 keeps the V1.5 coarse event-chain span as a diagnostic, but the main
+    pre-hoc interval is the frame-refined span. The legacy CRA [1,3,5] fixed
+    window is also retained only as a controlled diagnostic.
 
-    The old Version 1.1 ``finalize_grounding(..., temporal_bias=...)`` API is
-    intentionally kept for checkpoint/code compatibility, but Ver1.1.3 must
-    not use that method for its Q-Bound main path.
+    This yields three readouts on the same V1.6 temporal key:
+        1) refined V1.6 interval        -- MAIN
+        2) coarse V1.5 event span      -- diagnostic
+        3) CRA fixed short window      -- diagnostic
 
-    Legacy Version 1.1 principle
-    ---------------------
-    Q-Bound must affect temporal evidence BEFORE `key`, `start`, and `end`
-    are produced.
-
-    To preserve the CRA baseline at beta=0, the original CRA frame
-    distribution is first computed exactly as before:
-
-        raw score
-        -> softmax over time = ori_key
-
-    We then use log(ori_key) as a numerically stable temporal-logit
-    representation:
-
-        cra_temporal_logits = log(ori_key)
-
-    The CRA adapter may provide:
-
-        temporal_bias = beta * qbound_event_temporal_logits
-
-    and this module computes:
-
-        fused_temporal_logits =
-            cra_temporal_logits + temporal_bias
-
-        pre_smooth_key =
-            softmax(fused_temporal_logits)
-
-        final key =
-            GaussianFilter(pre_smooth_key)
-
-    Therefore:
-        temporal_bias == 0
-        => pre_smooth_key == ori_key
-        => the old CRA grounding path is preserved.
+    The Q-Bound probability path still:
+        * applies no CRA temporal-logit fusion;
+        * uses no CRA->Q-Bound handover;
+        * applies no second temporal softmax after QBoundCore;
+        * uses a fixed/detached Q-Bound Gaussian width.
 
     Public API
     ----------
     compute_base_temporal(v, qa, valid_mask=None)
-        Compute CRA temporal evidence once. This is useful because Q-Bound
-        may optionally consume the detached CRA key as a prior.
+        Original CRA temporal evidence.
 
-    finalize_grounding(base_temporal, temporal_bias=None, ...)
-        Add Q-Bound evidence and only then produce key/start/end.
+    finalize_probability_grounding(...)
+        Legacy V1.4 Q-Bound readout.  Kept for controlled ablations.
+
+    finalize_composed_grounding(...)
+        Legacy V1.5 adaptive event-chain readout, retained for ablation.
+
+    finalize_refined_grounding(...)
+        V1.6 main readout. Uses the refined Q-Bound probability for grounded
+        pooling and the frame-level refined interval for pre-hoc grounding.
+
+    finalize_grounding(...)
+        Legacy V1.1 CRA/Q-Bound temporal-logit fusion, compatibility only.
 
     forward(...)
-        Backward-compatible convenience wrapper.
+        Backward-compatible CRA convenience wrapper.
     """
 
     def __init__(
@@ -424,7 +403,7 @@ class GroundingModule(nn.Module):
             initial_sigma=float(initial_sigma),
         )
 
-        # Ver1.2 decouples Q-Bound smoothing from CRA's learnable sigma.
+        # V1.6 keeps Q-Bound smoothing decoupled from CRA's learnable sigma.
         # The value defaults to the same initial width for backward-compatible
         # behavior, but it is a non-persistent buffer rather than a parameter.
         qbound_sigma_value = (
@@ -678,6 +657,628 @@ class GroundingModule(nn.Module):
             fallback,
         )
 
+
+    def gen_adaptive_grounding(
+        self,
+        keyframe_prob,
+        selected_span_start_frame,
+        selected_span_end_frame,
+        valid_mask=None,
+        selected_frame_mask=None,
+    ):
+        """
+        Convert explicit Q-Bound frame indices into a contiguous interval.
+
+        Unlike ``gen_grounding()``, this helper performs NO fixed-window
+        search. It is shared by the V1.5 coarse Composer diagnostic and the
+        V1.6 frame-refined main readout.
+
+        Args
+        ----
+        keyframe_prob:
+            [B,T] temporal probability used for downstream grounded pooling.
+        selected_span_start_frame / selected_span_end_frame:
+            [B] integer frame indices from QBoundCore.
+        valid_mask:
+            optional [B,T].
+        selected_frame_mask:
+            optional detached [B,T] mask from QBoundCore.  It is retained as a
+            diagnostic consistency signal; the returned main mask is rebuilt
+            from start/end so it is guaranteed contiguous.
+
+        Returns
+        -------
+        Dict with the same main contract as ``gen_grounding()``:
+            key, max_indices, start, end, mask
+        plus adaptive-span diagnostics.
+        """
+        if keyframe_prob.ndim != 2:
+            raise ValueError(
+                "keyframe_prob must have shape [B,T], got "
+                f"{tuple(keyframe_prob.shape)}."
+            )
+
+        batch_size, time_steps = keyframe_prob.shape
+        device = keyframe_prob.device
+
+        valid_mask = self._normalize_valid_mask(
+            valid_mask,
+            batch_size,
+            time_steps,
+            device,
+        )
+
+        def _prepare_index(index, name):
+            if not torch.is_tensor(index):
+                index = torch.as_tensor(index, device=device)
+            index = index.to(device=device).reshape(-1).long().detach()
+            if index.numel() != batch_size:
+                raise ValueError(
+                    f"{name} must contain one index per sample. "
+                    f"Expected {batch_size}, got {index.numel()}."
+                )
+            return index
+
+        start_index = _prepare_index(
+            selected_span_start_frame,
+            "selected_span_start_frame",
+        )
+        end_index = _prepare_index(
+            selected_span_end_frame,
+            "selected_span_end_frame",
+        )
+
+        frame_index = torch.arange(
+            time_steps,
+            device=device,
+            dtype=torch.long,
+        ).view(1, time_steps).expand(batch_size, -1)
+
+        # Last valid temporal index per sample.  This equals valid_length-1
+        # for the contiguous-prefix masks used by NExT-GQA, but also avoids
+        # assuming every sample uses all T slots.
+        last_valid_index = torch.where(
+            valid_mask,
+            frame_index,
+            torch.full_like(frame_index, -1),
+        ).max(dim=-1).values.clamp_min(0)
+
+        start_index = start_index.clamp(min=0, max=max(time_steps - 1, 0))
+        end_index = end_index.clamp(min=0, max=max(time_steps - 1, 0))
+        start_index = torch.minimum(start_index, last_valid_index)
+        end_index = torch.minimum(end_index, last_valid_index)
+
+        invalid_order = end_index < start_index
+        if invalid_order.any():
+            # Defensive fallback to the single selected start frame.  A valid
+            # contiguous event chain from QBoundCore should never trigger this.
+            end_index = torch.where(
+                invalid_order,
+                start_index,
+                end_index,
+            )
+
+        main_mask = (
+            (frame_index >= start_index.unsqueeze(1))
+            & (frame_index <= end_index.unsqueeze(1))
+            & valid_mask
+        )
+
+        if selected_frame_mask is None:
+            composer_mask = main_mask
+            composer_mask_consistency = torch.ones(
+                batch_size,
+                dtype=keyframe_prob.dtype,
+                device=device,
+            )
+        else:
+            if not torch.is_tensor(selected_frame_mask):
+                selected_frame_mask = torch.as_tensor(
+                    selected_frame_mask,
+                    device=device,
+                )
+            if selected_frame_mask.shape != (batch_size, time_steps):
+                raise ValueError(
+                    "selected_frame_mask must be [B,T], got "
+                    f"{tuple(selected_frame_mask.shape)}."
+                )
+            composer_mask = selected_frame_mask.to(device=device).bool().detach()
+            composer_mask = composer_mask & valid_mask
+            composer_mask_consistency = (
+                composer_mask == main_mask
+            ).all(dim=-1).to(keyframe_prob.dtype)
+
+        max_indices = torch.stack(
+            [start_index, end_index],
+            dim=-1,
+        )
+
+        # Normalize by the last valid feature index so padded suffixes do not
+        # compress the predicted interval.  For the current NExT-GQA setup,
+        # every sample has 32 valid temporal tokens, so this is identical to
+        # the legacy T-1 normalization.
+        denominator = last_valid_index.to(keyframe_prob.dtype).clamp_min(1.0)
+        start_time = (
+            start_index.to(keyframe_prob.dtype) / denominator
+        ).clamp(0.0, 1.0)
+        end_time = (
+            end_index.to(keyframe_prob.dtype) / denominator
+        ).clamp(0.0, 1.0)
+
+        span_length = main_mask.sum(dim=-1).to(keyframe_prob.dtype)
+        valid_length = valid_mask.sum(dim=-1).to(keyframe_prob.dtype).clamp_min(1.0)
+        span_fraction = span_length / valid_length
+
+        span_key_mass = (
+            keyframe_prob * main_mask.to(keyframe_prob.dtype)
+        ).sum(dim=-1)
+
+        peak_index = keyframe_prob.argmax(dim=-1)
+        peak_in_span = (
+            (peak_index >= start_index)
+            & (peak_index <= end_index)
+        ).to(keyframe_prob.dtype)
+
+        return {
+            "key": keyframe_prob,
+            "max_indices": max_indices,
+            "start": start_time,
+            "end": end_time,
+            "mask": main_mask,
+
+            "adaptive_span_used": torch.ones(
+                (),
+                dtype=keyframe_prob.dtype,
+                device=device,
+            ),
+            "adaptive_span_start_frame": start_index,
+            "adaptive_span_end_frame": end_index,
+            "adaptive_span_length": span_length,
+            "adaptive_span_fraction": span_fraction,
+            "adaptive_span_key_mass": span_key_mass,
+            "adaptive_span_peak_in_span": peak_in_span,
+            "adaptive_span_composer_mask": composer_mask,
+            "adaptive_span_mask_consistency": composer_mask_consistency,
+            "valid_mask": valid_mask,
+        }
+
+    def finalize_composed_grounding(
+        self,
+        temporal_probability,
+        selected_span_start_frame,
+        selected_span_end_frame,
+        valid_mask=None,
+        selected_frame_mask=None,
+        window_sizes=None,
+        detach_sigma=True,
+        apply_smoothing=True,
+    ):
+        """
+        Legacy Q-Bound V1.5 coarse event-span grounding adapter.
+
+        Inputs
+        ------
+        temporal_probability:
+            QBoundCore["composed_temporal_prob"] / ["event_temporal_prob"],
+            shape [B,T].
+        selected_span_start_frame / selected_span_end_frame:
+            Detached hard latent event-span boundaries selected by the
+            QBoundCore composer.
+        selected_frame_mask:
+            Optional detached exact selected-chain mask from QBoundCore.
+
+        Main path
+        ---------
+            composed temporal probability
+                -> normalize under valid mask
+                -> optional probability-preserving Gaussian smoothing
+                -> qbound_key used for grounded video pooling
+
+            selected latent event chain
+                -> adaptive start/end/mask used for pre-hoc grounding
+
+        The legacy CRA fixed-window extractor is evaluated in parallel only as
+        a diagnostic and does NOT define the V1.5 main start/end.
+        """
+        if (
+            temporal_probability.ndim == 3
+            and temporal_probability.size(-1) == 1
+        ):
+            temporal_probability = temporal_probability.squeeze(-1)
+
+        if temporal_probability.ndim != 2:
+            raise ValueError(
+                "temporal_probability must be [B,T] or [B,T,1]. "
+                f"Got {tuple(temporal_probability.shape)}."
+            )
+
+        batch_size, time_steps = temporal_probability.shape
+
+        valid_mask = self._normalize_valid_mask(
+            valid_mask,
+            batch_size,
+            time_steps,
+            temporal_probability.device,
+        )
+
+        pre_smooth_key = self._normalize_probability(
+            temporal_probability,
+            valid_mask,
+        )
+
+        if apply_smoothing:
+            qbound_key = self.gs_filter.smooth_probability(
+                pre_smooth_key.unsqueeze(-1),
+                valid_mask=valid_mask,
+                detach_sigma=detach_sigma,
+                sigma_override=self.qbound_sigma,
+            ).squeeze(-1)
+        else:
+            qbound_key = pre_smooth_key
+
+        qbound_key = self._normalize_probability(
+            qbound_key,
+            valid_mask,
+        )
+
+        # --------------------------------------------------------------
+        # Legacy V1.5 coarse event-chain span, no [1,3,5] re-selection.
+        # --------------------------------------------------------------
+        time_param = self.gen_adaptive_grounding(
+            qbound_key,
+            selected_span_start_frame=selected_span_start_frame,
+            selected_span_end_frame=selected_span_end_frame,
+            valid_mask=valid_mask,
+            selected_frame_mask=selected_frame_mask,
+        )
+
+        # --------------------------------------------------------------
+        # Controlled V1.4/CRA-style readout diagnostic on the SAME key.
+        # --------------------------------------------------------------
+        legacy_time = self.gen_grounding(
+            qbound_key,
+            window_sizes=window_sizes,
+        )
+
+        time_param["pre_smooth_key"] = pre_smooth_key
+        time_param["post_smooth_key"] = qbound_key
+        time_param["qbound_key"] = qbound_key
+        time_param["qbound_smoothing_applied"] = torch.as_tensor(
+            float(apply_smoothing),
+            dtype=qbound_key.dtype,
+            device=qbound_key.device,
+        )
+        time_param["qbound_sigma"] = self.qbound_sigma.to(
+            device=qbound_key.device,
+            dtype=qbound_key.dtype,
+        )
+
+        time_param["legacy_fixed_window_key"] = legacy_time["key"]
+        time_param["legacy_fixed_window_max_indices"] = legacy_time[
+            "max_indices"
+        ]
+        time_param["legacy_fixed_window_start"] = legacy_time["start"]
+        time_param["legacy_fixed_window_end"] = legacy_time["end"]
+        time_param["legacy_fixed_window_mask"] = legacy_time["mask"]
+        time_param["legacy_fixed_window_span_length"] = (
+            legacy_time["mask"].sum(dim=-1).to(qbound_key.dtype)
+        )
+
+        adaptive_length = time_param["adaptive_span_length"].clamp_min(1.0)
+        legacy_length = time_param[
+            "legacy_fixed_window_span_length"
+        ].clamp_min(1.0)
+        time_param["adaptive_vs_legacy_span_length_ratio"] = (
+            adaptive_length / legacy_length
+        )
+
+        # Useful direct diagnostic for the bottleneck observed in V1.4:
+        # how much probability mass is captured by each interval extractor?
+        time_param["legacy_fixed_window_key_mass"] = (
+            qbound_key
+            * legacy_time["mask"].to(qbound_key.dtype)
+        ).sum(dim=-1)
+        time_param["adaptive_minus_legacy_key_mass"] = (
+            time_param["adaptive_span_key_mass"]
+            - time_param["legacy_fixed_window_key_mass"]
+        )
+
+        return time_param
+
+
+    def finalize_refined_grounding(
+        self,
+        temporal_probability,
+        refined_span_start_frame,
+        refined_span_end_frame,
+        valid_mask=None,
+        refined_frame_mask=None,
+        coarse_span_start_frame=None,
+        coarse_span_end_frame=None,
+        coarse_frame_mask=None,
+        window_sizes=None,
+        detach_sigma=True,
+        apply_smoothing=True,
+    ):
+        """
+        Main Q-Bound V1.6 coarse-to-fine grounding adapter.
+
+        Inputs
+        ------
+        temporal_probability:
+            QBoundCore["refined_temporal_prob"] / ["main_temporal_prob"],
+            shape [B,T].
+        refined_span_start_frame / refined_span_end_frame:
+            Detached frame-level boundaries returned by QBoundCore REFINE.
+        refined_frame_mask:
+            Optional detached [B,T] refined support mask.
+        coarse_span_start_frame / coarse_span_end_frame / coarse_frame_mask:
+            Optional V1.5 Composer span. These are diagnostic only.
+
+        Main path
+        ---------
+            refined temporal probability
+                -> normalize under valid mask
+                -> probability-preserving Gaussian smoothing
+                -> qbound_key used for grounded video pooling
+
+            refined frame boundaries
+                -> final V1.6 start/end/mask used for pre-hoc grounding
+
+        Controlled diagnostics on the SAME qbound_key
+        ---------------------------------------------
+            * coarse V1.5 event-chain interval
+            * legacy CRA [1,3,5] fixed-window interval
+
+        There is deliberately no extra temporal softmax in this adapter.
+        """
+        if (
+            temporal_probability.ndim == 3
+            and temporal_probability.size(-1) == 1
+        ):
+            temporal_probability = temporal_probability.squeeze(-1)
+
+        if temporal_probability.ndim != 2:
+            raise ValueError(
+                "temporal_probability must be [B,T] or [B,T,1]. "
+                f"Got {tuple(temporal_probability.shape)}."
+            )
+
+        batch_size, time_steps = temporal_probability.shape
+
+        valid_mask = self._normalize_valid_mask(
+            valid_mask,
+            batch_size,
+            time_steps,
+            temporal_probability.device,
+        )
+
+        pre_smooth_key = self._normalize_probability(
+            temporal_probability,
+            valid_mask,
+        )
+
+        if apply_smoothing:
+            qbound_key = self.gs_filter.smooth_probability(
+                pre_smooth_key.unsqueeze(-1),
+                valid_mask=valid_mask,
+                detach_sigma=detach_sigma,
+                sigma_override=self.qbound_sigma,
+            ).squeeze(-1)
+        else:
+            qbound_key = pre_smooth_key
+
+        qbound_key = self._normalize_probability(
+            qbound_key,
+            valid_mask,
+        )
+
+        # ----------------------------------------------------------
+        # V1.6 MAIN: refined frame-level interval.
+        # ----------------------------------------------------------
+        refined_time = self.gen_adaptive_grounding(
+            qbound_key,
+            selected_span_start_frame=refined_span_start_frame,
+            selected_span_end_frame=refined_span_end_frame,
+            valid_mask=valid_mask,
+            selected_frame_mask=refined_frame_mask,
+        )
+
+        # Preserve the generic GroundingModule contract.
+        time_param = dict(refined_time)
+
+        # Rename/add explicit V1.6 semantics without removing compatibility
+        # aliases such as adaptive_span_length.
+        time_param["refined_span_used"] = torch.ones(
+            (),
+            dtype=qbound_key.dtype,
+            device=qbound_key.device,
+        )
+        time_param["refined_span_start_frame"] = refined_time[
+            "adaptive_span_start_frame"
+        ]
+        time_param["refined_span_end_frame"] = refined_time[
+            "adaptive_span_end_frame"
+        ]
+        time_param["refined_span_length"] = refined_time[
+            "adaptive_span_length"
+        ]
+        time_param["refined_span_fraction"] = refined_time[
+            "adaptive_span_fraction"
+        ]
+        time_param["refined_span_key_mass"] = refined_time[
+            "adaptive_span_key_mass"
+        ]
+        time_param["refined_span_peak_in_span"] = refined_time[
+            "adaptive_span_peak_in_span"
+        ]
+        time_param["refined_span_core_mask"] = refined_time[
+            "adaptive_span_composer_mask"
+        ]
+        time_param["refined_span_mask_consistency"] = refined_time[
+            "adaptive_span_mask_consistency"
+        ]
+
+        # ----------------------------------------------------------
+        # V1.5 coarse Composer diagnostic on the SAME V1.6 key.
+        # ----------------------------------------------------------
+        coarse_available = (
+            coarse_span_start_frame is not None
+            and coarse_span_end_frame is not None
+        )
+
+        if coarse_available:
+            coarse_time = self.gen_adaptive_grounding(
+                qbound_key,
+                selected_span_start_frame=coarse_span_start_frame,
+                selected_span_end_frame=coarse_span_end_frame,
+                valid_mask=valid_mask,
+                selected_frame_mask=coarse_frame_mask,
+            )
+
+            time_param["coarse_v15_start"] = coarse_time["start"]
+            time_param["coarse_v15_end"] = coarse_time["end"]
+            time_param["coarse_v15_mask"] = coarse_time["mask"]
+            time_param["coarse_v15_max_indices"] = coarse_time[
+                "max_indices"
+            ]
+            time_param["coarse_v15_span_start_frame"] = coarse_time[
+                "adaptive_span_start_frame"
+            ]
+            time_param["coarse_v15_span_end_frame"] = coarse_time[
+                "adaptive_span_end_frame"
+            ]
+            time_param["coarse_v15_span_length"] = coarse_time[
+                "adaptive_span_length"
+            ]
+            time_param["coarse_v15_span_fraction"] = coarse_time[
+                "adaptive_span_fraction"
+            ]
+            time_param["coarse_v15_span_key_mass"] = coarse_time[
+                "adaptive_span_key_mass"
+            ]
+            time_param["coarse_v15_span_peak_in_span"] = coarse_time[
+                "adaptive_span_peak_in_span"
+            ]
+            time_param["coarse_v15_span_mask_consistency"] = coarse_time[
+                "adaptive_span_mask_consistency"
+            ]
+        else:
+            zeros = torch.zeros(
+                batch_size,
+                dtype=qbound_key.dtype,
+                device=qbound_key.device,
+            )
+            false_mask = torch.zeros(
+                batch_size,
+                time_steps,
+                dtype=torch.bool,
+                device=qbound_key.device,
+            )
+            time_param["coarse_v15_start"] = zeros
+            time_param["coarse_v15_end"] = zeros
+            time_param["coarse_v15_mask"] = false_mask
+            time_param["coarse_v15_max_indices"] = torch.zeros(
+                batch_size,
+                2,
+                dtype=torch.long,
+                device=qbound_key.device,
+            )
+            time_param["coarse_v15_span_start_frame"] = torch.zeros(
+                batch_size,
+                dtype=torch.long,
+                device=qbound_key.device,
+            )
+            time_param["coarse_v15_span_end_frame"] = torch.zeros(
+                batch_size,
+                dtype=torch.long,
+                device=qbound_key.device,
+            )
+            time_param["coarse_v15_span_length"] = zeros
+            time_param["coarse_v15_span_fraction"] = zeros
+            time_param["coarse_v15_span_key_mass"] = zeros
+            time_param["coarse_v15_span_peak_in_span"] = zeros
+            time_param["coarse_v15_span_mask_consistency"] = zeros
+
+        # ----------------------------------------------------------
+        # CRA/V1.4 fixed short-window diagnostic on the SAME V1.6 key.
+        # ----------------------------------------------------------
+        legacy_time = self.gen_grounding(
+            qbound_key,
+            window_sizes=window_sizes,
+        )
+
+        time_param["legacy_fixed_window_key"] = legacy_time["key"]
+        time_param["legacy_fixed_window_max_indices"] = legacy_time[
+            "max_indices"
+        ]
+        time_param["legacy_fixed_window_start"] = legacy_time["start"]
+        time_param["legacy_fixed_window_end"] = legacy_time["end"]
+        time_param["legacy_fixed_window_mask"] = legacy_time["mask"]
+        time_param["legacy_fixed_window_span_length"] = (
+            legacy_time["mask"].sum(dim=-1).to(qbound_key.dtype)
+        )
+        time_param["legacy_fixed_window_key_mass"] = (
+            qbound_key
+            * legacy_time["mask"].to(qbound_key.dtype)
+        ).sum(dim=-1)
+
+        # ----------------------------------------------------------
+        # Direct coarse-to-fine diagnostics.
+        # ----------------------------------------------------------
+        refined_length = time_param["refined_span_length"].clamp_min(1.0)
+        coarse_length = time_param[
+            "coarse_v15_span_length"
+        ].clamp_min(1.0)
+        legacy_length = time_param[
+            "legacy_fixed_window_span_length"
+        ].clamp_min(1.0)
+
+        time_param["refined_vs_coarse_span_length_ratio"] = (
+            refined_length / coarse_length
+        )
+        time_param["refined_vs_legacy_span_length_ratio"] = (
+            refined_length / legacy_length
+        )
+        time_param["coarse_vs_legacy_span_length_ratio"] = (
+            coarse_length / legacy_length
+        )
+
+        time_param["refined_minus_coarse_key_mass"] = (
+            time_param["refined_span_key_mass"]
+            - time_param["coarse_v15_span_key_mass"]
+        )
+        time_param["refined_minus_legacy_key_mass"] = (
+            time_param["refined_span_key_mass"]
+            - time_param["legacy_fixed_window_key_mass"]
+        )
+
+        # How much of the V1.5 coarse interval survived REFINE.
+        time_param["refined_retained_fraction_of_coarse"] = (
+            refined_length / coarse_length
+        )
+        time_param["refined_trimmed_frame_count"] = (
+            time_param["coarse_v15_span_length"]
+            - time_param["refined_span_length"]
+        ).clamp_min(0.0)
+
+        # Smoothing / key contract.
+        time_param["pre_smooth_key"] = pre_smooth_key
+        time_param["post_smooth_key"] = qbound_key
+        time_param["qbound_key"] = qbound_key
+        time_param["qbound_smoothing_applied"] = torch.as_tensor(
+            float(apply_smoothing),
+            dtype=qbound_key.dtype,
+            device=qbound_key.device,
+        )
+        time_param["qbound_sigma"] = self.qbound_sigma.to(
+            device=qbound_key.device,
+            dtype=qbound_key.dtype,
+        )
+        time_param["valid_mask"] = valid_mask
+
+        return time_param
+
     def finalize_probability_grounding(
         self,
         temporal_probability,
@@ -687,26 +1288,30 @@ class GroundingModule(nn.Module):
         apply_smoothing=True,
     ):
         """
-        Build Q-Bound V1.2 grounding directly from temporal probabilities.
+        Legacy Q-Bound V1.4 grounding directly from temporal probabilities.
 
         Expected main input:
             QBoundCore["event_temporal_prob"]      [B,T]
 
-        Counterfactual input:
-            QBoundCore["merge_event_temporal_prob"][:, 0]  [B,T]
+        Compatibility input:
+            QBoundCore["legacy_v14_event_temporal_prob"] or any [B,T] prob.
 
         Pipeline:
             probability
             -> normalize under valid mask
             -> Gaussian smooth_probability()
             -> sum-normalized qbound_key
-            -> the SAME CRA interval extraction (gen_grounding)
+            -> legacy CRA interval extraction (gen_grounding)
 
         There is deliberately:
             * no CRA temporal-logit addition,
             * no alpha/beta gate,
+            * no CRA->Q-Bound handover,
             * no second temporal softmax,
             * no Q-Bound gradient into CRA sigma when detach_sigma=True.
+
+        Therefore the only normalization after QBoundCore is sum
+        normalization before/after probability-preserving Gaussian smoothing.
         """
         if temporal_probability.ndim == 3 and temporal_probability.size(-1) == 1:
             temporal_probability = temporal_probability.squeeze(-1)
@@ -783,7 +1388,7 @@ class GroundingModule(nn.Module):
         LEGACY V1.1 temporal-logit fusion path.
 
         Kept unchanged for compatibility and CRA baseline reproduction.
-        Q-Bound V1.2 must use ``finalize_probability_grounding()`` instead.
+        Q-Bound V1.6 main path must use ``finalize_refined_grounding()`` instead.
 
         base_temporal:
             output of compute_base_temporal()
@@ -1080,8 +1685,8 @@ class GroundingModule(nn.Module):
                 valid_mask=video_mask,
             )
 
-        Q-Bound V1.2 does not use this convenience forward for its main
-        temporal path. It calls ``finalize_probability_grounding()`` directly.
+        Q-Bound V1.6 does not use this convenience forward for its main
+        temporal path. It calls ``finalize_refined_grounding()`` directly.
         """
         base_temporal = (
             self.compute_base_temporal(

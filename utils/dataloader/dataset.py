@@ -166,9 +166,20 @@ class VideoQADataset(Dataset):
         vid_frames = self.get_vid_feats(vid_id)
         vlen = self.max_feats
         
-        question_txt = cur_sample['question']
-            
-        # print(question_txt)
+        # --------------------------------------------------------------
+        # FIX 1: Keep all question representations synchronized.
+        # Augment first, then tokenize the FINAL question used by this
+        # sample. Preserve the original question so that an augmented
+        # paraphrase is not paired against its original form as a negative.
+        # --------------------------------------------------------------
+        original_question_txt = cur_sample['question']
+        question_txt = original_question_txt
+
+        if self.mode == 'train' and self.agu and vid_qid in self.qsn_agu:
+            agus = self.qsn_agu[vid_qid].get('gen', [])
+            if agus and random.random() < 0.3:
+                question_txt = random.choice(agus).rstrip('?')
+
         if self.mc >= 0:
             qsn_tk_id = torch.tensor(
                 self.tokenizer.encode(
@@ -182,23 +193,17 @@ class VideoQADataset(Dataset):
             )
             q_len = torch.tensor([len(qsn_tk_id)], dtype=torch.long)
         else:
-            qsn_tk_id  = torch.tensor([0], dtype=torch.long)
+            qsn_tk_id = torch.tensor([0], dtype=torch.long)
             q_len = torch.tensor([0], dtype=torch.long)
-        
+
         qtype, ans_token_ids, answer_len = 0, 0, 0
         # max_seg_num = self.amax_words
         # seg_feats = torch.zeros(self.mc, max_seg_num, 2048)
         # seg_num = torch.LongTensor(self.mc)
 
-        qsns_id , qsns_token_ids, qsns_seq_len = 0, 0, 0
-        qtype = 'null' if 'type' not in cur_sample  else cur_sample['type'] 
-        if self.mode == 'train' and self.agu:
-            if vid_qid in self.qsn_agu:
-                agus = self.qsn_agu[vid_qid]['gen']
-                #agus.append(question_txt)
-                question_txt = random.sample(agus, 1)[0].rstrip('?') if random.random()<0.3 else question_txt
-                #question_txt = question_txt.rstrip('?')
-                
+        qsns_id, qsns_token_ids, qsns_seq_len = 0, 0, 0
+        qtype = 'null' if 'type' not in cur_sample else cur_sample['type']
+
         if self.vg and self.mode not in ['val','test']:
             try:
                 qtype = get_qsn_type(question_txt, qtype)
@@ -210,20 +215,68 @@ class VideoQADataset(Dataset):
             else:
                 valid_qsncans = self.qsn_group[qtype]
             
+            # ----------------------------------------------------------
+            # FIX 2: Exclude the positive question correctly.
+            # `set(question_txt)` is a set of characters, not a set
+            # containing the full question. If augmentation is active,
+            # exclude both the original and the paraphrased positive.
+            # ----------------------------------------------------------
+            positive_questions = {original_question_txt, question_txt}
+
             if random.random() < 0.3:
                 same_v_qsn = set(self.v_questions[vid_id])
-                same_v_other_qsn = list(same_v_qsn - {question_txt})
+                same_v_other_qsn = list(same_v_qsn - positive_questions)
                 num_other = len(same_v_other_qsn)
-                if num_other >= self.mc-1:
-                    qchoices = random.sample(same_v_other_qsn, self.mc-1)
+
+                if num_other >= self.mc - 1:
+                    qchoices = random.sample(
+                        same_v_other_qsn,
+                        self.mc - 1
+                    )
                 else:
-                    cand_qsn = valid_qsncans - same_v_qsn
-                    if len(cand_qsn) < self.mc-1-num_other:
-                        cand_qsn = set(self.all_questions) - same_v_qsn
-                    qchoices = same_v_other_qsn + random.sample(list(cand_qsn), self.mc-1-num_other)
+                    needed = self.mc - 1 - num_other
+                    cand_qsn = (
+                        set(valid_qsncans)
+                        - same_v_qsn
+                        - positive_questions
+                    )
+
+                    if len(cand_qsn) < needed:
+                        cand_qsn = (
+                            set(self.all_questions)
+                            - same_v_qsn
+                            - positive_questions
+                        )
+
+                    if len(cand_qsn) < needed:
+                        raise RuntimeError(
+                            f"Not enough negative questions for {vid_qid}: "
+                            f"need {needed}, found {len(cand_qsn)}"
+                        )
+
+                    qchoices = same_v_other_qsn + random.sample(
+                        list(cand_qsn),
+                        needed
+                    )
             else:
-                cand_qsns = valid_qsncans - set(question_txt)
-                qchoices = random.sample(list(cand_qsns), self.mc-1)
+                cand_qsns = set(valid_qsncans) - positive_questions
+
+                if len(cand_qsns) < self.mc - 1:
+                    cand_qsns = (
+                        set(self.all_questions)
+                        - positive_questions
+                    )
+
+                if len(cand_qsns) < self.mc - 1:
+                    raise RuntimeError(
+                        f"Not enough negative questions for {vid_qid}: "
+                        f"need {self.mc - 1}, found {len(cand_qsns)}"
+                    )
+
+                qchoices = random.sample(
+                    list(cand_qsns),
+                    self.mc - 1
+                )
             """
             same_v_qsn = set(self.v_questions[vid_id])
             same_v_other_qsn = list(same_v_qsn - set(question_txt))
@@ -289,8 +342,9 @@ class VideoQADataset(Dataset):
                     truncation=True
                 )
                 
-            except:
-                print('Fail to tokenize: '+answer_txts)
+            except Exception as e:
+                print("Fail to tokenize:", answer_txts)
+                raise e
             qas_len = torch.tensor([len(ans) for ans in ans_token_ids], dtype=torch.long)
         else:
             answer_txts = cur_sample["answer"]

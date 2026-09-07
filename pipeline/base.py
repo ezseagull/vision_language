@@ -107,9 +107,9 @@ class BasePipeline(object):
     @staticmethod
     def _is_qbound_parameter_name(name):
         """
-        Q-Bound V1.1 parameters live under:
+        Q-Bound V1.4 parameters live under:
             decoder.qbound.*
-            decoder.qbound_adapter.*
+            decoder.qbound.*
 
         DataParallel may prefix names with ``module.``; substring matching is
         therefore intentional.
@@ -124,8 +124,7 @@ class BasePipeline(object):
         Required only when Q-Bound is enabled:
             optim.qbound_lr
 
-        The grounding module remains a CRA/base parameter.  Only QBoundCore and
-        CRAQBoundAdapter use the Q-Bound learning rate.
+        The grounding module remains a CRA/base parameter.  Only QBoundCore parameters use the Q-Bound learning rate in V1.4.
         """
         if not self._qbound_enabled():
             return
@@ -236,6 +235,12 @@ class BasePipeline(object):
         self.optimizer.add_param_group(
             qbound_group
         )
+
+        # The last group must be the dedicated V1.4 Q-Bound group.
+        if self.optimizer.param_groups[-1].get("name") != "qbound":
+            raise RuntimeError(
+                "Failed to create the dedicated Q-Bound optimizer group."
+            )
 
         total_qbound_params = sum(
             parameter.numel()
@@ -433,8 +438,36 @@ class BasePipeline(object):
         )
         print(
             "Verified Q-Bound learning rate: "
-            f"{actual_qbound_lr}\n"
+            f"{actual_qbound_lr}"
         )
+
+        # V1.4 debug summary: all trainable Q-Bound tensors should live under
+        # decoder.qbound.*.  This catches accidental parameters added outside
+        # the dedicated core while keeping substring matching DataParallel-safe.
+        prefix_counts = {}
+        for name, parameter in self.model.named_parameters():
+            if (
+                parameter.requires_grad
+                and self._is_qbound_parameter_name(name)
+            ):
+                normalized_name = (
+                    name[len("module."):]
+                    if name.startswith("module.")
+                    else name
+                )
+                if ".qbound." in normalized_name:
+                    prefix = normalized_name.split(".qbound.", 1)[0] + ".qbound"
+                else:
+                    prefix = normalized_name.rsplit(".", 1)[0]
+
+                prefix_counts[prefix] = (
+                    prefix_counts.get(prefix, 0) + 1
+                )
+
+        print("Q-Bound trainable tensor groups:")
+        for prefix, count in sorted(prefix_counts.items()):
+            print(f"  {prefix}: {count} tensors")
+        print("")
 
     def _check_optimizer_coverage(self):
         """
