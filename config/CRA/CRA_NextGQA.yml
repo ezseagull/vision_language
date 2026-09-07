@@ -35,21 +35,20 @@ model:
 
   # ------------------------------------------------------------
   # Original CRA settings are kept unchanged for controlled
-  # comparison with CRA / Q-Bound V1.4 / V1.5.
+  # comparison with CRA / Q-Bound V1.4 / V1.5 / V1.6.
   #
-  # IMPORTANT V1.6:
+  # IMPORTANT V1.7:
   #   window_sizes remains [1,3,5] ONLY for:
   #     (1) the original CRA grounding path, and
-  #     (2) detached legacy fixed-window diagnostics.
+  #     (2) controlled fixed-window diagnostics.
   #
-  #   The MAIN Q-Bound V1.6 pre-hoc span does NOT use this
-  #   fixed-window search and does NOT use the coarse Composer
-  #   event boundaries directly. It uses frame-level refined
-  #   start/end predicted inside the selected coarse event chain.
+  #   The MAIN Q-Bound V1.7 pre-hoc span does NOT use this
+  #   fixed-window search. It uses the frame-level refined
+  #   start/end predicted inside ONE detached top-1 coarse event chain.
   #
   # causal_feature_path + do:true still belong to the downstream
   # CRA testbed. They are not inputs to Q-Bound DECOMPOSE,
-  # RELATE, COMPOSE, or REFINE.
+  # RELATE, COMPOSE, or STABLE REFINE.
   # ------------------------------------------------------------
   sigma: 3.0
   gamma: 1
@@ -62,18 +61,24 @@ model:
   vote: 0
 
   # ============================================================
-  # Q-Bound V1.6
+  # Q-Bound V1.7
   #
-  #   DECOMPOSE -> RELATE -> COMPOSE -> REFINE -> GROUND
+  #   DECOMPOSE -> RELATE -> COMPOSE -> STABLE REFINE -> GROUND
   #
-  # V1.6 deliberately keeps the healthy V1.5 DECOMPOSE,
-  # Q-OEI, and Composer mechanisms unchanged. The only method
-  # change in the first controlled V1.6 run is frame-level
-  # boundary refinement inside the first/last selected events.
+  # V1.7 keeps the healthy V1.4/V1.5/V1.6 DECOMPOSE and Q-OEI
+  # mechanisms and keeps the V1.5 Composer scorer unchanged.
+  #
+  # Main method change:
+  #   * COMPOSE keeps a differentiable coarse answer branch;
+  #   * REFINE receives only the detached hard top-1 coarse chain;
+  #   * the all-span COMPOSE x REFINE marginalization from V1.6
+  #     is removed from the MAIN path;
+  #   * minimality is applied only when the refined answer remains
+  #     sufficient relative to the coarse answer.
   # ============================================================
   qbound:
     enabled: true
-    version: "1.6"
+    version: "1.7"
 
     # ----------------------------------------------------------
     # Generic Q-Bound interface / capacity
@@ -93,7 +98,7 @@ model:
     # CRA temporal key/prior is not consumed by Q-Bound.
     use_temporal_prior: false
 
-    # Keep the same controlled setting as V1.5.
+    # Keep the same controlled setting as previous versions.
     # Q-Bound learns its own parameters while its raw video and
     # question inputs are detached from the upstream backbone.
     detach_backbone_inputs: true
@@ -103,14 +108,13 @@ model:
     # ----------------------------------------------------------
     # Question-conditioned temporal geometry
     # ----------------------------------------------------------
-    # Unchanged from V1.4/V1.5.
     question_modulation_scale: 0.10
 
     # ----------------------------------------------------------
     # DECOMPOSE: dynamic boundary proposals
     # ----------------------------------------------------------
-    # Keep all topology-related values unchanged so the first
-    # V1.6 experiment isolates the effect of REFINE.
+    # Unchanged from V1.4/V1.5/V1.6 so the first V1.7 run isolates
+    # the new COMPOSE->REFINE training/routing strategy.
     boundary_temperature: 0.7
     boundary_threshold: 0.5
     boundary_radius: 2
@@ -129,7 +133,7 @@ model:
       loss_weight: 0.10
 
       # Internal partition-energy terms.
-      # Deliberately unchanged from V1.4/V1.5.
+      # Deliberately unchanged.
       complexity_weight: 1.25
       boundary_weight: 0.50
       temperature: 0.20
@@ -144,38 +148,60 @@ model:
     # ----------------------------------------------------------
     # COMPOSE: Latent Contiguous Event-Span Composer
     # ----------------------------------------------------------
-    # Unchanged from V1.5.
+    # Scorer and temperature are intentionally unchanged from V1.5/V1.6.
+    # For M ordered events, every valid contiguous chain [Ei ... Ej]
+    # is considered; with max_events=4 there are at most 10 candidates.
     #
-    # For M ordered events, consider every valid contiguous event
-    # chain [Ei ... Ej]. With max_events=4 there are at most
-    # 10 candidates.
+    # In V1.7:
+    #   * composed_temporal_prob remains differentiable and is used by
+    #     the explicit coarse VQA branch;
+    #   * only the detached top-1 coarse chain is routed into REFINE.
     composer:
       enabled: true
       type: latent_contiguous_event_span
       temperature: 0.35
 
     # ----------------------------------------------------------
-    # REFINE: Question-Conditioned Frame Boundary Refiner
+    # STABLE REFINE: Minimal-Sufficient Frame Boundary Refiner
     # ----------------------------------------------------------
-    # NEW in V1.6.
-    #
-    # Given a coarse event chain [Ei ... Ej]:
+    # Given the detached selected coarse chain [Ei ... Ej]:
     #   start is searched only inside Ei,
     #   end   is searched only inside Ej,
     #   start <= end,
-    #   interior selected events remain covered.
+    #   refined interval must stay inside the coarse chain.
     #
-    # Training marginalizes the conditional frame-level
-    # start/end posterior with the Composer span posterior.
-    # Hard refined start/end are detached and used only for
-    # evaluation/diagnostics.
+    # Unlike V1.6, MAIN training does NOT marginalize over all
+    # Composer spans. This prevents refined-task gradients from
+    # encouraging the Composer to expand coarse support.
     refinement:
       enabled: true
-      type: question_conditioned_frame_boundary_refiner
+      type: minimal_sufficient_boundary_refiner
 
-      # First controlled V1.6 value.
-      # Do not tune Composer temperature at the same time.
+      # Keep the V1.6 refiner temperature for the first controlled run.
       temperature: 0.30
+
+      # Explicit routing contract for reproducibility/documentation.
+      # The current code enforces these behaviors directly.
+      hard_coarse_route: true
+      detach_coarse: true
+
+      # Keep the differentiable coarse Composer branch task-aware.
+      #
+      # total_loss += coarse_task_weight * L_coarse_VQA
+      coarse_task_weight: 0.10
+
+      # Minimal-sufficient objective:
+      # minimize expected retained coarse-span fraction ONLY when
+      # refined answer CE is no worse than coarse answer CE.
+      #
+      # total_loss += minimal_sufficient_weight * L_MS
+      minimal_sufficient_weight: 0.10
+
+      # Sufficient iff:
+      #   CE_refined <= CE_coarse + sufficiency_margin
+      #
+      # First controlled run uses the strict comparison.
+      sufficiency_margin: 0.0
 
     # ----------------------------------------------------------
     # Weak semantic alignment inherited from V1.2+
@@ -184,35 +210,40 @@ model:
     weak_align_temperature: 0.07
 
     # ----------------------------------------------------------
-    # Deliberately NOT introduced in the first V1.6 run
+    # Deliberately NOT introduced in the first V1.7 run
     # ----------------------------------------------------------
     # No:
     #   temporal-GT supervision
-    #   refiner/start-end supervised loss
-    #   span-length loss
-    #   trim loss
+    #   supervised start/end loss
+    #   direct span-length target
+    #   trim target
     #   IoU / IoP optimization loss
+    #   refiner entropy loss
     #   Composer entropy loss
     #   Composer length/diversity/balance loss
+    #   event-count forcing
     #   CRA -> Q-Bound handover
     #   direct reasoned-event -> answer residual
     #   CRA consistency loss
     #
     # Goal:
-    # test whether frame-level refinement can recover temporal
-    # precision (IoP/GQA) while preserving the coverage/IoU gain
-    # introduced by V1.5 COMPOSE.
+    # preserve the coverage/IoU gain of COMPOSE while improving
+    # temporal precision (IoP/GQA) through stable coarse routing
+    # and answer-conditioned minimal-sufficient refinement.
 
 optim:
   pipeline: cra
   optimizer: Adam
 
   # Original CRA objectives remain unchanged.
-  # CRAPipeline V1.6 still adds only:
+  #
+  # CRAPipeline V1.7 adds:
   #   + weak_align_weight * L_align
   #   + decomposition.loss_weight * L_decomp
+  #   + refinement.coarse_task_weight * L_coarse_VQA
+  #   + refinement.minimal_sufficient_weight * L_MS
   #
-  # REFINE has NO separate auxiliary loss in the first V1.6 run.
+  # L_MS uses NO temporal GT.
   loss:
     ce:
       vq: 1
@@ -225,8 +256,8 @@ optim:
   weight_decay: 0
   amsgrad: true
 
-  # All decoder.qbound.* parameters, including the new frame
-  # boundary refiner, use the dedicated Q-Bound optimizer group.
+  # All decoder.qbound.* parameters, including Composer and REFINE,
+  # use the dedicated Q-Bound optimizer group.
   qbound_lr: 5.e-5
 
   # Keep the same training budget for controlled comparison.
@@ -246,13 +277,13 @@ stat:
 
   record_dir: ./output
 
-  # Start the first V1.6 controlled run from scratch.
-  # This avoids partial-checkpoint ambiguity because REFINE adds
-  # new trainable parameters.
+  # Start V1.7 from scratch.
+  # V1.7 changes gradient routing and the objective, so resuming V1.6
+  # would not be a controlled experiment.
   resume: null
 
 misc:
-  running_name: CRA/NextGQA/QBound_v1.6_seed2024
-  info: "CRA testbed + Q-Bound V1.6 | dynamic latent decomposition + ordered event reasoning + latent event-span composition + question-conditioned frame-level boundary refinement + grounding"
+  running_name: CRA/NextGQA/QBound_v1.7_seed2024
+  info: "CRA testbed + Q-Bound V1.7 | dynamic latent decomposition + ordered event reasoning + differentiable coarse event-span composition + detached hard coarse routing + minimal-sufficient frame-level refinement + grounding"
   cuda: "0"
   seed: 2024

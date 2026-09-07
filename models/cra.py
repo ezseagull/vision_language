@@ -11,41 +11,40 @@ from modules.m_cra.causal_module import LinguisticInterventionGraph
 
 class CRA(nn.Module):
     """
-    CRA wrapper with Q-Bound Version 1.6.
+    CRA wrapper with Q-Bound Version 1.7.
 
-    Q-Bound V1.6 follows:
+    Q-Bound V1.7 follows:
 
-        DECOMPOSE -> RELATE -> COMPOSE -> REFINE -> GROUND
+        DECOMPOSE -> RELATE -> COMPOSE -> STABLE REFINE -> GROUND
 
-    The wrapper deliberately keeps CRA as a downstream testbed while Q-Bound
-    owns the temporal reasoning process.
+    CRA remains a downstream testbed. Q-Bound owns temporal reasoning.
 
-    Main responsibilities
-    ---------------------
-    * preserve CRA's original candidate-conditioned VQ/VQA language path;
-    * encode a separate question-only representation for Q-Bound;
-    * keep answer-choice semantics out of Q-Bound topology/composition;
-    * pass raw video features + question-only semantics to RefineDecoder;
-    * preserve CRA's original candidate dot-product answer interface;
-    * expose V1.6 decomposition, Q-OEI, latent event-span composition,
-      frame-level boundary refinement, grounding, and selected event tokens
-      to the pipeline.
+    V1.7 adds one important wrapper-level interface over V1.6:
+    it exposes two answer-space video representations produced from the same
+    CRA feature tensor and the same projection/dropout realization:
 
-    V1.6 controls
-    -------------
-    * no CRA -> Q-Bound temporal handover;
+        qbound_coarse_video_proj
+            differentiable COMPOSE coarse branch
+
+        qbound_refined_video_proj
+            detached-coarse-route STABLE REFINE branch (MAIN)
+
+    This lets the pipeline compare coarse/refined answer sufficiency fairly and
+    build the minimal-sufficient refinement objective without changing CRA's
+    candidate dot-product answer scorer.
+
+    Controls
+    --------
+    * question-only semantics define Q-Bound topology/routing;
+    * no answer-choice leakage into DECOMPOSE / RELATE / COMPOSE / REFINE;
+    * no CRA -> Q-Bound handover;
     * no direct reasoned-event residual into answer space;
-    * DECOMPOSE and Q-OEI remain the V1.4 mechanisms;
-    * COMPOSE scores contiguous chains of reasoned events;
-    * REFINE learns frame-level start/end inside the first/last event of the
-      selected coarse chain without modifying event topology;
-    * main start/end/mask come from the refined frame interval, not directly
-      from coarse event boundaries and not from CRA's fixed [1,3,5] search;
-    * the complete V1.5 coarse readout and V1.4 fixed-window readout are
-      retained only as detached diagnostics/ablations;
-    * selected ordered event tokens are surfaced for a future frozen
-      LLM/MLLM adapter;
-    * temporal GT is never consumed here for training.
+    * refined-task gradients are blocked from span_composer_score inside core;
+    * the differentiable coarse branch remains available to supervise Composer;
+    * main start/end/mask come from frame-level refined boundaries;
+    * temporal GT is never consumed here for training;
+    * selected ordered event tokens remain available for a future frozen
+      LLM/MLLM adapter.
     """
 
     def __init__(self, cfgs, tokenizer) -> None:
@@ -80,7 +79,7 @@ class CRA(nn.Module):
                 "version",
                 model_cfg.get(
                     "qbound_version",
-                    model_cfg.get("gpeb_version", "1.6"),
+                    model_cfg.get("gpeb_version", "1.7"),
                 ),
             )
         )
@@ -297,14 +296,18 @@ class CRA(nn.Module):
         qbound_mix=1.0,
     ):
         """
-        Refined CRA/Q-Bound V1.6 forward.
+        Refined CRA/Q-Bound V1.7 forward.
 
-        ``question`` is required by default when Q-Bound is active because
-        decomposition and ordered reasoning must remain question-only.
+        ``question`` is required by default when Q-Bound is active because all
+        temporal reasoning remains question-only.
 
-        ``qbound_mix`` is accepted only for compatibility with older pipeline
-        callers. RefineDecoder V1.6 ignores the old handover schedule and uses
-        the pure Q-Bound temporal path whenever Q-Bound is active.
+        ``qbound_mix`` is compatibility-only. V1.7 uses the pure Q-Bound refined
+        path when active; there is no CRA/Q-Bound temporal handover.
+
+        The returned ``video_proj`` is ALWAYS the refined V1.7 representation.
+        The differentiable coarse representation is exposed separately through:
+            outs["qbound_coarse_video_proj"]
+            outs["qbound_aux"]["qbound_coarse_video_proj"]
         """
         mode = mode.upper()
 
@@ -335,16 +338,15 @@ class CRA(nn.Module):
         qsn_gt = None
 
         if mode == "VQ" and answer_indices is not None:
-            # Preserve original VQ behavior.
+            # Preserve original CRA VQ behavior.
             qsn_g = self._select_candidate_features(
                 answer_g,
                 answer_indices,
             )
             qsn_gt = qsn_g
         else:
-            # Preserve the original CRA candidate-conditioned context.
+            # Preserve original CRA candidate-conditioned context.
             qsn_g = answer_g.max(dim=1).values
-
             if answer_indices is not None:
                 qsn_gt = self._select_candidate_features(
                     answer_g,
@@ -363,10 +365,10 @@ class CRA(nn.Module):
             if question is None:
                 if self.qbound_require_question_only:
                     raise ValueError(
-                        "Q-Bound V1.6 requires question-only token ids. "
+                        "Q-Bound V1.7 requires question-only token ids. "
                         "Pass them through CRA.forward(..., question=...). "
                         "Do not reuse candidate answer features because that "
-                        "would leak answer-choice semantics into decomposition."
+                        "would leak answer-choice semantics into temporal reasoning."
                     )
             else:
                 question_g, question_tokens = self._encode_question(
@@ -392,7 +394,7 @@ class CRA(nn.Module):
             ),
             use_qbound=use_qbound,
             question_feature=question_g,
-            # Compatibility only. RefineDecoder V1.6 ignores handover mixing.
+            # Compatibility only; RefineDecoder V1.7 ignores handover mixing.
             qbound_mix=(
                 qbound_mix
                 if use_qbound
@@ -400,7 +402,7 @@ class CRA(nn.Module):
             ),
         )
 
-        # Keep the repository's original answer-scoring interface.
+        # Keep CRA's original answer-scoring interface unchanged.
         answer_proj = answer_g
 
         qbound_aux = (
@@ -410,491 +412,214 @@ class CRA(nn.Module):
         )
 
         # --------------------------------------------------------------
-        # Validate V1.6 decoder/core/refiner interface early.
+        # Validate the V1.7 decoder/core interface early.
         # --------------------------------------------------------------
         if use_qbound:
             required_time_keys = {
-                # Main / pure-QBound grounded features.
+                # Main/coarse answer representations.
                 "qbound_grounding_feature",
                 "qbound_temporal_main_feature",
-                "qbound_reasoned_video_feature",
+                "qbound_coarse_grounding_feature",
+                "qbound_coarse_video_proj",
+                "qbound_refined_video_proj",
 
-                # Generic visual/event evidence.
-                "qbound_event_visual_tokens",
-                "qbound_evidence_visual_token",
-                "qbound_event_valid_mask",
-                "qbound_frame_semantic_logits",
+                # Explicit coarse/refined temporal keys.
+                "qbound_key",
+                "qbound_coarse_key",
+                "refined_key",
 
-                # Event evidence retained from V1.4.
-                "qbound_event_evidence_logits",
-                "qbound_event_evidence_weights",
-                "qbound_event_evidence_effective_count",
-                "qbound_multi_event_evidence",
-                "qbound_top1_event_evidence_share",
-                "qbound_top2_event_evidence_share",
+                # Stable routing contract.
+                "qbound_stable_refiner_enabled",
+                "qbound_refine_hard_coarse_route",
+                "qbound_refine_coarse_detached",
+                "qbound_all_span_refine_marginal_enabled",
 
-                # Ordered reasoning.
-                "qbound_event_tokens",
-                "qbound_reasoned_event_tokens",
-                "qbound_reasoned_event_repr",
-                "qbound_ordered_relation_gates",
-                "qbound_ordered_relation_valid_mask",
-                "qbound_ordered_update_gate",
-                "qbound_reasoned_event_token_delta_norm",
+                # Minimal-sufficient differentiable interface.
+                "qbound_expected_refined_span_length",
+                "qbound_expected_refined_length_ratio",
+                "qbound_expected_refined_span_fraction",
+                "qbound_expected_refine_trim_fraction",
 
-                # Latent decomposition.
-                "qbound_event_assignment",
-                "qbound_event_mass",
-                "qbound_event_mass_max",
-                "qbound_event_mass_min",
-                "qbound_event_mass_mean",
-                "qbound_effective_event_count",
-                "qbound_soft_effective_event_count",
-                "qbound_decomp_loss",
-                "qbound_decomp_expected_energy",
-                "qbound_decomp_selected_coherence",
-                "qbound_decomp_selected_complexity",
-                "qbound_decomp_selected_complexity_cost",
-                "qbound_decomp_selected_boundary_reward",
-                "qbound_decomp_selected_boundary_term",
-                "qbound_decomp_selected_total_energy",
-                "qbound_decomp_expected_event_count",
-                "qbound_partition_entropy",
-                "qbound_candidate_split_gain",
-                "qbound_accepted_split_gain",
-                "qbound_rejected_split_gain",
-
-                # Proposal diagnostics.
-                "qbound_boundary_prob",
-                "qbound_boundary_hard",
-                "qbound_boundary_soft_marginal",
-                "qbound_boundary_candidate_indices",
-                "qbound_boundary_candidate_probs",
-                "qbound_boundary_candidate_valid_mask",
-
-                # Explicit V1.4 shortcut removal.
-                "qbound_reasoning_residual",
-                "qbound_reasoning_residual_used",
-                "qbound_reasoning_scale",
-                "qbound_direct_reasoning_residual_enabled",
-            }
-
-            required_time_keys.update({
-                # V1.5 COMPOSE retained inside V1.6.
-                "qbound_adaptive_span_enabled",
+                # COMPOSE.
                 "qbound_span_posterior",
                 "qbound_span_entropy",
                 "qbound_span_effective_count",
                 "qbound_span_top1_posterior",
+                "qbound_composed_temporal_prob",
+                "qbound_selected_span_index",
                 "qbound_selected_event_mask",
                 "qbound_selected_reasoned_event_tokens",
-                "qbound_selected_frame_mask",
-                "qbound_selected_span_start_frame",
-                "qbound_selected_span_end_frame",
                 "qbound_selected_span_event_count",
                 "qbound_selected_span_frame_length",
                 "qbound_selected_span_fraction",
-                "qbound_selected_span_posterior",
-                "qbound_soft_selected_event_weights",
-                "qbound_composed_reasoned_event_repr",
-                "qbound_composed_temporal_prob",
 
-                # V1.6 REFINE main path.
-                "qbound_refined_span_enabled",
-                "qbound_refiner_enabled",
-                "qbound_refine_start_logits",
-                "qbound_refine_end_logits",
-                "qbound_refine_start_candidate_mask",
-                "qbound_refine_end_candidate_mask",
+                # STABLE REFINE.
                 "qbound_refined_temporal_prob",
                 "qbound_refine_selected_pair_entropy",
                 "qbound_refine_selected_pair_effective_count",
                 "qbound_refine_selected_pair_top1_posterior",
+                "qbound_refine_selected_pair_candidate_count",
+                "qbound_refine_selected_pair_entropy_ratio",
                 "qbound_refined_span_start_frame",
                 "qbound_refined_span_end_frame",
                 "qbound_refined_span_length",
                 "qbound_refined_span_fraction",
-                "qbound_refined_span_key_mass",
-                "qbound_refined_span_mask_consistency",
-                "qbound_refine_trim_left_frames",
-                "qbound_refine_trim_right_frames",
                 "qbound_refine_trim_total_frames",
-                "qbound_refine_retained_fraction",
+                "qbound_refined_inside_coarse",
 
-                # Coarse V1.5 and fixed-window diagnostics on V1.6 key.
-                "qbound_coarse_v15_span_length",
-                "qbound_coarse_v15_span_fraction",
-                "qbound_coarse_v15_span_key_mass",
-                "qbound_legacy_fixed_window_span_length",
-                "qbound_legacy_fixed_window_key_mass",
-                "qbound_refined_vs_coarse_span_length_ratio",
-                "qbound_refined_vs_legacy_span_length_ratio",
-                "qbound_refined_minus_coarse_key_mass",
-                "qbound_refined_minus_legacy_key_mass",
+                # DECOMPOSE / RELATE essentials.
+                "qbound_event_assignment",
+                "qbound_event_mass",
+                "qbound_soft_effective_event_count",
+                "qbound_decomp_loss",
+                "qbound_event_visual_tokens",
+                "qbound_evidence_visual_token",
+                "qbound_event_valid_mask",
+                "qbound_reasoned_event_tokens",
+                "qbound_ordered_relation_gates",
+                "qbound_ordered_update_gate",
 
-                # Full detached historical readouts.
+                # Shortcut-removal controls.
+                "qbound_reasoning_residual",
+                "qbound_reasoning_residual_used",
+                "qbound_direct_reasoning_residual_enabled",
+
+                # Historical diagnostics.
                 "qbound_v15_diagnostic_key",
                 "qbound_v15_diagnostic_start",
                 "qbound_v15_diagnostic_end",
-                "qbound_v15_diagnostic_mask",
-                "qbound_v15_diagnostic_span_length",
                 "qbound_v14_diagnostic_key",
                 "qbound_v14_diagnostic_start",
                 "qbound_v14_diagnostic_end",
-                "qbound_v14_diagnostic_mask",
-                "qbound_v14_diagnostic_span_length",
-            })
+            }
 
             missing_time_keys = sorted(
                 required_time_keys.difference(time_param)
             )
             if missing_time_keys:
                 raise KeyError(
-                    "RefineDecoder/Q-Bound V1.6 time_param/refiner output is missing: "
+                    "RefineDecoder/Q-Bound V1.7 time_param output is missing: "
                     + ", ".join(missing_time_keys)
                 )
 
             if qbound_aux is None:
                 raise KeyError(
-                    "RefineDecoder/Q-Bound V1.6 must expose "
+                    "RefineDecoder/Q-Bound V1.7 must expose "
                     "time_param['qbound_aux']."
                 )
 
             required_aux_keys = {
-                # Main temporal output.
-                "event_temporal_prob",
-                "event_temporal_logits",
+                # Main/refined and differentiable coarse answer branches.
+                "main_video_proj",
+                "qbound_video_proj",
+                "qbound_refined_video_proj",
+                "qbound_coarse_video_proj",
+                "qbound_key",
+                "qbound_coarse_key",
+                "final_key",
 
-                # Dynamic decomposition.
-                "boundary_hard",
-                "boundary_count",
-                "event_count",
-                "event_assignment",
-                "event_mass",
-                "event_mass_max",
-                "event_mass_min",
-                "soft_effective_event_count",
-                "decomp_loss",
-                "decomp_selected_coherence",
-                "decomp_selected_complexity",
-                "decomp_selected_total_energy",
-                "decomp_expected_event_count",
-                "partition_entropy",
-                "accepted_split_gain",
-                "rejected_split_gain",
-
-                # Event evidence.
-                "event_visual_tokens",
-                "evidence_visual_token",
-                "event_evidence_logits",
-                "event_evidence_weights",
-                "event_evidence_effective_count",
-                "multi_event_evidence",
-
-                # Native ordered reasoning.
-                "event_tokens",
-                "reasoned_event_tokens",
-                "reasoned_event_repr",
-                "ordered_relation_gates",
-                "ordered_relation_valid_mask",
-                "ordered_update_gate",
-                "reasoned_event_token_delta_norm",
-
-                # Decoder marks the absence of V1.3 main merge diagnostic.
-                "merge_counterfactual_available",
-            }
-
-            required_aux_keys.update({
-                # V1.6 main temporal outputs.
+                # Main/coarse temporal distributions.
                 "main_temporal_prob",
                 "main_temporal_logits",
                 "refined_temporal_prob",
                 "refined_temporal_logits",
-
-                # V1.5/V1.4 controlled temporal outputs.
-                "legacy_v15_composed_temporal_prob",
                 "composed_temporal_prob",
                 "composed_temporal_logits",
-                "legacy_v14_event_temporal_prob",
 
-                # V1.5 COMPOSE.
-                "span_candidate_event_mask",
-                "span_candidate_valid_mask",
-                "span_candidate_frame_mask",
-                "span_logits",
-                "span_posterior",
-                "span_entropy",
-                "span_effective_count",
-                "span_top1_posterior",
-                "soft_span_support",
-                "selected_span_index",
-                "selected_event_mask",
-                "selected_reasoned_event_tokens",
-                "selected_frame_mask",
-                "selected_span_start_event",
-                "selected_span_end_event",
-                "selected_span_event_count",
-                "selected_span_start_frame",
-                "selected_span_end_frame",
-                "selected_span_frame_length",
-                "selected_span_fraction",
-                "selected_span_posterior",
-                "soft_selected_event_weights",
-                "composed_reasoned_event_repr",
+                # Stable route.
+                "stable_refiner_enabled",
+                "all_span_refine_marginal_enabled",
+                "refine_hard_coarse_route",
+                "refine_coarse_detached",
+                "refine_selected_span_index",
 
-                # V1.6 REFINE core.
-                "refiner_enabled",
-                "refine_start_logits",
-                "refine_end_logits",
-                "refine_start_candidate_mask",
-                "refine_end_candidate_mask",
-                "refined_soft_support",
+                # Minimal-sufficient quantities.
+                "expected_refined_span_length",
+                "expected_refined_length_ratio",
+                "expected_refined_span_fraction",
+                "expected_refine_trim_fraction",
+
+                # Pair posterior.
+                "refine_selected_pair_posterior",
                 "refine_selected_pair_entropy",
                 "refine_selected_pair_effective_count",
                 "refine_selected_pair_top1_posterior",
+                "refine_selected_pair_candidate_count",
+                "refine_selected_pair_entropy_ratio",
+
+                # Coarse/refined hard intervals.
                 "coarse_span_start_frame",
                 "coarse_span_end_frame",
                 "coarse_span_frame_length",
                 "coarse_span_fraction",
-                "coarse_frame_mask",
                 "refined_span_start_frame",
                 "refined_span_end_frame",
-                "refined_frame_mask",
                 "refined_span_frame_length",
                 "refined_span_fraction",
-                "refine_trim_left_frames",
-                "refine_trim_right_frames",
-                "refine_trim_total_frames",
-                "refine_retained_fraction",
                 "refined_inside_coarse",
 
-                # Refine/Grounding V1.6 adapter outputs.
-                "qbound_adaptive_span_enabled",
-                "qbound_refined_span_enabled",
-                "qbound_adaptive_start",
-                "qbound_adaptive_end",
-                "qbound_adaptive_mask",
-                "qbound_refined_start",
-                "qbound_refined_end",
-                "qbound_refined_mask",
-                "qbound_refined_span_length",
-                "qbound_refined_span_fraction",
-                "qbound_refined_span_key_mass",
-                "qbound_coarse_v15_span_length",
-                "qbound_coarse_v15_span_fraction",
-                "qbound_coarse_v15_span_key_mass",
-                "qbound_legacy_fixed_window_span_length",
-                "qbound_refined_vs_coarse_span_length_ratio",
-                "qbound_refined_vs_legacy_span_length_ratio",
-                "v15_diagnostic_key",
-                "v15_diagnostic_start",
-                "v15_diagnostic_end",
-                "v15_diagnostic_mask",
-                "v14_diagnostic_key",
-                "v14_diagnostic_start",
-                "v14_diagnostic_end",
-                "v14_diagnostic_mask",
-            })
+                # DECOMPOSE/RELATE/COMPOSE essentials.
+                "event_count",
+                "event_assignment",
+                "event_mass",
+                "soft_effective_event_count",
+                "decomp_loss",
+                "reasoned_event_tokens",
+                "span_posterior",
+                "selected_span_index",
+                "selected_event_mask",
+                "selected_reasoned_event_tokens",
+
+                # Decoder controls/diagnostics.
+                "qbound_handover_enabled",
+                "qbound_stable_refiner_enabled",
+                "qbound_direct_reasoning_residual_enabled",
+                "merge_counterfactual_available",
+            }
 
             missing_aux_keys = sorted(
                 required_aux_keys.difference(qbound_aux)
             )
             if missing_aux_keys:
                 raise KeyError(
-                    "Q-Bound V1.6 auxiliary/refiner output is missing: "
+                    "Q-Bound V1.7 auxiliary output is missing: "
                     + ", ".join(missing_aux_keys)
                 )
 
+            # Fail fast on accidental V1.6 routing.
+            if float(
+                qbound_aux["all_span_refine_marginal_enabled"]
+                .detach()
+                .item()
+            ) != 0.0:
+                raise RuntimeError(
+                    "Q-Bound V1.7 expected all-span REFINE marginalization "
+                    "to be disabled."
+                )
+
+            if float(
+                qbound_aux["refine_coarse_detached"]
+                .detach()
+                .item()
+            ) != 1.0:
+                raise RuntimeError(
+                    "Q-Bound V1.7 expected the coarse route into REFINE "
+                    "to be detached."
+                )
+
         # --------------------------------------------------------------
-        # Collect pure-QBound / event evidence outputs.
+        # Collect shared outputs.
         # --------------------------------------------------------------
         def _tp(name):
             if not isinstance(time_param, dict):
                 return None
             return time_param.get(name)
 
-        qbound_grounding_feature = _tp(
-            "qbound_grounding_feature"
-        )
-        qbound_event_visual_tokens = _tp(
-            "qbound_event_visual_tokens"
-        )
-        qbound_evidence_visual_token = _tp(
-            "qbound_evidence_visual_token"
-        )
-        qbound_event_valid_mask = _tp(
-            "qbound_event_valid_mask"
-        )
-        qbound_frame_semantic_logits = _tp(
-            "qbound_frame_semantic_logits"
-        )
-
-        qbound_event_evidence_logits = _tp(
-            "qbound_event_evidence_logits"
-        )
-        qbound_event_evidence_weights = _tp(
-            "qbound_event_evidence_weights"
-        )
-        qbound_event_evidence_effective_count = _tp(
-            "qbound_event_evidence_effective_count"
-        )
-        qbound_multi_event_evidence = _tp(
-            "qbound_multi_event_evidence"
-        )
-        qbound_top1_event_evidence_share = _tp(
-            "qbound_top1_event_evidence_share"
-        )
-        qbound_top2_event_evidence_share = _tp(
-            "qbound_top2_event_evidence_share"
-        )
-
-        # --------------------------------------------------------------
-        # Ordered event reasoning outputs.
-        # --------------------------------------------------------------
-        qbound_event_tokens = _tp("qbound_event_tokens")
-        qbound_reasoned_event_tokens = _tp(
-            "qbound_reasoned_event_tokens"
-        )
-        qbound_reasoned_event_repr = _tp(
-            "qbound_reasoned_event_repr"
-        )
-        qbound_ordered_relation_gates = _tp(
-            "qbound_ordered_relation_gates"
-        )
-        qbound_ordered_relation_valid_mask = _tp(
-            "qbound_ordered_relation_valid_mask"
-        )
-        qbound_ordered_update_gate = _tp(
-            "qbound_ordered_update_gate"
-        )
-        qbound_reasoned_event_token_delta_norm = _tp(
-            "qbound_reasoned_event_token_delta_norm"
-        )
-
-        # --------------------------------------------------------------
-        # Latent decomposition outputs.
-        # --------------------------------------------------------------
-        qbound_event_assignment = _tp(
-            "qbound_event_assignment"
-        )
-        qbound_event_mass = _tp(
-            "qbound_event_mass"
-        )
-        qbound_event_mass_max = _tp(
-            "qbound_event_mass_max"
-        )
-        qbound_event_mass_min = _tp(
-            "qbound_event_mass_min"
-        )
-        qbound_event_mass_mean = _tp(
-            "qbound_event_mass_mean"
-        )
-        qbound_effective_event_count = _tp(
-            "qbound_effective_event_count"
-        )
-        qbound_soft_effective_event_count = _tp(
-            "qbound_soft_effective_event_count"
-        )
-
-        qbound_decomp_loss = _tp(
-            "qbound_decomp_loss"
-        )
-        qbound_decomp_expected_energy = _tp(
-            "qbound_decomp_expected_energy"
-        )
-        qbound_decomp_selected_coherence = _tp(
-            "qbound_decomp_selected_coherence"
-        )
-        qbound_decomp_selected_complexity = _tp(
-            "qbound_decomp_selected_complexity"
-        )
-        qbound_decomp_selected_complexity_cost = _tp(
-            "qbound_decomp_selected_complexity_cost"
-        )
-        qbound_decomp_selected_boundary_reward = _tp(
-            "qbound_decomp_selected_boundary_reward"
-        )
-        qbound_decomp_selected_boundary_term = _tp(
-            "qbound_decomp_selected_boundary_term"
-        )
-        qbound_decomp_selected_total_energy = _tp(
-            "qbound_decomp_selected_total_energy"
-        )
-        qbound_decomp_expected_event_count = _tp(
-            "qbound_decomp_expected_event_count"
-        )
-        qbound_partition_entropy = _tp(
-            "qbound_partition_entropy"
-        )
-        qbound_candidate_split_gain = _tp(
-            "qbound_candidate_split_gain"
-        )
-        qbound_accepted_split_gain = _tp(
-            "qbound_accepted_split_gain"
-        )
-        qbound_rejected_split_gain = _tp(
-            "qbound_rejected_split_gain"
-        )
-
-        # Boundary proposal diagnostics.
-        qbound_boundary_prob = _tp(
-            "qbound_boundary_prob"
-        )
-        qbound_boundary_hard = _tp(
-            "qbound_boundary_hard"
-        )
-        qbound_boundary_soft_marginal = _tp(
-            "qbound_boundary_soft_marginal"
-        )
-        qbound_boundary_candidate_indices = _tp(
-            "qbound_boundary_candidate_indices"
-        )
-        qbound_boundary_candidate_probs = _tp(
-            "qbound_boundary_candidate_probs"
-        )
-        qbound_boundary_candidate_valid_mask = _tp(
-            "qbound_boundary_candidate_valid_mask"
-        )
-
-        # Explicit shortcut-removal diagnostics.
-        qbound_reasoning_residual = _tp(
-            "qbound_reasoning_residual"
-        )
-        qbound_reasoning_residual_used = _tp(
-            "qbound_reasoning_residual_used"
-        )
-        qbound_reasoning_scale = _tp(
-            "qbound_reasoning_scale"
-        )
-        qbound_direct_reasoning_residual_enabled = _tp(
-            "qbound_direct_reasoning_residual_enabled"
-        )
-
-        qbound_reasoned_video_feature = _tp(
-            "qbound_reasoned_video_feature"
-        )
-        qbound_temporal_main_feature = _tp(
-            "qbound_temporal_main_feature"
-        )
-
-        # Compatibility aliases for old loggers. These no longer define the
-        # V1.4 main grounding mechanism.
-        qbound_event_relevance_weights = _tp(
-            "qbound_event_relevance_weights"
-        )
-        qbound_event_relevance_gates = _tp(
-            "qbound_event_relevance_gates"
-        )
-        qbound_event_relevance_effective_count = _tp(
-            "qbound_event_relevance_effective_count"
-        )
-
         outs = {
             "fatt": video_attn,
             "time_param": time_param,
 
-            # Original CRA alignment target (GT QA semantic feature when
-            # available). It is never fed into Q-Bound decomposition.
+            # Original CRA semantic context.
             "align_gt": qsn_gt,
             "qa_condition": qsn_g,
 
@@ -907,121 +632,11 @@ class CRA(nn.Module):
                 dtype=video_proj.dtype,
             ),
 
-            # Weak-alignment targets/candidates.
+            # Weak alignment.
             "qbound_align_question": question_g,
             "qbound_align_qa": qsn_gt,
 
-            # Pure Q-Bound temporal / visual evidence.
-            "qbound_grounding_feature": qbound_grounding_feature,
-            "qbound_event_visual_tokens": qbound_event_visual_tokens,
-            "qbound_evidence_visual_token": qbound_evidence_visual_token,
-            "qbound_event_valid_mask": qbound_event_valid_mask,
-            "qbound_frame_semantic_logits": qbound_frame_semantic_logits,
-
-            # V1.4 event evidence.
-            "qbound_event_evidence_logits": qbound_event_evidence_logits,
-            "qbound_event_evidence_weights": qbound_event_evidence_weights,
-            "qbound_event_evidence_effective_count": (
-                qbound_event_evidence_effective_count
-            ),
-            "qbound_multi_event_evidence": qbound_multi_event_evidence,
-            "qbound_top1_event_evidence_share": (
-                qbound_top1_event_evidence_share
-            ),
-            "qbound_top2_event_evidence_share": (
-                qbound_top2_event_evidence_share
-            ),
-
-            # Ordered event reasoning retained from V1.3.
-            "qbound_event_tokens": qbound_event_tokens,
-            "qbound_reasoned_event_tokens": qbound_reasoned_event_tokens,
-            "qbound_reasoned_event_repr": qbound_reasoned_event_repr,
-            "qbound_ordered_relation_gates": qbound_ordered_relation_gates,
-            "qbound_ordered_relation_valid_mask": (
-                qbound_ordered_relation_valid_mask
-            ),
-            "qbound_ordered_update_gate": qbound_ordered_update_gate,
-            "qbound_reasoned_event_token_delta_norm": (
-                qbound_reasoned_event_token_delta_norm
-            ),
-
-            # Latent decomposition.
-            "qbound_event_assignment": qbound_event_assignment,
-            "qbound_event_mass": qbound_event_mass,
-            "qbound_event_mass_max": qbound_event_mass_max,
-            "qbound_event_mass_min": qbound_event_mass_min,
-            "qbound_event_mass_mean": qbound_event_mass_mean,
-            "qbound_effective_event_count": qbound_effective_event_count,
-            "qbound_soft_effective_event_count": (
-                qbound_soft_effective_event_count
-            ),
-            "qbound_decomp_loss": qbound_decomp_loss,
-            "qbound_decomp_expected_energy": qbound_decomp_expected_energy,
-            "qbound_decomp_selected_coherence": (
-                qbound_decomp_selected_coherence
-            ),
-            "qbound_decomp_selected_complexity": (
-                qbound_decomp_selected_complexity
-            ),
-            "qbound_decomp_selected_complexity_cost": (
-                qbound_decomp_selected_complexity_cost
-            ),
-            "qbound_decomp_selected_boundary_reward": (
-                qbound_decomp_selected_boundary_reward
-            ),
-            "qbound_decomp_selected_boundary_term": (
-                qbound_decomp_selected_boundary_term
-            ),
-            "qbound_decomp_selected_total_energy": (
-                qbound_decomp_selected_total_energy
-            ),
-            "qbound_decomp_expected_event_count": (
-                qbound_decomp_expected_event_count
-            ),
-            "qbound_partition_entropy": qbound_partition_entropy,
-            "qbound_candidate_split_gain": qbound_candidate_split_gain,
-            "qbound_accepted_split_gain": qbound_accepted_split_gain,
-            "qbound_rejected_split_gain": qbound_rejected_split_gain,
-
-            # Proposal diagnostics.
-            "qbound_boundary_prob": qbound_boundary_prob,
-            "qbound_boundary_hard": qbound_boundary_hard,
-            "qbound_boundary_soft_marginal": qbound_boundary_soft_marginal,
-            "qbound_boundary_candidate_indices": (
-                qbound_boundary_candidate_indices
-            ),
-            "qbound_boundary_candidate_probs": (
-                qbound_boundary_candidate_probs
-            ),
-            "qbound_boundary_candidate_valid_mask": (
-                qbound_boundary_candidate_valid_mask
-            ),
-
-            # Grounding-mediated main-path semantics.
-            "qbound_reasoned_video_feature": qbound_reasoned_video_feature,
-            "qbound_temporal_main_feature": qbound_temporal_main_feature,
-
-            # These must remain zero/disabled in V1.6. They remain only to keep
-            # old diagnostics from crashing during the pipeline transition.
-            "qbound_reasoning_residual": qbound_reasoning_residual,
-            "qbound_reasoning_residual_used": qbound_reasoning_residual_used,
-            "qbound_reasoning_scale": qbound_reasoning_scale,
-            "qbound_direct_reasoning_residual_enabled": (
-                qbound_direct_reasoning_residual_enabled
-            ),
-
-            # Old V1.3 relevance aliases, diagnostic only.
-            "qbound_event_relevance_weights": (
-                qbound_event_relevance_weights
-            ),
-            "qbound_event_relevance_gates": (
-                qbound_event_relevance_gates
-            ),
-            "qbound_event_relevance_effective_count": (
-                qbound_event_relevance_effective_count
-            ),
-
-            # Complete generic diagnostic package.
+            # Complete diagnostic package.
             "qbound_aux": qbound_aux,
 
             "qbound_active": use_qbound,
@@ -1037,18 +652,85 @@ class CRA(nn.Module):
             ),
             "qbound_version": self.qbound_version,
 
-            # Temporary compatibility alias.
+            # Compatibility alias.
             "gpeb_active": use_qbound,
         }
 
         # --------------------------------------------------------------
-        # Q-Bound V1.6 temporal hierarchy outputs.
-        #
-        # CRA remains a thin wrapper. All DECOMPOSE / RELATE / COMPOSE /
-        # REFINE logic lives in QBoundCore / RefineDecoder.
+        # Core event/decomposition/reasoning outputs used by pipeline/loggers.
+        # --------------------------------------------------------------
+        common_output_names = [
+            "qbound_grounding_feature",
+            "qbound_temporal_main_feature",
+            "qbound_reasoned_video_feature",
+
+            "qbound_event_visual_tokens",
+            "qbound_evidence_visual_token",
+            "qbound_event_valid_mask",
+            "qbound_frame_semantic_logits",
+            "qbound_event_evidence_logits",
+            "qbound_event_evidence_weights",
+            "qbound_event_evidence_effective_count",
+            "qbound_multi_event_evidence",
+            "qbound_top1_event_evidence_share",
+            "qbound_top2_event_evidence_share",
+
+            "qbound_event_tokens",
+            "qbound_reasoned_event_tokens",
+            "qbound_reasoned_event_repr",
+            "qbound_ordered_relation_gates",
+            "qbound_ordered_relation_valid_mask",
+            "qbound_ordered_update_gate",
+            "qbound_reasoned_event_token_delta_norm",
+
+            "qbound_event_assignment",
+            "qbound_event_mass",
+            "qbound_event_mass_max",
+            "qbound_event_mass_min",
+            "qbound_event_mass_mean",
+            "qbound_effective_event_count",
+            "qbound_soft_effective_event_count",
+
+            "qbound_decomp_loss",
+            "qbound_decomp_expected_energy",
+            "qbound_decomp_selected_coherence",
+            "qbound_decomp_selected_complexity",
+            "qbound_decomp_selected_complexity_cost",
+            "qbound_decomp_selected_boundary_reward",
+            "qbound_decomp_selected_boundary_term",
+            "qbound_decomp_selected_total_energy",
+            "qbound_decomp_expected_event_count",
+            "qbound_partition_entropy",
+            "qbound_candidate_split_gain",
+            "qbound_accepted_split_gain",
+            "qbound_rejected_split_gain",
+
+            "qbound_boundary_prob",
+            "qbound_boundary_hard",
+            "qbound_boundary_soft_marginal",
+            "qbound_boundary_candidate_indices",
+            "qbound_boundary_candidate_probs",
+            "qbound_boundary_candidate_valid_mask",
+
+            "qbound_reasoning_residual",
+            "qbound_reasoning_residual_used",
+            "qbound_reasoning_scale",
+            "qbound_direct_reasoning_residual_enabled",
+
+            # Compatibility event-relevance aliases.
+            "qbound_event_relevance_weights",
+            "qbound_event_relevance_gates",
+            "qbound_event_relevance_effective_count",
+        ]
+
+        for name in common_output_names:
+            outs[name] = _tp(name)
+
+        # --------------------------------------------------------------
+        # V1.7 COMPOSE / STABLE REFINE / minimal-sufficient interfaces.
         # --------------------------------------------------------------
         qbound_output_names = [
-            # V1.5 Composer candidates/posterior retained in V1.6.
+            # COMPOSE.
             "qbound_span_candidate_event_mask",
             "qbound_span_candidate_start_event",
             "qbound_span_candidate_end_event",
@@ -1072,7 +754,7 @@ class CRA(nn.Module):
             "qbound_composed_temporal_logits",
             "qbound_composed_temporal_prob",
 
-            # Hard coarse event-chain / future LLM interface.
+            # Selected coarse chain / future LLM interface.
             "qbound_selected_span_index",
             "qbound_selected_event_mask",
             "qbound_selected_reasoned_event_tokens",
@@ -1089,12 +771,38 @@ class CRA(nn.Module):
             "qbound_soft_selected_event_weights",
             "qbound_composed_reasoned_event_repr",
 
-            # V1.6 frame-level REFINE core outputs.
+            # Stable route flags.
             "qbound_refiner_enabled",
+            "qbound_stable_refiner_enabled",
+            "qbound_all_span_refine_marginal_enabled",
+            "qbound_refine_hard_coarse_route",
+            "qbound_refine_coarse_detached",
+            "qbound_refine_selected_span_index",
+
+            # Pair posterior.
             "qbound_refine_start_logits",
             "qbound_refine_end_logits",
             "qbound_refine_start_candidate_mask",
             "qbound_refine_end_candidate_mask",
+            "qbound_refine_selected_pair_valid_mask",
+            "qbound_refine_selected_pair_posterior",
+            "qbound_refine_selected_pair_entropy",
+            "qbound_refine_selected_pair_effective_count",
+            "qbound_refine_selected_pair_top1_posterior",
+            "qbound_refine_selected_pair_candidate_count",
+            "qbound_refine_selected_pair_entropy_ratio",
+            "qbound_refine_selected_start_candidate_count",
+            "qbound_refine_selected_end_candidate_count",
+
+            # Differentiable minimal-sufficient quantities.
+            "qbound_expected_refined_span_length",
+            "qbound_expected_refined_length_ratio",
+            "qbound_expected_refined_span_fraction",
+            "qbound_expected_refine_trim_fraction",
+            "qbound_expected_refined_start_frame",
+            "qbound_expected_refined_end_frame",
+
+            # Refined temporal support.
             "qbound_refine_conditional_support",
             "qbound_refined_soft_support",
             "qbound_refined_support_log_bias",
@@ -1102,15 +810,8 @@ class CRA(nn.Module):
             "qbound_refined_temporal_prob",
             "qbound_main_temporal_logits",
             "qbound_main_temporal_prob",
-            "qbound_refine_expected_pair_entropy",
-            "qbound_refine_selected_pair_posterior",
-            "qbound_refine_selected_pair_entropy",
-            "qbound_refine_selected_pair_effective_count",
-            "qbound_refine_selected_pair_top1_posterior",
-            "qbound_refine_selected_start_candidate_count",
-            "qbound_refine_selected_end_candidate_count",
 
-            # Core coarse/fine interval comparison.
+            # Core coarse/refined spans.
             "qbound_coarse_span_start_frame",
             "qbound_coarse_span_end_frame",
             "qbound_coarse_span_frame_length",
@@ -1131,8 +832,18 @@ class CRA(nn.Module):
             "qbound_refined_inside_coarse",
             "qbound_refiner_temperature",
 
-            # Main grounding adapter: compatibility adaptive aliases now
-            # correspond to the refined V1.6 interval.
+            # Decoder-level differentiable coarse branch.
+            "qbound_coarse_key",
+            "qbound_coarse_pre_smooth_key",
+            "qbound_coarse_post_smooth_key",
+            "qbound_coarse_start",
+            "qbound_coarse_end",
+            "qbound_coarse_mask",
+            "qbound_coarse_span_length",
+            "qbound_coarse_span_fraction",
+            "qbound_coarse_span_key_mass",
+
+            # Main refined grounding diagnostics.
             "qbound_adaptive_span_enabled",
             "qbound_refined_span_enabled",
             "qbound_adaptive_span_start_frame",
@@ -1142,50 +853,35 @@ class CRA(nn.Module):
             "qbound_adaptive_span_key_mass",
             "qbound_adaptive_span_peak_in_span",
             "qbound_adaptive_span_mask_consistency",
-
-            # Explicit refined interval diagnostics.
             "qbound_refined_span_length",
             "qbound_refined_span_key_mass",
             "qbound_refined_span_peak_in_span",
             "qbound_refined_span_mask_consistency",
 
-            # Coarse V1.5 span evaluated on the SAME V1.6 key.
+            # Same refined key + alternative hard readouts.
             "qbound_coarse_v15_start",
             "qbound_coarse_v15_end",
             "qbound_coarse_v15_mask",
-            "qbound_coarse_v15_max_indices",
-            "qbound_coarse_v15_span_start_frame",
-            "qbound_coarse_v15_span_end_frame",
             "qbound_coarse_v15_span_length",
             "qbound_coarse_v15_span_fraction",
             "qbound_coarse_v15_span_key_mass",
-            "qbound_coarse_v15_span_peak_in_span",
-            "qbound_coarse_v15_span_mask_consistency",
-
-            # Same V1.6 key with legacy CRA fixed-window extraction.
             "qbound_legacy_fixed_window_start",
             "qbound_legacy_fixed_window_end",
             "qbound_legacy_fixed_window_mask",
             "qbound_legacy_fixed_window_span_length",
             "qbound_legacy_fixed_window_key_mass",
-
-            # Direct V1.6 coarse-to-fine diagnostics.
             "qbound_refined_vs_coarse_span_length_ratio",
             "qbound_refined_vs_legacy_span_length_ratio",
-            "qbound_coarse_vs_legacy_span_length_ratio",
             "qbound_refined_minus_coarse_key_mass",
             "qbound_refined_minus_legacy_key_mass",
-            "qbound_refined_retained_fraction_of_coarse",
             "qbound_refined_trimmed_frame_count",
 
-            # Full detached V1.5 readout.
+            # Historical full readouts.
             "qbound_v15_diagnostic_key",
             "qbound_v15_diagnostic_start",
             "qbound_v15_diagnostic_end",
             "qbound_v15_diagnostic_mask",
             "qbound_v15_diagnostic_span_length",
-
-            # Full detached V1.4 readout.
             "qbound_v14_diagnostic_key",
             "qbound_v14_diagnostic_start",
             "qbound_v14_diagnostic_end",
@@ -1196,40 +892,73 @@ class CRA(nn.Module):
         for name in qbound_output_names:
             outs[name] = _tp(name)
 
-        # Explicit final V1.6 interval used by evaluation.
-        outs["qbound_refined_start"] = (
-            qbound_aux.get("qbound_refined_start")
-            if isinstance(qbound_aux, dict)
-            else None
-        )
-        outs["qbound_refined_end"] = (
-            qbound_aux.get("qbound_refined_end")
-            if isinstance(qbound_aux, dict)
-            else None
-        )
-        outs["qbound_refined_mask"] = (
-            qbound_aux.get("qbound_refined_mask")
-            if isinstance(qbound_aux, dict)
-            else None
-        )
+        # --------------------------------------------------------------
+        # Explicit answer-space representations required by V1.7 pipeline.
+        # --------------------------------------------------------------
+        if isinstance(qbound_aux, dict):
+            outs["qbound_coarse_video_proj"] = qbound_aux.get(
+                "qbound_coarse_video_proj"
+            )
+            outs["qbound_refined_video_proj"] = qbound_aux.get(
+                "qbound_refined_video_proj"
+            )
+            outs["qbound_coarse_key"] = qbound_aux.get(
+                "qbound_coarse_key"
+            )
+            outs["qbound_refined_key"] = qbound_aux.get(
+                "qbound_key"
+            )
 
-        # Compatibility aliases. In V1.6 these point to the refined interval,
-        # not to the coarse V1.5 Composer boundaries.
-        outs["qbound_adaptive_start"] = (
-            qbound_aux.get("qbound_adaptive_start")
-            if isinstance(qbound_aux, dict)
-            else None
-        )
-        outs["qbound_adaptive_end"] = (
-            qbound_aux.get("qbound_adaptive_end")
-            if isinstance(qbound_aux, dict)
-            else None
-        )
-        outs["qbound_adaptive_mask"] = (
-            qbound_aux.get("qbound_adaptive_mask")
-            if isinstance(qbound_aux, dict)
-            else None
-        )
+            # Raw core quantities are exposed too, so the pipeline does not need
+            # to infer them from hard spans.
+            outs["qbound_expected_refined_span_length"] = qbound_aux.get(
+                "expected_refined_span_length"
+            )
+            outs["qbound_expected_refined_length_ratio"] = qbound_aux.get(
+                "expected_refined_length_ratio"
+            )
+            outs["qbound_expected_refined_span_fraction"] = qbound_aux.get(
+                "expected_refined_span_fraction"
+            )
+            outs["qbound_expected_refine_trim_fraction"] = qbound_aux.get(
+                "expected_refine_trim_fraction"
+            )
+
+            outs["qbound_refined_start"] = qbound_aux.get(
+                "qbound_refined_start"
+            )
+            outs["qbound_refined_end"] = qbound_aux.get(
+                "qbound_refined_end"
+            )
+            outs["qbound_refined_mask"] = qbound_aux.get(
+                "qbound_refined_mask"
+            )
+
+            # Compatibility aliases: adaptive == refined in V1.7.
+            outs["qbound_adaptive_start"] = qbound_aux.get(
+                "qbound_adaptive_start"
+            )
+            outs["qbound_adaptive_end"] = qbound_aux.get(
+                "qbound_adaptive_end"
+            )
+            outs["qbound_adaptive_mask"] = qbound_aux.get(
+                "qbound_adaptive_mask"
+            )
+        else:
+            outs["qbound_coarse_video_proj"] = None
+            outs["qbound_refined_video_proj"] = None
+            outs["qbound_coarse_key"] = None
+            outs["qbound_refined_key"] = None
+            outs["qbound_expected_refined_span_length"] = None
+            outs["qbound_expected_refined_length_ratio"] = None
+            outs["qbound_expected_refined_span_fraction"] = None
+            outs["qbound_expected_refine_trim_fraction"] = None
+            outs["qbound_refined_start"] = None
+            outs["qbound_refined_end"] = None
+            outs["qbound_refined_mask"] = None
+            outs["qbound_adaptive_start"] = None
+            outs["qbound_adaptive_end"] = None
+            outs["qbound_adaptive_mask"] = None
 
         return video_proj, answer_proj, outs
 
