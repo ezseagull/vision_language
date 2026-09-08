@@ -1580,6 +1580,56 @@ class Decoder(nn.Module):
                     time_param[f"qbound_{key}"] = qbound_time[key]
 
             # ----------------------------------------------------------
+            # 10b) Explicit V1.8 CALIBRATED MAIN adapter aliases.
+            #
+            # `time_param["start"/"end"/"mask"]` are already the official
+            # calibrated MAIN interval. These explicit aliases are required
+            # by CRA.forward's V1.8 contract and make the three branches
+            # symmetric:
+            #
+            #   calibrated MAIN / raw-refined / coarse.
+            # ----------------------------------------------------------
+            time_param["qbound_calibrated_pre_smooth_key"] = (
+                qbound_time["pre_smooth_key"]
+            )
+            time_param["qbound_calibrated_post_smooth_key"] = (
+                calibrated_qbound_key
+            )
+            time_param["qbound_calibrated_start"] = (
+                qbound_time["start"]
+            )
+            time_param["qbound_calibrated_end"] = (
+                qbound_time["end"]
+            )
+            time_param["qbound_calibrated_mask"] = (
+                qbound_time["mask"]
+            )
+            time_param["qbound_calibrated_span_length"] = (
+                qbound_time["refined_span_length"]
+            )
+            time_param["qbound_calibrated_span_fraction"] = (
+                qbound_time["refined_span_fraction"]
+            )
+            time_param["qbound_calibrated_span_key_mass"] = (
+                qbound_time["refined_span_key_mass"]
+            )
+
+            # Strong contract: the generic official interval must be exactly
+            # the same tensors as the explicit calibrated aliases.
+            if time_param["qbound_calibrated_start"] is not time_param["start"]:
+                raise RuntimeError(
+                    "V1.8 calibrated start alias does not match MAIN start."
+                )
+            if time_param["qbound_calibrated_end"] is not time_param["end"]:
+                raise RuntimeError(
+                    "V1.8 calibrated end alias does not match MAIN end."
+                )
+            if time_param["qbound_calibrated_mask"] is not time_param["mask"]:
+                raise RuntimeError(
+                    "V1.8 calibrated mask alias does not match MAIN mask."
+                )
+
+            # ----------------------------------------------------------
             # 11) Explicit differentiable COARSE branch diagnostics.
             # ----------------------------------------------------------
             time_param["qbound_coarse_pre_smooth_key"] = (
