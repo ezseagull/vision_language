@@ -21,68 +21,57 @@ from utils.misc.misc import (
 
 class CRAPipeline(BasePipeline):
     """
-    CRA training pipeline with Q-Bound Version 1.7.
+    CRA training pipeline with Q-Bound Version 1.8.
 
     Architecture:
 
-        DECOMPOSE -> RELATE -> COMPOSE -> STABLE REFINE -> GROUND
+        DECOMPOSE -> RELATE -> COMPOSE -> REFINE
+        -> UNCERTAINTY CALIBRATION -> GROUND
 
-    V1.7 targets the two failures diagnosed in V1.6:
-      1) COMPOSE over-expanded because refined-task gradients could influence
-         the coarse selection path;
-      2) frame-level start/end remained under-identified, leaving a very
-         diffuse boundary-pair posterior.
+    V1.8 removes the two training terms introduced by V1.7 after the observed
+    support-contraction failure:
 
-    The V1.7 training interface therefore has TWO answer-space branches:
+        L_coarse_VQA                  REMOVED
+        L_minimal_sufficient          REMOVED
 
-        differentiable COMPOSE key
-            -> coarse_video_proj
-            -> coarse VQA CE
-            -> keeps Composer task-supervised
+    The official V1.8 temporal probability is produced inside QBoundCore:
 
-        detached top-1 coarse route
-            -> STABLE REFINE
-            -> refined_video_proj
-            -> MAIN VQA CE
+        p_main(t)
+            = (1 - confidence) * p_coarse(t)
+            + confidence * p_raw_refine(t)
 
-    Minimal-sufficient refinement
-    -----------------------------
-    For each sample, the pipeline compares per-sample answer CE:
+    where confidence is derived from the REFINE pair-posterior uncertainty and
+    detached before fusion.
 
-        CE_refined  vs  CE_coarse
+    Gradient routing
+    ----------------
+    * MAIN task -> calibrated probability -> differentiable coarse component
+      -> Composer.
+    * MAIN task -> calibrated probability -> raw fine component -> Refiner.
+    * REFINE still receives only a detached hard top-1 coarse chain, so the
+      V1.6 Refiner->Composer feedback loop remains blocked.
+    * No separate coarse-answer loss is required.
+    * No minimality/sufficiency gate is used.
 
-    A detached sufficiency gate is active when:
-
-        CE_refined <= CE_coarse + margin
-
-    Only sufficient samples receive minimality pressure on the differentiable
-    expected retained-length ratio returned by QBoundCore:
-
-        L_MS =
-            mean_gate[
-                E(refined_span_length) / coarse_span_length
-            ]
-
-    Therefore shorter spans are rewarded ONLY when refined answer evidence is
-    not worse than the coarse answer evidence.
-
-    First controlled V1.7 objective:
+    First controlled V1.8 objective:
 
         L =
-            L_CRA/main-refined-task
+            L_CRA/main_calibrated_task
             + lambda_align * L_weak_align
             + lambda_decomp * L_decomp
-            + lambda_coarse * L_coarse_VQA
-            + lambda_ms * L_minimal_sufficient
 
-    No temporal GT, IoU/IoP loss, fixed target length, entropy loss, trim target,
-    CRA->Q-Bound handover, or direct event-token answer residual is introduced.
+    No temporal GT, IoU/IoP loss, target duration, trim loss, entropy loss,
+    event-count forcing, CRA->Q-Bound handover, or direct event-token answer
+    residual is introduced.
 
-    Evaluation keeps:
-      * V1.7 refined MAIN readout;
-      * V1.7 differentiable coarse branch;
-      * same-refined-key coarse/fixed readout controls;
-      * detached V1.5 and V1.4 historical readouts.
+    Evaluation keeps three same-checkpoint Q-Bound branches:
+
+        calibrated MAIN
+        raw V1.7-style REFINE diagnostic
+        coarse COMPOSE diagnostic
+
+    plus same-calibrated-key coarse/fixed readout controls and historical
+    detached V1.5/V1.4 readouts.
     """
 
     def __init__(self, cfgs) -> None:
@@ -117,29 +106,21 @@ class CRAPipeline(BasePipeline):
         """
         return 1.0, 0
 
-    def _qbound_v17_loss_settings(self):
+    def _qbound_v18_loss_settings(self):
         """
-        Read V1.7 weak/coarse/minimal-sufficient objective settings.
+        Read the V1.8 objective settings.
 
         Preferred YAML:
+
             model:
               qbound:
                 weak_align_weight: 0.10
                 weak_align_temperature: 0.07
                 decomposition:
                   loss_weight: 0.10
-                refinement:
-                  coarse_task_weight: 0.10
-                  minimal_sufficient_weight: 0.10
-                  sufficiency_margin: 0.0
 
-        ``coarse_task_weight`` is not a localization heuristic. It is the weak
-        VQA supervision needed to keep the differentiable Composer branch
-        task-aware after the refined hard-coarse route is detached.
-
-        ``minimal_sufficient_weight`` acts only on the differentiable expected
-        retained-length ratio and only for samples that already preserve coarse
-        answer sufficiency.
+        V1.8 deliberately has no coarse-answer auxiliary loss and no
+        minimal-sufficient/span-length loss.
         """
         model_cfg = self.cfgs.get("model", {})
         qbound_cfg = model_cfg.get("qbound", {})
@@ -149,10 +130,6 @@ class CRAPipeline(BasePipeline):
         decomp_cfg = qbound_cfg.get("decomposition", {})
         if not isinstance(decomp_cfg, dict):
             decomp_cfg = {}
-
-        refinement_cfg = qbound_cfg.get("refinement", {})
-        if not isinstance(refinement_cfg, dict):
-            refinement_cfg = {}
 
         align_weight = float(
             qbound_cfg.get(
@@ -176,47 +153,17 @@ class CRAPipeline(BasePipeline):
             )
         )
 
-        coarse_task_weight = float(
-            refinement_cfg.get(
-                "coarse_task_weight",
-                qbound_cfg.get("coarse_task_weight", 0.10),
-            )
-        )
-        minimal_sufficient_weight = float(
-            refinement_cfg.get(
-                "minimal_sufficient_weight",
-                qbound_cfg.get("minimal_sufficient_weight", 0.10),
-            )
-        )
-        sufficiency_margin = float(
-            refinement_cfg.get(
-                "sufficiency_margin",
-                qbound_cfg.get("sufficiency_margin", 0.0),
-            )
-        )
-
         if align_weight < 0.0:
             raise ValueError("qbound weak_align_weight must be >= 0.")
         if align_temperature <= 0.0:
             raise ValueError("qbound weak_align_temperature must be > 0.")
         if decomp_weight < 0.0:
             raise ValueError("qbound decomp_weight must be >= 0.")
-        if coarse_task_weight < 0.0:
-            raise ValueError("qbound coarse_task_weight must be >= 0.")
-        if minimal_sufficient_weight < 0.0:
-            raise ValueError(
-                "qbound minimal_sufficient_weight must be >= 0."
-            )
-        if sufficiency_margin < 0.0:
-            raise ValueError("qbound sufficiency_margin must be >= 0.")
 
         return (
             align_weight,
             align_temperature,
             decomp_weight,
-            coarse_task_weight,
-            minimal_sufficient_weight,
-            sufficiency_margin,
         )
 
     @staticmethod
@@ -239,7 +186,7 @@ class CRAPipeline(BasePipeline):
         """
         if evidence_visual_token is None or question_state is None:
             raise ValueError(
-                "Q-Bound V1.7 weak alignment requires evidence_visual_token "
+                "Q-Bound V1.8 weak alignment requires evidence_visual_token "
                 "and qa_state."
             )
         if evidence_visual_token.ndim != 2 or question_state.ndim != 2:
@@ -298,14 +245,14 @@ class CRAPipeline(BasePipeline):
         decomp_loss = qbound_aux.get("decomp_loss")
         if not torch.is_tensor(decomp_loss):
             raise KeyError(
-                "Q-Bound V1.7 decomposition requires qbound_aux['decomp_loss']."
+                "Q-Bound V1.8 decomposition requires qbound_aux['decomp_loss']."
             )
 
         value = decomp_loss.mean()
 
         if not torch.isfinite(value):
             raise FloatingPointError(
-                "Q-Bound V1.7 decomposition loss is NaN/Inf."
+                "Q-Bound V1.8 decomposition loss is NaN/Inf."
             )
 
         return value
@@ -330,7 +277,7 @@ class CRAPipeline(BasePipeline):
         return 1.0 if self._qbound_enabled() else 0.0
 
     def _get_qbound_aux(self, gqa_output):
-        """Safely extract Q-Bound V1.7 outputs from a CRA VQA forward."""
+        """Safely extract Q-Bound V1.8 outputs from a CRA VQA forward."""
         if not self._qbound_enabled():
             return None
 
@@ -530,7 +477,7 @@ class CRAPipeline(BasePipeline):
         return 0.5 * (first_kl + second_kl)
 
     # ------------------------------------------------------------------
-    # Q-Bound V1.7 diagnostics
+    # Q-Bound V1.8 diagnostics
     # ------------------------------------------------------------------
     @staticmethod
     def _distribution_entropy(
@@ -554,23 +501,30 @@ class CRAPipeline(BasePipeline):
             dim=-1,
         )
 
-    def _compute_qbound_v17_diagnostics(
+    def _compute_qbound_v18_diagnostics(
         self,
         gqa_output,
         answer_proj,
         answer_id,
         main_logits,
+        raw_refined_logits=None,
         coarse_logits=None,
     ):
         """
-        V1.7 diagnostics only; no value returned here is added to total_loss.
+        Diagnostics only; nothing returned here is added to total_loss.
 
-        Main questions:
-          1) Does the refined answer branch preserve/improve coarse answer evidence?
-          2) How often is the refined branch sufficient relative to coarse?
-          3) Is expected refined length decreasing only on sufficient samples?
-          4) Are the stable routing invariants active?
-          5) How different are refined/coarse/CRA/historical temporal keys?
+        V1.8 separates three same-checkpoint branches:
+
+            MAIN        = uncertainty-calibrated
+            RAW REFINE  = V1.7-style fine proposal
+            COARSE      = COMPOSE support
+
+        The diagnostics answer:
+          1) whether calibration preserves answer evidence;
+          2) whether calibrated support lies between raw and coarse behavior;
+          3) how strongly the refiner is trusted;
+          4) whether temporal keys differ meaningfully;
+          5) whether V1.6/V1.7 routing mechanisms remain disabled.
         """
         qbound_aux = self._get_qbound_aux(gqa_output)
         if qbound_aux is None:
@@ -578,26 +532,47 @@ class CRAPipeline(BasePipeline):
 
         required_keys = {
             "cra_video_proj",
-            "qbound_refined_video_proj",
-            "qbound_coarse_video_proj",
             "main_video_proj",
+            "qbound_calibrated_video_proj",
+            "qbound_raw_refined_video_proj",
+            "qbound_coarse_video_proj",
+
             "cra_key",
-            "qbound_key",
+            "qbound_calibrated_key",
+            "qbound_raw_refined_key",
             "qbound_coarse_key",
             "final_key",
             "qbound_pre_smooth_key",
             "qbound_post_smooth_key",
-            "expected_refined_length_ratio",
+
+            "calibration_uncertainty",
+            "calibration_information",
+            "calibration_confidence",
+            "calibration_confidence_detached",
+
             "expected_refined_span_length",
+            "expected_refined_length_ratio",
+            "calibrated_expected_span_length",
+            "calibrated_expected_length_ratio",
+
+            "coarse_span_frame_length",
+            "refined_span_frame_length",
+            "calibrated_span_frame_length",
+            "calibrated_retained_fraction",
+
             "refine_coarse_detached",
             "all_span_refine_marginal_enabled",
+            "uncertainty_calibration_enabled",
+            "minimal_sufficient_enabled",
+
             "qbound_handover_enabled",
             "qbound_direct_reasoning_residual_enabled",
         }
+
         missing = sorted(required_keys.difference(qbound_aux))
         if missing:
             raise KeyError(
-                "Missing Q-Bound V1.7 diagnostic outputs: "
+                "Missing Q-Bound V1.8 diagnostic outputs: "
                 + ", ".join(missing)
             )
 
@@ -605,13 +580,24 @@ class CRAPipeline(BasePipeline):
             answer_id,
             answer_proj.device,
         )
+
         if main_logits.size(0) != labels.numel():
             raise ValueError(
-                "answer_id size does not match main VQA logits."
+                "answer_id size does not match calibrated MAIN logits."
             )
 
         with torch.no_grad():
-            refined_logits = main_logits.detach()
+            calibrated_logits = main_logits.detach()
+
+            if raw_refined_logits is None:
+                raw_refined_logits = self._score_answer_candidates(
+                    answer_proj=answer_proj,
+                    representation=qbound_aux[
+                        "qbound_raw_refined_video_proj"
+                    ],
+                    detach_answer=True,
+                )
+            raw_refined_logits = raw_refined_logits.detach()
 
             if coarse_logits is None:
                 coarse_logits = self._score_answer_candidates(
@@ -629,8 +615,13 @@ class CRAPipeline(BasePipeline):
                 detach_answer=True,
             )
 
-            refined_ce = F.cross_entropy(
-                refined_logits,
+            calibrated_ce = F.cross_entropy(
+                calibrated_logits,
+                labels,
+                reduction="none",
+            )
+            raw_refined_ce = F.cross_entropy(
+                raw_refined_logits,
                 labels,
                 reduction="none",
             )
@@ -645,65 +636,22 @@ class CRAPipeline(BasePipeline):
                 reduction="none",
             )
 
-            refined_pred = refined_logits.argmax(dim=-1)
+            calibrated_pred = calibrated_logits.argmax(dim=-1)
+            raw_refined_pred = raw_refined_logits.argmax(dim=-1)
             coarse_pred = coarse_logits.argmax(dim=-1)
             cra_pred = cra_logits.argmax(dim=-1)
 
-            refinement_cfg = (
-                self.cfgs.get("model", {})
-                .get("qbound", {})
-                .get("refinement", {})
+            calibrated_key = self._normalize_distribution(
+                qbound_aux["qbound_calibrated_key"]
             )
-            if not isinstance(refinement_cfg, dict):
-                refinement_cfg = {}
-            sufficiency_margin = float(
-                refinement_cfg.get("sufficiency_margin", 0.0)
-            )
-
-            sufficient_gate = (
-                refined_ce <= coarse_ce + sufficiency_margin
-            ).float()
-
-            expected_ratio = qbound_aux[
-                "expected_refined_length_ratio"
-            ].detach().float()
-            expected_length = qbound_aux[
-                "expected_refined_span_length"
-            ].detach().float()
-
-            sufficient_count = sufficient_gate.sum()
-            insufficient_gate = 1.0 - sufficient_gate
-
-            if sufficient_count.item() > 0:
-                sufficient_expected_ratio = (
-                    (sufficient_gate * expected_ratio).sum()
-                    / sufficient_count
-                )
-                sufficient_expected_length = (
-                    (sufficient_gate * expected_length).sum()
-                    / sufficient_count
-                )
-            else:
-                sufficient_expected_ratio = expected_ratio.new_tensor(0.0)
-                sufficient_expected_length = expected_length.new_tensor(0.0)
-
-            insufficient_count = insufficient_gate.sum()
-            if insufficient_count.item() > 0:
-                insufficient_expected_ratio = (
-                    (insufficient_gate * expected_ratio).sum()
-                    / insufficient_count
-                )
-            else:
-                insufficient_expected_ratio = expected_ratio.new_tensor(0.0)
-
-            cra_key = self._normalize_distribution(
-                qbound_aux["cra_key"]
-            )
-            refined_key = self._normalize_distribution(
-                qbound_aux["qbound_key"]
+            raw_refined_key = self._normalize_distribution(
+                qbound_aux["qbound_raw_refined_key"]
             )
             coarse_key = self._normalize_distribution(
                 qbound_aux["qbound_coarse_key"]
+            )
+            cra_key = self._normalize_distribution(
+                qbound_aux["cra_key"]
             )
             final_key = self._normalize_distribution(
                 qbound_aux["final_key"]
@@ -715,74 +663,154 @@ class CRAPipeline(BasePipeline):
                 qbound_aux["qbound_post_smooth_key"]
             )
 
-            cra_refined_js = self._js_divergence(
-                cra_key,
-                refined_key,
+            calibrated_raw_js = self._js_divergence(
+                calibrated_key,
+                raw_refined_key,
             ).mean()
-            coarse_refined_js = self._js_divergence(
+            calibrated_coarse_js = self._js_divergence(
+                calibrated_key,
                 coarse_key,
-                refined_key,
             ).mean()
-            coarse_refined_l1 = (
-                coarse_key - refined_key
+            raw_coarse_js = self._js_divergence(
+                raw_refined_key,
+                coarse_key,
+            ).mean()
+            cra_calibrated_js = self._js_divergence(
+                cra_key,
+                calibrated_key,
+            ).mean()
+
+            calibrated_raw_l1 = (
+                calibrated_key - raw_refined_key
             ).abs().mean()
+            calibrated_coarse_l1 = (
+                calibrated_key - coarse_key
+            ).abs().mean()
+            raw_coarse_l1 = (
+                raw_refined_key - coarse_key
+            ).abs().mean()
+
             pre_post_js = self._js_divergence(
                 pre_smooth_key,
                 post_smooth_key,
             ).mean()
-            refined_final_l1 = (
-                refined_key - final_key
+            final_l1 = (
+                calibrated_key - final_key
             ).abs().mean()
 
             v15_key_raw = qbound_aux.get("v15_diagnostic_key")
-            v17_v15_js = None
-            v17_v15_l1 = None
+            v18_v15_js = None
+            v18_v15_l1 = None
             if torch.is_tensor(v15_key_raw):
                 v15_key = self._normalize_distribution(v15_key_raw)
-                v17_v15_js = self._js_divergence(
-                    refined_key,
+                v18_v15_js = self._js_divergence(
+                    calibrated_key,
                     v15_key,
                 ).mean()
-                v17_v15_l1 = (
-                    refined_key - v15_key
+                v18_v15_l1 = (
+                    calibrated_key - v15_key
                 ).abs().mean()
 
             v14_key_raw = qbound_aux.get("v14_diagnostic_key")
-            v17_v14_js = None
-            v17_v14_l1 = None
+            v18_v14_js = None
+            v18_v14_l1 = None
             if torch.is_tensor(v14_key_raw):
                 v14_key = self._normalize_distribution(v14_key_raw)
-                v17_v14_js = self._js_divergence(
-                    refined_key,
+                v18_v14_js = self._js_divergence(
+                    calibrated_key,
                     v14_key,
                 ).mean()
-                v17_v14_l1 = (
-                    refined_key - v14_key
+                v18_v14_l1 = (
+                    calibrated_key - v14_key
                 ).abs().mean()
 
-            refined_entropy = self._distribution_entropy(refined_key)
-            coarse_entropy = self._distribution_entropy(coarse_key)
-            cra_entropy = self._distribution_entropy(cra_key)
+            calibrated_entropy = self._distribution_entropy(
+                calibrated_key
+            )
+            raw_refined_entropy = self._distribution_entropy(
+                raw_refined_key
+            )
+            coarse_entropy = self._distribution_entropy(
+                coarse_key
+            )
+            cra_entropy = self._distribution_entropy(
+                cra_key
+            )
 
             valid_length = torch.full(
-                (refined_key.size(0),),
-                float(refined_key.size(-1)),
-                dtype=refined_key.dtype,
-                device=refined_key.device,
+                (calibrated_key.size(0),),
+                float(calibrated_key.size(-1)),
+                dtype=calibrated_key.dtype,
+                device=calibrated_key.device,
             ).clamp_min(2.0)
             uniform_entropy = torch.log(valid_length)
 
-            refined_peak = refined_key.max(dim=-1).values
+            calibrated_peak = calibrated_key.max(dim=-1).values
+            raw_refined_peak = raw_refined_key.max(dim=-1).values
             coarse_peak = coarse_key.max(dim=-1).values
 
-            refined_coarse_ce_gain = coarse_ce - refined_ce
-            refined_cra_ce_gain = cra_ce - refined_ce
+            uncertainty = qbound_aux[
+                "calibration_uncertainty"
+            ].detach().float()
+            information = qbound_aux[
+                "calibration_information"
+            ].detach().float()
+            confidence = qbound_aux[
+                "calibration_confidence"
+            ].detach().float()
+
+            coarse_length = qbound_aux[
+                "coarse_span_frame_length"
+            ].detach().float()
+            raw_hard_length = qbound_aux[
+                "refined_span_frame_length"
+            ].detach().float()
+            raw_expected_length = qbound_aux[
+                "expected_refined_span_length"
+            ].detach().float()
+            raw_expected_ratio = qbound_aux[
+                "expected_refined_length_ratio"
+            ].detach().float()
+
+            calibrated_hard_length = qbound_aux[
+                "calibrated_span_frame_length"
+            ].detach().float()
+            calibrated_expected_length = qbound_aux[
+                "calibrated_expected_span_length"
+            ].detach().float()
+            calibrated_expected_ratio = qbound_aux[
+                "calibrated_expected_length_ratio"
+            ].detach().float()
+            calibrated_retained = qbound_aux[
+                "calibrated_retained_fraction"
+            ].detach().float()
+
+            between_raw_and_coarse = (
+                (calibrated_hard_length >= raw_hard_length)
+                & (calibrated_hard_length <= coarse_length)
+            ).float()
+
+            raw_point_ratio = (
+                raw_hard_length <= 1.0
+            ).float().mean()
+            calibrated_point_ratio = (
+                calibrated_hard_length <= 1.0
+            ).float().mean()
 
             coarse_detached = self._scalar_mean(
                 qbound_aux.get("refine_coarse_detached")
             )
             all_span_enabled = self._scalar_mean(
                 qbound_aux.get("all_span_refine_marginal_enabled")
+            )
+            uncertainty_enabled = self._scalar_mean(
+                qbound_aux.get("uncertainty_calibration_enabled")
+            )
+            minimality_enabled = self._scalar_mean(
+                qbound_aux.get("minimal_sufficient_enabled")
+            )
+            confidence_detached = self._scalar_mean(
+                qbound_aux.get("calibration_confidence_detached")
             )
             handover_enabled = self._scalar_mean(
                 qbound_aux.get("qbound_handover_enabled")
@@ -794,8 +822,15 @@ class CRAPipeline(BasePipeline):
             )
 
         diagnostics = {
-            "qbound_refined_acc": (
-                (refined_pred == labels).float().mean().item()
+            # Answer behavior.
+            "qbound_main_acc": (
+                (calibrated_pred == labels).float().mean().item()
+            ),
+            "qbound_calibrated_acc": (
+                (calibrated_pred == labels).float().mean().item()
+            ),
+            "qbound_raw_refined_acc": (
+                (raw_refined_pred == labels).float().mean().item()
             ),
             "qbound_coarse_acc": (
                 (coarse_pred == labels).float().mean().item()
@@ -804,85 +839,146 @@ class CRAPipeline(BasePipeline):
                 (cra_pred == labels).float().mean().item()
             ),
 
-            # Compatibility: main == refined.
-            "qbound_main_acc": (
-                (refined_pred == labels).float().mean().item()
-            ),
-
-            "qbound_refined_ce": refined_ce.mean().item(),
+            "qbound_main_ce": calibrated_ce.mean().item(),
+            "qbound_calibrated_ce": calibrated_ce.mean().item(),
+            "qbound_raw_refined_ce": raw_refined_ce.mean().item(),
             "qbound_coarse_ce": coarse_ce.mean().item(),
             "qbound_cra_diagnostic_ce": cra_ce.mean().item(),
-            "qbound_main_ce": refined_ce.mean().item(),
 
-            "qbound_refined_minus_coarse_ce": (
-                (refined_ce - coarse_ce).mean().item()
+            "qbound_calibrated_vs_raw_ce_gain": (
+                (raw_refined_ce - calibrated_ce).mean().item()
             ),
-            "qbound_refined_vs_coarse_ce_gain": (
-                refined_coarse_ce_gain.mean().item()
+            "qbound_calibrated_vs_coarse_ce_gain": (
+                (coarse_ce - calibrated_ce).mean().item()
             ),
-            "qbound_refined_vs_cra_ce_gain": (
-                refined_cra_ce_gain.mean().item()
+            "qbound_calibrated_vs_cra_ce_gain": (
+                (cra_ce - calibrated_ce).mean().item()
             ),
-            "qbound_refined_beats_coarse_ratio": (
-                (refined_ce < coarse_ce).float().mean().item()
+            "qbound_calibrated_beats_raw_ratio": (
+                (calibrated_ce < raw_refined_ce).float().mean().item()
             ),
-            "qbound_refined_beats_cra_ratio": (
-                (refined_ce < cra_ce).float().mean().item()
+            "qbound_calibrated_beats_coarse_ratio": (
+                (calibrated_ce < coarse_ce).float().mean().item()
+            ),
+            "qbound_calibrated_beats_cra_ratio": (
+                (calibrated_ce < cra_ce).float().mean().item()
             ),
 
-            # Minimal-sufficient diagnostics.
-            "qbound_sufficient_ratio": sufficient_gate.mean().item(),
-            "qbound_expected_refined_length_ratio": (
-                expected_ratio.mean().item()
+            # Calibration behavior.
+            "qbound_calibration_uncertainty": uncertainty.mean().item(),
+            "qbound_calibration_information": information.mean().item(),
+            "qbound_calibration_confidence": confidence.mean().item(),
+            "qbound_calibration_confidence_min": confidence.min().item(),
+            "qbound_calibration_confidence_max": confidence.max().item(),
+            "qbound_calibration_confidence_std": (
+                confidence.std(unbiased=False).item()
             ),
-            "qbound_expected_refined_span_length": (
-                expected_length.mean().item()
+
+            # Span hierarchy.
+            "qbound_coarse_span_frame_length_diag": (
+                coarse_length.mean().item()
             ),
-            "qbound_sufficient_expected_length_ratio": (
-                sufficient_expected_ratio.item()
+            "qbound_raw_refined_hard_span_length": (
+                raw_hard_length.mean().item()
             ),
-            "qbound_sufficient_expected_span_length": (
-                sufficient_expected_length.item()
+            "qbound_raw_refined_expected_span_length": (
+                raw_expected_length.mean().item()
             ),
-            "qbound_insufficient_expected_length_ratio": (
-                insufficient_expected_ratio.item()
+            "qbound_raw_refined_expected_length_ratio": (
+                raw_expected_ratio.mean().item()
+            ),
+            "qbound_calibrated_hard_span_length": (
+                calibrated_hard_length.mean().item()
+            ),
+            "qbound_calibrated_expected_span_length": (
+                calibrated_expected_length.mean().item()
+            ),
+            "qbound_calibrated_expected_length_ratio": (
+                calibrated_expected_ratio.mean().item()
+            ),
+            "qbound_calibrated_retained_fraction": (
+                calibrated_retained.mean().item()
+            ),
+            "qbound_calibrated_between_raw_coarse_ratio": (
+                between_raw_and_coarse.mean().item()
+            ),
+            "qbound_raw_refined_point_span_ratio": (
+                raw_point_ratio.item()
+            ),
+            "qbound_calibrated_point_span_ratio": (
+                calibrated_point_ratio.item()
             ),
 
             # Key behavior.
-            "qbound_cra_refined_js": cra_refined_js.item(),
-            "qbound_coarse_refined_js": coarse_refined_js.item(),
-            "qbound_coarse_refined_l1": coarse_refined_l1.item(),
+            "qbound_cra_calibrated_js": cra_calibrated_js.item(),
+            "qbound_calibrated_raw_js": calibrated_raw_js.item(),
+            "qbound_calibrated_coarse_js": calibrated_coarse_js.item(),
+            "qbound_raw_coarse_js": raw_coarse_js.item(),
+            "qbound_calibrated_raw_l1": calibrated_raw_l1.item(),
+            "qbound_calibrated_coarse_l1": calibrated_coarse_l1.item(),
+            "qbound_raw_coarse_l1": raw_coarse_l1.item(),
             "qbound_pre_post_smooth_js": pre_post_js.item(),
-            "qbound_qbound_final_l1": refined_final_l1.item(),
+            "qbound_qbound_final_l1": final_l1.item(),
 
-            "qbound_refined_key_entropy": refined_entropy.mean().item(),
+            "qbound_key_entropy": calibrated_entropy.mean().item(),
+            "qbound_calibrated_key_entropy": (
+                calibrated_entropy.mean().item()
+            ),
+            "qbound_raw_refined_key_entropy": (
+                raw_refined_entropy.mean().item()
+            ),
             "qbound_coarse_key_entropy": coarse_entropy.mean().item(),
             "qbound_cra_key_entropy": cra_entropy.mean().item(),
-            "qbound_refined_key_entropy_ratio": (
-                (refined_entropy / uniform_entropy.clamp_min(1e-6))
-                .mean().item()
+
+            "qbound_key_entropy_ratio": (
+                (
+                    calibrated_entropy
+                    / uniform_entropy.clamp_min(1e-6)
+                ).mean().item()
+            ),
+            "qbound_calibrated_key_entropy_ratio": (
+                (
+                    calibrated_entropy
+                    / uniform_entropy.clamp_min(1e-6)
+                ).mean().item()
+            ),
+            "qbound_raw_refined_key_entropy_ratio": (
+                (
+                    raw_refined_entropy
+                    / uniform_entropy.clamp_min(1e-6)
+                ).mean().item()
             ),
             "qbound_coarse_key_entropy_ratio": (
-                (coarse_entropy / uniform_entropy.clamp_min(1e-6))
-                .mean().item()
+                (
+                    coarse_entropy
+                    / uniform_entropy.clamp_min(1e-6)
+                ).mean().item()
             ),
-            "qbound_refined_key_max": refined_peak.mean().item(),
+
+            "qbound_key_max": calibrated_peak.mean().item(),
+            "qbound_calibrated_key_max": calibrated_peak.mean().item(),
+            "qbound_raw_refined_key_max": raw_refined_peak.mean().item(),
             "qbound_coarse_key_max": coarse_peak.mean().item(),
 
-            # Compatibility aliases for previous plots.
-            "qbound_key_entropy": refined_entropy.mean().item(),
-            "qbound_key_entropy_ratio": (
-                (refined_entropy / uniform_entropy.clamp_min(1e-6))
-                .mean().item()
-            ),
-            "qbound_key_max": refined_peak.mean().item(),
-
-            # Stable-routing invariants.
+            # Routing invariants.
             "qbound_refine_coarse_detached": (
                 0.0 if coarse_detached is None else float(coarse_detached)
             ),
             "qbound_all_span_refine_marginal_enabled": (
                 0.0 if all_span_enabled is None else float(all_span_enabled)
+            ),
+            "qbound_uncertainty_calibration_enabled": (
+                0.0
+                if uncertainty_enabled is None
+                else float(uncertainty_enabled)
+            ),
+            "qbound_minimal_sufficient_enabled": (
+                0.0 if minimality_enabled is None else float(minimality_enabled)
+            ),
+            "qbound_calibration_confidence_detached": (
+                0.0
+                if confidence_detached is None
+                else float(confidence_detached)
             ),
             "qbound_handover_enabled": (
                 0.0 if handover_enabled is None else float(handover_enabled)
@@ -894,15 +990,15 @@ class CRAPipeline(BasePipeline):
             ),
         }
 
-        if v17_v15_js is not None:
-            diagnostics["qbound_v17_v15_key_js"] = v17_v15_js.item()
-        if v17_v15_l1 is not None:
-            diagnostics["qbound_v17_v15_key_l1"] = v17_v15_l1.item()
+        if v18_v15_js is not None:
+            diagnostics["qbound_v18_v15_key_js"] = v18_v15_js.item()
+        if v18_v15_l1 is not None:
+            diagnostics["qbound_v18_v15_key_l1"] = v18_v15_l1.item()
 
-        if v17_v14_js is not None:
-            diagnostics["qbound_v17_v14_key_js"] = v17_v14_js.item()
-        if v17_v14_l1 is not None:
-            diagnostics["qbound_v17_v14_key_l1"] = v17_v14_l1.item()
+        if v18_v14_js is not None:
+            diagnostics["qbound_v18_v14_key_js"] = v18_v14_js.item()
+        if v18_v14_l1 is not None:
+            diagnostics["qbound_v18_v14_key_l1"] = v18_v14_l1.item()
 
         return diagnostics
 
@@ -942,33 +1038,71 @@ class CRAPipeline(BasePipeline):
             return stats
 
         # ----------------------------------------------------------
-        # V1.7 stable-route / minimal-sufficient core statistics.
+        # V1.8 uncertainty-calibration / routing statistics.
         # ----------------------------------------------------------
-        v17_scalar_keys = [
+        v18_scalar_keys = [
             "stable_refiner_enabled",
+            "uncertainty_calibration_enabled",
+            "minimal_sufficient_enabled",
             "all_span_refine_marginal_enabled",
             "refine_hard_coarse_route",
             "refine_coarse_detached",
+
+            "calibration_uncertainty",
+            "calibration_information",
+            "calibration_confidence",
+            "calibration_confidence_detached",
+
             "refine_selected_pair_candidate_count",
             "refine_selected_pair_entropy_ratio",
+
             "expected_refined_span_length",
             "expected_refined_length_ratio",
             "expected_refined_span_fraction",
             "expected_refine_trim_fraction",
-            "coarse_refined_key_l1",
+
+            "calibrated_expected_span_length",
+            "calibrated_expected_length_ratio",
+            "calibrated_span_frame_length",
+            "calibrated_span_fraction",
+            "calibrated_retained_fraction",
+            "calibrated_trim_left_frames",
+            "calibrated_trim_right_frames",
+            "calibrated_trim_total_frames",
+            "calibrated_inside_coarse",
+
+            "cra_qbound_key_l1",
+            "coarse_calibrated_key_l1",
+            "raw_refined_calibrated_key_l1",
+            "coarse_raw_refined_key_l1",
         ]
-        for key in v17_scalar_keys:
+
+        for key in v18_scalar_keys:
             scalar = self._scalar_mean(qbound_aux.get(key))
             if scalar is not None:
                 stats[f"qbound_{key}"] = scalar
 
-        v17_prefixed_keys = [
+        v18_prefixed_keys = [
             "qbound_stable_refiner_enabled",
+            "qbound_uncertainty_calibration_enabled",
+            "qbound_minimal_sufficient_enabled",
+
+            "qbound_calibrated_span_enabled",
+            "qbound_calibrated_span_length",
+            "qbound_calibrated_span_fraction",
+            "qbound_calibrated_span_key_mass",
+
+            "qbound_raw_refined_span_enabled",
+            "qbound_raw_refined_span_length",
+            "qbound_raw_refined_span_fraction",
+            "qbound_raw_refined_span_key_mass",
+
             "qbound_coarse_span_length",
             "qbound_coarse_span_fraction",
             "qbound_coarse_span_key_mass",
         ]
-        for key in v17_prefixed_keys:
+
+        for key in v18_prefixed_keys:
             scalar = self._scalar_mean(qbound_aux.get(key))
             if scalar is not None:
                 stats[key] = scalar
@@ -1179,7 +1313,7 @@ class CRAPipeline(BasePipeline):
             )
 
         # ----------------------------------------------------------
-        # V1.7 STABLE REFINE: frame-level boundary diagnostics.
+        # V1.8 RAW REFINE + calibrated boundary diagnostics.
         # ----------------------------------------------------------
         refiner_scalar_keys = [
             "refine_expected_pair_entropy",
@@ -1197,6 +1331,23 @@ class CRAPipeline(BasePipeline):
             "refine_trim_total_frames",
             "refine_retained_fraction",
             "refined_inside_coarse",
+
+            # V1.8 calibrated interval.
+            "calibrated_expected_span_length",
+            "calibrated_expected_length_ratio",
+            "calibrated_span_frame_length",
+            "calibrated_span_fraction",
+            "calibrated_retained_fraction",
+            "calibrated_trim_left_frames",
+            "calibrated_trim_right_frames",
+            "calibrated_trim_total_frames",
+            "calibrated_inside_coarse",
+
+            # Calibration.
+            "calibration_uncertainty",
+            "calibration_information",
+            "calibration_confidence",
+
             "refiner_temperature",
         ]
 
@@ -1205,12 +1356,32 @@ class CRAPipeline(BasePipeline):
             if scalar is not None:
                 stats[f"qbound_{key}"] = scalar
 
-        # Adapter-level coarse/fine diagnostics. These are already prefixed.
+        # Adapter-level calibrated/raw/coarse diagnostics.
         refiner_adapter_keys = [
+            # Compatibility refined == calibrated MAIN.
             "qbound_refined_span_enabled",
             "qbound_refined_span_length",
             "qbound_refined_span_fraction",
             "qbound_refined_span_key_mass",
+
+            # Explicit calibrated branch.
+            "qbound_calibrated_span_enabled",
+            "qbound_calibrated_span_length",
+            "qbound_calibrated_span_fraction",
+            "qbound_calibrated_span_key_mass",
+
+            # Explicit raw-refined branch.
+            "qbound_raw_refined_span_enabled",
+            "qbound_raw_refined_span_length",
+            "qbound_raw_refined_span_fraction",
+            "qbound_raw_refined_span_key_mass",
+
+            # Explicit coarse branch.
+            "qbound_coarse_span_length",
+            "qbound_coarse_span_fraction",
+            "qbound_coarse_span_key_mass",
+
+            # Same calibrated key + alternate hard readouts.
             "qbound_coarse_v15_span_length",
             "qbound_coarse_v15_span_fraction",
             "qbound_coarse_v15_span_key_mass",
@@ -1240,6 +1411,27 @@ class CRAPipeline(BasePipeline):
             )
             stats["qbound_refined_span_frame_length_max"] = (
                 values.max().item()
+            )
+
+        calibrated_length = qbound_aux.get(
+            "calibrated_span_frame_length"
+        )
+        if torch.is_tensor(calibrated_length):
+            values = calibrated_length.detach().float()
+            stats["qbound_calibrated_span_frame_length_min"] = (
+                values.min().item()
+            )
+            stats["qbound_calibrated_span_frame_length_max"] = (
+                values.max().item()
+            )
+            stats["qbound_calibrated_point_span_ratio"] = (
+                (values <= 1.0).float().mean().item()
+            )
+
+        if torch.is_tensor(refined_length):
+            values = refined_length.detach().float()
+            stats["qbound_raw_refined_point_span_ratio"] = (
+                (values <= 1.0).float().mean().item()
             )
 
         trim_total = qbound_aux.get("refine_trim_total_frames")
@@ -1593,7 +1785,7 @@ class CRAPipeline(BasePipeline):
                 )
 
         # ----------------------------------------------------------
-        # Frame-evidence scale and smoothing.
+        # Frame-evidence scale and calibrated-MAIN smoothing.
         # ----------------------------------------------------------
         frame_semantic_logits = qbound_aux.get(
             "frame_semantic_logits"
@@ -1669,13 +1861,15 @@ class CRAPipeline(BasePipeline):
 
     def _qbound_component_grad_norms(self):
         """
-        Diagnostic gradient norms for the two V1.7 trainable responsibilities.
+        Diagnostic gradient norms for V1.8.
 
-        ``composer`` checks span_composer_score, which should receive the explicit
-        coarse VQA task signal.
+        ``composer`` checks span_composer_score. It should receive the MAIN
+        calibrated VQA signal through the differentiable coarse component.
 
-        ``refiner`` checks boundary_refine_encoder/start/end, which should receive
-        the refined main task and minimal-sufficient signal.
+        ``refiner`` checks boundary_refine_encoder/start/end. It should receive
+        the same MAIN calibrated VQA signal through the raw-fine component.
+
+        There is no separate coarse task loss and no minimal-sufficient loss.
         """
         if not self._qbound_enabled():
             return {
@@ -1873,9 +2067,6 @@ class CRAPipeline(BasePipeline):
                 "qbound_refined_trimmed_frame_count",
                 "qbound_composer_grad_norm",
                 "qbound_refiner_grad_norm",
-                "qbound_coarse_task_weight",
-                "qbound_minimal_sufficient_weight",
-                "qbound_sufficiency_margin",
                 "qbound_refined_acc",
                 "qbound_coarse_acc",
                 "qbound_refined_ce",
@@ -1883,12 +2074,8 @@ class CRAPipeline(BasePipeline):
                 "qbound_refined_minus_coarse_ce",
                 "qbound_refined_vs_coarse_ce_gain",
                 "qbound_refined_beats_coarse_ratio",
-                "qbound_sufficient_ratio",
                 "qbound_expected_refined_length_ratio",
                 "qbound_expected_refined_span_length",
-                "qbound_sufficient_expected_length_ratio",
-                "qbound_sufficient_expected_span_length",
-                "qbound_insufficient_expected_length_ratio",
                 "qbound_cra_refined_js",
                 "qbound_coarse_refined_js",
                 "qbound_coarse_refined_l1",
@@ -1909,10 +2096,61 @@ class CRAPipeline(BasePipeline):
                 "qbound_coarse_span_length",
                 "qbound_coarse_span_fraction",
                 "qbound_coarse_span_key_mass",
-                "qbound_v17_v15_key_js",
-                "qbound_v17_v15_key_l1",
-                "qbound_v17_v14_key_js",
-                "qbound_v17_v14_key_l1",
+                "qbound_calibrated_acc",
+                "qbound_raw_refined_acc",
+                "qbound_calibrated_ce",
+                "qbound_raw_refined_ce",
+                "qbound_calibrated_vs_raw_ce_gain",
+                "qbound_calibrated_vs_coarse_ce_gain",
+                "qbound_calibrated_vs_cra_ce_gain",
+                "qbound_calibrated_beats_raw_ratio",
+                "qbound_calibrated_beats_coarse_ratio",
+                "qbound_calibrated_beats_cra_ratio",
+                "qbound_calibration_uncertainty",
+                "qbound_calibration_information",
+                "qbound_calibration_confidence",
+                "qbound_calibration_confidence_min",
+                "qbound_calibration_confidence_max",
+                "qbound_calibration_confidence_std",
+                "qbound_calibration_confidence_detached",
+                "qbound_uncertainty_calibration_enabled",
+                "qbound_minimal_sufficient_enabled",
+                "qbound_coarse_span_frame_length_diag",
+                "qbound_raw_refined_hard_span_length",
+                "qbound_raw_refined_expected_span_length",
+                "qbound_raw_refined_expected_length_ratio",
+                "qbound_calibrated_hard_span_length",
+                "qbound_calibrated_expected_span_length",
+                "qbound_calibrated_expected_length_ratio",
+                "qbound_calibrated_span_frame_length",
+                "qbound_calibrated_span_frame_length_min",
+                "qbound_calibrated_span_frame_length_max",
+                "qbound_calibrated_span_fraction",
+                "qbound_calibrated_retained_fraction",
+                "qbound_calibrated_between_raw_coarse_ratio",
+                "qbound_raw_refined_point_span_ratio",
+                "qbound_calibrated_point_span_ratio",
+                "qbound_calibrated_trim_left_frames",
+                "qbound_calibrated_trim_right_frames",
+                "qbound_calibrated_trim_total_frames",
+                "qbound_calibrated_inside_coarse",
+                "qbound_cra_calibrated_js",
+                "qbound_calibrated_raw_js",
+                "qbound_calibrated_coarse_js",
+                "qbound_raw_coarse_js",
+                "qbound_calibrated_raw_l1",
+                "qbound_calibrated_coarse_l1",
+                "qbound_raw_coarse_l1",
+                "qbound_calibrated_key_entropy",
+                "qbound_raw_refined_key_entropy",
+                "qbound_calibrated_key_entropy_ratio",
+                "qbound_raw_refined_key_entropy_ratio",
+                "qbound_calibrated_key_max",
+                "qbound_raw_refined_key_max",
+                "qbound_v18_v15_key_js",
+                "qbound_v18_v15_key_l1",
+                "qbound_v18_v14_key_js",
+                "qbound_v18_v14_key_l1",
         ]
 
         # ------------------------------------------------------------------
@@ -1924,20 +2162,19 @@ class CRAPipeline(BasePipeline):
         qbound_mix=1.0,
     ):
         """
-        V1.7 objective:
+        V1.8 objective:
 
             L =
-                L_CRA/main-refined-task
+                L_CRA/main_calibrated_task
                 + lambda_align * L_weak_align
                 + lambda_decomp * L_decomp
-                + lambda_coarse * L_coarse_VQA
-                + lambda_ms * L_minimal_sufficient
 
-        Minimality is applied only when the refined answer CE is no worse than
-        the coarse answer CE (within an optional non-negative margin).
+        The MAIN calibrated probability itself provides task gradients to both:
+            Composer -> through the coarse mixture component
+            Refiner  -> through the raw fine mixture component
 
-        No temporal GT, IoU/IoP loss, entropy loss, fixed duration target, or
-        trim target is used.
+        No separate coarse VQA loss, minimal-sufficient loss, temporal GT,
+        IoU/IoP loss, entropy loss, or target duration is used.
         """
         del qbound_mix
 
@@ -2021,7 +2258,7 @@ class CRAPipeline(BasePipeline):
             )
 
         # ----------------------------------------------------------
-        # MAIN VQA: V1.7 refined branch.
+        # MAIN VQA: V1.8 uncertainty-calibrated branch.
         # ----------------------------------------------------------
         gqa_output = self.model(
             video_frames,
@@ -2038,13 +2275,13 @@ class CRAPipeline(BasePipeline):
         main_video_proj = gqa_output[0]
         answer_proj = gqa_output[1]
 
-        refined_logits = self._score_answer_candidates(
+        calibrated_logits = self._score_answer_candidates(
             answer_proj=answer_proj,
             representation=main_video_proj,
             detach_answer=False,
         )
 
-        prediction_dict["vqa_pred"] = refined_logits
+        prediction_dict["vqa_pred"] = calibrated_logits
         target_dict["vqa_target"] = answer_id_device
 
         prediction_dict["vqa_align_pred"] = (
@@ -2054,21 +2291,16 @@ class CRAPipeline(BasePipeline):
             gqa_output[2]["align_gt"]
         )
 
-        # Preserve the repository CRA task objective exactly for MAIN refined path.
+        # Preserve the repository CRA task objective for the official MAIN path.
         loss = self.criterion(
             prediction_dict,
             target_dict,
         )
 
         weak_align_retrieval_acc = None
-
         align_weight = 0.0
         decomp_weight = 0.0
-        coarse_task_weight = 0.0
-        minimal_sufficient_weight = 0.0
-        sufficiency_margin = 0.0
 
-        coarse_logits = None
         qbound_aux = self._get_qbound_aux(gqa_output)
 
         if self._qbound_enabled() and qbound_aux is not None:
@@ -2076,10 +2308,26 @@ class CRAPipeline(BasePipeline):
                 align_weight,
                 align_temperature,
                 decomp_weight,
-                coarse_task_weight,
-                minimal_sufficient_weight,
-                sufficiency_margin,
-            ) = self._qbound_v17_loss_settings()
+            ) = self._qbound_v18_loss_settings()
+
+            # Fail fast if a V1.7 objective/routing mechanism is accidentally on.
+            minimality_flag = qbound_aux.get(
+                "minimal_sufficient_enabled"
+            )
+            if torch.is_tensor(minimality_flag):
+                if float(minimality_flag.detach().item()) != 0.0:
+                    raise RuntimeError(
+                        "Q-Bound V1.8 must disable minimal-sufficient routing."
+                    )
+
+            uncertainty_flag = qbound_aux.get(
+                "uncertainty_calibration_enabled"
+            )
+            if torch.is_tensor(uncertainty_flag):
+                if float(uncertainty_flag.detach().item()) != 1.0:
+                    raise RuntimeError(
+                        "Q-Bound V1.8 requires uncertainty calibration."
+                    )
 
             # ------------------------------------------------------
             # Weak question/event semantic alignment.
@@ -2102,7 +2350,7 @@ class CRAPipeline(BasePipeline):
                 )
 
             # ------------------------------------------------------
-            # Latent DECOMPOSE objective retained unchanged.
+            # Dynamic latent DECOMPOSE objective: unchanged.
             # ------------------------------------------------------
             if decomp_weight > 0.0:
                 qbound_decomp_loss = (
@@ -2114,108 +2362,41 @@ class CRAPipeline(BasePipeline):
                     + decomp_weight * qbound_decomp_loss
                 )
 
-            # ------------------------------------------------------
-            # V1.7 differentiable COARSE Composer task supervision.
-            #
-            # Candidate embeddings are detached for this auxiliary branch so it
-            # does not train the language/answer side a second time. The video /
-            # temporal branch remains differentiable.
-            # ------------------------------------------------------
-            coarse_video_proj = qbound_aux.get(
+        # ----------------------------------------------------------
+        # Diagnostic answer branches only. These outputs are already
+        # detached/no-grad in the decoder and never enter total_loss.
+        # ----------------------------------------------------------
+        raw_refined_logits = None
+        coarse_logits = None
+
+        if self._qbound_enabled() and qbound_aux is not None:
+            raw_refined_proj = qbound_aux.get(
+                "qbound_raw_refined_video_proj"
+            )
+            coarse_proj = qbound_aux.get(
                 "qbound_coarse_video_proj"
             )
-            if not torch.is_tensor(coarse_video_proj):
-                raise KeyError(
-                    "V1.7 requires qbound_coarse_video_proj for "
-                    "Composer task supervision."
+
+            if torch.is_tensor(raw_refined_proj):
+                raw_refined_logits = self._score_answer_candidates(
+                    answer_proj=answer_proj,
+                    representation=raw_refined_proj,
+                    detach_answer=True,
                 )
 
-            coarse_logits = self._score_answer_candidates(
-                answer_proj=answer_proj,
-                representation=coarse_video_proj,
-                detach_answer=True,
-            )
-
-            coarse_ce_per_sample = F.cross_entropy(
-                coarse_logits,
-                answer_id_device,
-                reduction="none",
-            )
-            coarse_task_loss = coarse_ce_per_sample.mean()
-
-            if coarse_task_weight > 0.0:
-                loss["qbound_coarse_task_loss"] = coarse_task_loss
-                loss["total_loss"] = (
-                    loss["total_loss"]
-                    + coarse_task_weight * coarse_task_loss
+            if torch.is_tensor(coarse_proj):
+                coarse_logits = self._score_answer_candidates(
+                    answer_proj=answer_proj,
+                    representation=coarse_proj,
+                    detach_answer=True,
                 )
 
-            # ------------------------------------------------------
-            # V1.7 minimal-sufficient refinement.
-            #
-            # MAIN refined CE already enforces answer sufficiency.
-            # The detached gate decides whether minimality is currently safe.
-            # ------------------------------------------------------
-            expected_length_ratio = qbound_aux.get(
-                "expected_refined_length_ratio"
-            )
-            if not torch.is_tensor(expected_length_ratio):
-                raise KeyError(
-                    "V1.7 requires expected_refined_length_ratio."
-                )
-
-            expected_length_ratio = expected_length_ratio.reshape(-1)
-            if expected_length_ratio.numel() != batch_size:
-                raise ValueError(
-                    "expected_refined_length_ratio must have one value "
-                    "per sample."
-                )
-            if not torch.isfinite(expected_length_ratio).all():
-                raise FloatingPointError(
-                    "expected_refined_length_ratio contains NaN/Inf."
-                )
-
-            refined_ce_per_sample = F.cross_entropy(
-                refined_logits,
-                answer_id_device,
-                reduction="none",
-            )
-
-            sufficient_gate = (
-                refined_ce_per_sample.detach()
-                <= coarse_ce_per_sample.detach() + sufficiency_margin
-            ).to(expected_length_ratio.dtype)
-
-            sufficient_count = sufficient_gate.sum()
-
-            if sufficient_count.item() > 0:
-                minimal_sufficient_loss = (
-                    sufficient_gate * expected_length_ratio
-                ).sum() / sufficient_count
-            else:
-                # Differentiable zero connected to the refiner statistic.
-                minimal_sufficient_loss = (
-                    expected_length_ratio.sum() * 0.0
-                )
-
-            if minimal_sufficient_weight > 0.0:
-                loss["qbound_minimal_sufficient_loss"] = (
-                    minimal_sufficient_loss
-                )
-                loss["total_loss"] = (
-                    loss["total_loss"]
-                    + minimal_sufficient_weight
-                    * minimal_sufficient_loss
-                )
-
-        # ----------------------------------------------------------
-        # Diagnostics only.
-        # ----------------------------------------------------------
-        qbound_logs = self._compute_qbound_v17_diagnostics(
+        qbound_logs = self._compute_qbound_v18_diagnostics(
             gqa_output=gqa_output,
             answer_proj=answer_proj,
             answer_id=answer_id,
-            main_logits=refined_logits,
+            main_logits=calibrated_logits,
+            raw_refined_logits=raw_refined_logits,
             coarse_logits=coarse_logits,
         )
 
@@ -2226,22 +2407,13 @@ class CRAPipeline(BasePipeline):
             qbound_logs["qbound_decomp_weight"] = float(
                 decomp_weight
             )
-            qbound_logs["qbound_coarse_task_weight"] = float(
-                coarse_task_weight
-            )
-            qbound_logs["qbound_minimal_sufficient_weight"] = float(
-                minimal_sufficient_weight
-            )
-            qbound_logs["qbound_sufficiency_margin"] = float(
-                sufficiency_margin
-            )
 
             if weak_align_retrieval_acc is not None:
                 qbound_logs[
                     "qbound_weak_align_retrieval_acc"
                 ] = float(weak_align_retrieval_acc)
 
-        predicted = refined_logits.argmax(dim=-1).detach().cpu()
+        predicted = calibrated_logits.argmax(dim=-1).detach().cpu()
         running_accuracy = (
             predicted == answer_id.reshape(-1).cpu()
         ).float().mean().item()
@@ -2280,8 +2452,6 @@ class CRAPipeline(BasePipeline):
         if self._qbound_enabled():
             self.monitor.reset_kv("qbound_align_loss")
             self.monitor.reset_kv("qbound_decomp_loss")
-            self.monitor.reset_kv("qbound_coarse_task_loss")
-            self.monitor.reset_kv("qbound_minimal_sufficient_loss")
             for key in self._qbound_monitor_keys():
                 self.monitor.reset_kv(key)
 
@@ -2456,18 +2626,22 @@ class CRAPipeline(BasePipeline):
 
         def _print_readouts(split_prefix):
             display_names = [
-                ("pre-hoc", "V1.7 refined MAIN"),
+                ("pre-hoc", "V1.8 calibrated MAIN"),
+                (
+                    "raw-refined",
+                    "raw V1.7-style REFINE diagnostic",
+                ),
                 (
                     "coarse-branch",
-                    "V1.7 differentiable COMPOSE coarse branch",
+                    "COMPOSE coarse diagnostic",
                 ),
                 (
                     "coarse-readout",
-                    "V1.7 refined key + coarse hard span",
+                    "calibrated MAIN answer + coarse hard span",
                 ),
                 (
                     "fixed-readout",
-                    "V1.7 refined key + CRA fixed span",
+                    "calibrated MAIN answer + CRA fixed span",
                 ),
                 ("v15-readout", "full detached V1.5 readout"),
                 ("v14-readout", "full detached V1.4 readout"),
@@ -2482,9 +2656,14 @@ class CRAPipeline(BasePipeline):
                     _print_score(score[full_key])
 
         self.monitor.log_info(
-            f"\nVal Set\t refined acc: "
+            f"\nVal Set\t calibrated MAIN acc: "
             f"{score['val_acc']:.2%}"
         )
+        if "val_raw_refined_acc" in score:
+            self.monitor.log_info(
+                f"\nVal Set\t raw-refined acc: "
+                f"{score['val_raw_refined_acc']:.2%}"
+            )
         if "val_coarse_acc" in score:
             self.monitor.log_info(
                 f"\nVal Set\t coarse acc: "
@@ -2505,9 +2684,14 @@ class CRAPipeline(BasePipeline):
             _print_score(score["val_merge"])
 
         self.monitor.log_info(
-            f"\nTest Set\t refined acc: "
+            f"\nTest Set\t calibrated MAIN acc: "
             f"{score['test_acc']:.2%}"
         )
+        if "test_raw_refined_acc" in score:
+            self.monitor.log_info(
+                f"\nTest Set\t raw-refined acc: "
+                f"{score['test_raw_refined_acc']:.2%}"
+            )
         if "test_coarse_acc" in score:
             self.monitor.log_info(
                 f"\nTest Set\t coarse acc: "
@@ -2545,6 +2729,8 @@ class CRAPipeline(BasePipeline):
         temporal_diagnostic_prefixes = (
             "val_QBound-",
             "test_QBound-",
+            "val_QBoundRawRefined-",
+            "test_QBoundRawRefined-",
             "val_QBoundCoarse-",
             "test_QBoundCoarse-",
             "val_CRA-",
@@ -2686,18 +2872,24 @@ class CRAPipeline(BasePipeline):
         device = self._model_device()
 
         count = 0
+        raw_refined_count = 0
         coarse_count = 0
 
         score = {
             "acc": 0.0,
+            "raw_refined_acc": 0.0,
             "coarse_acc": 0.0,
         }
 
+        # Answer predictions.
         results = {}
+        raw_refined_results = {}
         coarse_results = {}
 
+        # Grounding outputs.
         ground_res = {}
         ground_pre = {}
+        ground_raw_refined = {}
         ground_coarse_branch = {}
         ground_coarse_readout = {}
         ground_fixed_readout = {}
@@ -2707,7 +2899,9 @@ class CRAPipeline(BasePipeline):
         keyframe = {}
         ori_keyframe = {}
 
+        # Temporal-key diagnostics.
         qbound_keyframe = {}
+        qbound_raw_refined_keyframe = {}
         qbound_coarse_keyframe = {}
         cra_keyframe = {}
         qbound_pre_smooth_keyframe = {}
@@ -2776,17 +2970,20 @@ class CRAPipeline(BasePipeline):
                     ),
                 )
 
-                refined_logits = self._score_answer_candidates(
+                # Official V1.8 calibrated MAIN.
+                calibrated_logits = self._score_answer_candidates(
                     answer_proj=answer_proj,
                     representation=fusion_proj,
                     detach_answer=False,
                 )
+                calibrated_predicted = (
+                    calibrated_logits.argmax(dim=-1).cpu()
+                )
 
-                refined_predicted = refined_logits.argmax(dim=-1).cpu()
                 labels_cpu = answer_id.reshape(-1).cpu()
 
                 score["acc"] += (
-                    refined_predicted == labels_cpu
+                    calibrated_predicted == labels_cpu
                 ).sum().item()
 
                 time_param = model_outputs.get("time_param")
@@ -2806,17 +3003,36 @@ class CRAPipeline(BasePipeline):
                     eval_wrapper = None
                     qbound_aux = None
 
+                raw_refined_logits = None
                 coarse_logits = None
+                raw_refined_predicted = None
                 coarse_predicted = None
 
                 if qbound_aux is not None:
-                    coarse_video_proj = qbound_aux.get(
+                    raw_refined_proj = qbound_aux.get(
+                        "qbound_raw_refined_video_proj"
+                    )
+                    if torch.is_tensor(raw_refined_proj):
+                        raw_refined_logits = self._score_answer_candidates(
+                            answer_proj=answer_proj,
+                            representation=raw_refined_proj,
+                            detach_answer=True,
+                        )
+                        raw_refined_predicted = (
+                            raw_refined_logits.argmax(dim=-1).cpu()
+                        )
+                        score["raw_refined_acc"] += (
+                            raw_refined_predicted == labels_cpu
+                        ).sum().item()
+                        raw_refined_count += batch_size
+
+                    coarse_proj = qbound_aux.get(
                         "qbound_coarse_video_proj"
                     )
-                    if torch.is_tensor(coarse_video_proj):
+                    if torch.is_tensor(coarse_proj):
                         coarse_logits = self._score_answer_candidates(
                             answer_proj=answer_proj,
-                            representation=coarse_video_proj,
+                            representation=coarse_proj,
                             detach_answer=True,
                         )
                         coarse_predicted = (
@@ -2827,11 +3043,12 @@ class CRAPipeline(BasePipeline):
                         ).sum().item()
                         coarse_count += batch_size
 
-                    diagnostic_logs = self._compute_qbound_v17_diagnostics(
+                    diagnostic_logs = self._compute_qbound_v18_diagnostics(
                         gqa_output=eval_wrapper,
                         answer_proj=answer_proj,
                         answer_id=answer_id,
-                        main_logits=refined_logits,
+                        main_logits=calibrated_logits,
+                        raw_refined_logits=raw_refined_logits,
                         coarse_logits=coarse_logits,
                     )
 
@@ -2839,6 +3056,7 @@ class CRAPipeline(BasePipeline):
                         eval_wrapper,
                         extra_logs=diagnostic_logs,
                     )
+
                     for name, value in batch_stats.items():
                         qbound_stat_sums[name] += (
                             float(value) * batch_size
@@ -2859,7 +3077,7 @@ class CRAPipeline(BasePipeline):
                     video_attention = video_attention[None, :]
 
                 if time_param is not None:
-                    # Official V1.7 refined interval.
+                    # Official V1.8 calibrated hard interval.
                     start_time = (
                         time_param["start"]
                         .detach().cpu().numpy()
@@ -2882,13 +3100,15 @@ class CRAPipeline(BasePipeline):
                     )
 
                     batch_qbound_keyframe = None
-                    batch_qbound_coarse_keyframe = None
+                    batch_raw_refined_keyframe = None
+                    batch_coarse_keyframe = None
                     batch_cra_keyframe = None
-                    batch_qbound_pre_smooth_keyframe = None
-                    batch_qbound_post_smooth_keyframe = None
-                    batch_qbound_v15_keyframe = None
-                    batch_qbound_v14_keyframe = None
+                    batch_pre_smooth_keyframe = None
+                    batch_post_smooth_keyframe = None
+                    batch_v15_keyframe = None
+                    batch_v14_keyframe = None
 
+                    batch_raw_refined = None
                     batch_coarse_branch = None
                     batch_coarse_readout = None
                     batch_fixed_readout = None
@@ -2896,21 +3116,24 @@ class CRAPipeline(BasePipeline):
                     batch_v14_readout = None
 
                     if qbound_aux is not None:
-                        pure_qbound_key = qbound_aux.get(
-                            "qbound_key",
-                            qbound_aux.get("event_key"),
+                        calibrated_key = qbound_aux.get(
+                            "qbound_calibrated_key",
+                            qbound_aux.get("qbound_key"),
                         )
-                        coarse_qbound_key = qbound_aux.get(
+                        raw_refined_key = qbound_aux.get(
+                            "qbound_raw_refined_key"
+                        )
+                        coarse_key = qbound_aux.get(
                             "qbound_coarse_key"
                         )
-                        pure_cra_key = qbound_aux.get("cra_key")
+                        cra_key = qbound_aux.get("cra_key")
 
                         pre_smooth_key = qbound_aux.get(
                             "qbound_pre_smooth_key"
                         )
                         post_smooth_key = qbound_aux.get(
                             "qbound_post_smooth_key",
-                            pure_qbound_key,
+                            calibrated_key,
                         )
 
                         v15_key = qbound_aux.get(
@@ -2920,7 +3143,13 @@ class CRAPipeline(BasePipeline):
                             "v14_diagnostic_key"
                         )
 
-                        # Full V1.7 differentiable coarse branch.
+                        raw_start = time_param.get(
+                            "qbound_raw_refined_start"
+                        )
+                        raw_end = time_param.get(
+                            "qbound_raw_refined_end"
+                        )
+
                         coarse_branch_start = time_param.get(
                             "qbound_coarse_start"
                         )
@@ -2928,11 +3157,11 @@ class CRAPipeline(BasePipeline):
                             "qbound_coarse_end"
                         )
 
-                        # Same refined key, coarse hard span.
-                        coarse_start = time_param.get(
+                        # Same calibrated MAIN key, coarse hard interval.
+                        coarse_readout_start = time_param.get(
                             "qbound_coarse_v15_start"
                         )
-                        coarse_end = time_param.get(
+                        coarse_readout_end = time_param.get(
                             "qbound_coarse_v15_end"
                         )
 
@@ -2970,13 +3199,17 @@ class CRAPipeline(BasePipeline):
                                 )
                             return None
 
+                        batch_raw_refined = _stack_interval(
+                            raw_start,
+                            raw_end,
+                        )
                         batch_coarse_branch = _stack_interval(
                             coarse_branch_start,
                             coarse_branch_end,
                         )
                         batch_coarse_readout = _stack_interval(
-                            coarse_start,
-                            coarse_end,
+                            coarse_readout_start,
+                            coarse_readout_end,
                         )
                         batch_fixed_readout = _stack_interval(
                             fixed_start,
@@ -2991,44 +3224,60 @@ class CRAPipeline(BasePipeline):
                             v14_end,
                         )
 
-                        if torch.is_tensor(pure_qbound_key):
+                        if torch.is_tensor(calibrated_key):
                             batch_qbound_keyframe = (
-                                pure_qbound_key.detach().cpu().numpy()
+                                calibrated_key.detach().cpu().numpy()
                             )
-                        if torch.is_tensor(coarse_qbound_key):
-                            batch_qbound_coarse_keyframe = (
-                                coarse_qbound_key.detach().cpu().numpy()
+                        if torch.is_tensor(raw_refined_key):
+                            batch_raw_refined_keyframe = (
+                                raw_refined_key.detach().cpu().numpy()
                             )
-                        if torch.is_tensor(pure_cra_key):
+                        if torch.is_tensor(coarse_key):
+                            batch_coarse_keyframe = (
+                                coarse_key.detach().cpu().numpy()
+                            )
+                        if torch.is_tensor(cra_key):
                             batch_cra_keyframe = (
-                                pure_cra_key.detach().cpu().numpy()
+                                cra_key.detach().cpu().numpy()
                             )
                         if torch.is_tensor(pre_smooth_key):
-                            batch_qbound_pre_smooth_keyframe = (
+                            batch_pre_smooth_keyframe = (
                                 pre_smooth_key.detach().cpu().numpy()
                             )
                         if torch.is_tensor(post_smooth_key):
-                            batch_qbound_post_smooth_keyframe = (
+                            batch_post_smooth_keyframe = (
                                 post_smooth_key.detach().cpu().numpy()
                             )
                         if torch.is_tensor(v15_key):
-                            batch_qbound_v15_keyframe = (
+                            batch_v15_keyframe = (
                                 v15_key.detach().cpu().numpy()
                             )
                         if torch.is_tensor(v14_key):
-                            batch_qbound_v14_keyframe = (
+                            batch_v14_keyframe = (
                                 v14_key.detach().cpu().numpy()
                             )
 
                     for batch_index, qid in enumerate(question_id):
                         results[qid] = {
                             "prediction": int(
-                                refined_predicted.numpy()[batch_index]
+                                calibrated_predicted.numpy()[batch_index]
                             ),
                             "answer": int(
                                 labels_cpu.numpy()[batch_index]
                             ),
                         }
+
+                        if raw_refined_predicted is not None:
+                            raw_refined_results[qid] = {
+                                "prediction": int(
+                                    raw_refined_predicted.numpy()[
+                                        batch_index
+                                    ]
+                                ),
+                                "answer": int(
+                                    labels_cpu.numpy()[batch_index]
+                                ),
+                            }
 
                         if coarse_predicted is not None:
                             coarse_results[qid] = {
@@ -3055,69 +3304,95 @@ class CRAPipeline(BasePipeline):
 
                         if batch_qbound_keyframe is not None:
                             qbound_keyframe[qid] = (
-                                batch_qbound_keyframe[batch_index].tolist()
+                                batch_qbound_keyframe[
+                                    batch_index
+                                ].tolist()
                             )
-                        if batch_qbound_coarse_keyframe is not None:
+                        if batch_raw_refined_keyframe is not None:
+                            qbound_raw_refined_keyframe[qid] = (
+                                batch_raw_refined_keyframe[
+                                    batch_index
+                                ].tolist()
+                            )
+                        if batch_coarse_keyframe is not None:
                             qbound_coarse_keyframe[qid] = (
-                                batch_qbound_coarse_keyframe[
+                                batch_coarse_keyframe[
                                     batch_index
                                 ].tolist()
                             )
                         if batch_cra_keyframe is not None:
                             cra_keyframe[qid] = (
-                                batch_cra_keyframe[batch_index].tolist()
+                                batch_cra_keyframe[
+                                    batch_index
+                                ].tolist()
                             )
-                        if batch_qbound_pre_smooth_keyframe is not None:
+                        if batch_pre_smooth_keyframe is not None:
                             qbound_pre_smooth_keyframe[qid] = (
-                                batch_qbound_pre_smooth_keyframe[
+                                batch_pre_smooth_keyframe[
                                     batch_index
                                 ].tolist()
                             )
-                        if batch_qbound_post_smooth_keyframe is not None:
+                        if batch_post_smooth_keyframe is not None:
                             qbound_post_smooth_keyframe[qid] = (
-                                batch_qbound_post_smooth_keyframe[
+                                batch_post_smooth_keyframe[
                                     batch_index
                                 ].tolist()
                             )
-                        if batch_qbound_v15_keyframe is not None:
+                        if batch_v15_keyframe is not None:
                             qbound_v15_keyframe[qid] = (
-                                batch_qbound_v15_keyframe[
+                                batch_v15_keyframe[
                                     batch_index
                                 ].tolist()
                             )
-                        if batch_qbound_v14_keyframe is not None:
+                        if batch_v14_keyframe is not None:
                             qbound_v14_keyframe[qid] = (
-                                batch_qbound_v14_keyframe[
+                                batch_v14_keyframe[
                                     batch_index
                                 ].tolist()
                             )
 
+                        if batch_raw_refined is not None:
+                            ground_raw_refined[qid] = (
+                                batch_raw_refined[
+                                    batch_index
+                                ].tolist()
+                            )
                         if batch_coarse_branch is not None:
                             ground_coarse_branch[qid] = (
-                                batch_coarse_branch[batch_index].tolist()
+                                batch_coarse_branch[
+                                    batch_index
+                                ].tolist()
                             )
                         if batch_coarse_readout is not None:
                             ground_coarse_readout[qid] = (
-                                batch_coarse_readout[batch_index].tolist()
+                                batch_coarse_readout[
+                                    batch_index
+                                ].tolist()
                             )
                         if batch_fixed_readout is not None:
                             ground_fixed_readout[qid] = (
-                                batch_fixed_readout[batch_index].tolist()
+                                batch_fixed_readout[
+                                    batch_index
+                                ].tolist()
                             )
                         if batch_v15_readout is not None:
                             ground_v15_readout[qid] = (
-                                batch_v15_readout[batch_index].tolist()
+                                batch_v15_readout[
+                                    batch_index
+                                ].tolist()
                             )
                         if batch_v14_readout is not None:
                             ground_v14_readout[qid] = (
-                                batch_v14_readout[batch_index].tolist()
+                                batch_v14_readout[
+                                    batch_index
+                                ].tolist()
                             )
 
                 else:
                     for batch_index, qid in enumerate(question_id):
                         results[qid] = {
                             "prediction": int(
-                                refined_predicted.numpy()[batch_index]
+                                calibrated_predicted.numpy()[batch_index]
                             ),
                             "answer": int(
                                 labels_cpu.numpy()[batch_index]
@@ -3138,6 +3413,11 @@ class CRAPipeline(BasePipeline):
             raise RuntimeError("Evaluation data loader is empty.")
 
         score["acc"] /= count
+
+        if raw_refined_count > 0:
+            score["raw_refined_acc"] /= raw_refined_count
+        else:
+            score.pop("raw_refined_acc", None)
 
         if coarse_count > 0:
             score["coarse_acc"] /= coarse_count
@@ -3188,7 +3468,7 @@ class CRAPipeline(BasePipeline):
         if qbound_keyframe:
             if not hasattr(self.metric, "temporal_key_metrics"):
                 raise AttributeError(
-                    "Q-Bound V1.7 requires "
+                    "Q-Bound V1.8 requires "
                     "Metric.temporal_key_metrics()."
                 )
             score.update(
@@ -3197,6 +3477,16 @@ class CRAPipeline(BasePipeline):
                     ground_truth,
                     segments,
                     prefix="QBound",
+                )
+            )
+
+        if qbound_raw_refined_keyframe:
+            score.update(
+                self.metric.temporal_key_metrics(
+                    qbound_raw_refined_keyframe,
+                    ground_truth,
+                    segments,
+                    prefix="QBoundRawRefined",
                 )
             )
 
@@ -3263,16 +3553,21 @@ class CRAPipeline(BasePipeline):
         result = {
             "ph": post_hoc_ground,
             "result": results,
+            "raw_refined_result": raw_refined_results,
             "coarse_result": coarse_results,
             "gt_ground": ground_truth,
             "ph_attn": ground_res,
+
             "qbound_key": qbound_keyframe,
+            "qbound_raw_refined_key": qbound_raw_refined_keyframe,
             "qbound_coarse_key": qbound_coarse_keyframe,
             "cra_key": cra_keyframe,
             "qbound_pre_smooth_key": qbound_pre_smooth_keyframe,
             "qbound_post_smooth_key": qbound_post_smooth_keyframe,
             "qbound_v15_key": qbound_v15_keyframe,
             "qbound_v14_key": qbound_v14_keyframe,
+
+            "raw_refined": ground_raw_refined,
             "coarse_branch": ground_coarse_branch,
             "coarse_readout": ground_coarse_readout,
             "fixed_readout": ground_fixed_readout,
@@ -3281,7 +3576,7 @@ class CRAPipeline(BasePipeline):
         }
 
         if saw_time_param:
-            # MAIN V1.7 refined pre-hoc grounding.
+            # Official calibrated MAIN.
             score["pre-hoc"] = self.metric(
                 ground_pre,
                 ground_truth,
@@ -3289,7 +3584,16 @@ class CRAPipeline(BasePipeline):
                 gs=True,
             )
 
-            # Full V1.7 differentiable coarse answer+grounding branch.
+            # Raw V1.7-style fine branch.
+            if ground_raw_refined and raw_refined_results:
+                score["raw-refined"] = self.metric(
+                    ground_raw_refined,
+                    ground_truth,
+                    raw_refined_results,
+                    gs=True,
+                )
+
+            # Coarse COMPOSE diagnostic branch.
             if ground_coarse_branch and coarse_results:
                 score["coarse-branch"] = self.metric(
                     ground_coarse_branch,
@@ -3298,7 +3602,7 @@ class CRAPipeline(BasePipeline):
                     gs=True,
                 )
 
-            # Same MAIN answer predictions / refined temporal key, alternate span.
+            # Same calibrated answer prediction, alternative hard interval.
             if ground_coarse_readout:
                 score["coarse-readout"] = self.metric(
                     ground_coarse_readout,
@@ -3356,13 +3660,17 @@ class CRAPipeline(BasePipeline):
                             .replace("&", "_and_")
                         )
                         score[
-                            f"qbound_refined_minus_{reference_name}_"
+                            f"qbound_calibrated_minus_{reference_name}_"
                             f"{safe_name}"
                         ] = float(
                             main_pre[metric_name]
                             - reference_score[metric_name]
                         )
 
+            _record_metric_delta(
+                "rawrefined",
+                score.get("raw-refined"),
+            )
             _record_metric_delta(
                 "coarsebranch",
                 score.get("coarse-branch"),
@@ -3401,6 +3709,7 @@ class CRAPipeline(BasePipeline):
                     "tg": ground_pre,
                     "key": keyframe,
                     "ori_key": ori_keyframe,
+                    "raw_refined_tg": ground_raw_refined,
                     "coarse_branch_tg": ground_coarse_branch,
                     "coarse_tg": ground_coarse_readout,
                     "fixed_tg": ground_fixed_readout,

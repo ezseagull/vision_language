@@ -11,40 +11,46 @@ from modules.m_cra.causal_module import LinguisticInterventionGraph
 
 class CRA(nn.Module):
     """
-    CRA wrapper with Q-Bound Version 1.7.
+    CRA wrapper with Q-Bound Version 1.8.
 
-    Q-Bound V1.7 follows:
+    Q-Bound V1.8:
 
-        DECOMPOSE -> RELATE -> COMPOSE -> STABLE REFINE -> GROUND
+        DECOMPOSE -> RELATE -> COMPOSE -> REFINE
+        -> UNCERTAINTY CALIBRATION -> GROUND
 
-    CRA remains a downstream testbed. Q-Bound owns temporal reasoning.
+    CRA remains the downstream VideoQA testbed. The official returned
+    ``video_proj`` is always the uncertainty-calibrated V1.8 representation.
 
-    V1.7 adds one important wrapper-level interface over V1.6:
-    it exposes two answer-space video representations produced from the same
-    CRA feature tensor and the same projection/dropout realization:
+    Three answer-space branches are exposed:
+
+        qbound_calibrated_video_proj
+            Official MAIN branch.
+
+        qbound_raw_refined_video_proj
+            Raw V1.7-style REFINE branch, diagnostics/ablation only.
 
         qbound_coarse_video_proj
-            differentiable COMPOSE coarse branch
+            COMPOSE coarse branch, diagnostics/ablation only.
 
-        qbound_refined_video_proj
-            detached-coarse-route STABLE REFINE branch (MAIN)
+    Compatibility:
+      * qbound_refined_video_proj aliases the calibrated MAIN branch.
+      * raw fine refinement is always named qbound_raw_refined_*.
 
-    This lets the pipeline compare coarse/refined answer sufficiency fairly and
-    build the minimal-sufficient refinement objective without changing CRA's
-    candidate dot-product answer scorer.
+    Gradient/routing controls:
+      * question-only semantics define Q-Bound temporal reasoning;
+      * the top-1 coarse chain routed into REFINE remains detached;
+      * V1.6 all-span REFINE marginalization remains disabled;
+      * V1.7 minimal-sufficient routing is disabled;
+      * the calibrated MAIN probability contains both differentiable coarse
+        and fine components, so the main task can train Composer and Refiner
+        without a separate coarse-answer or minimality objective;
+      * calibration confidence is detached inside QBoundCore;
+      * no CRA->Q-Bound handover;
+      * no direct reasoned-event residual into answer space;
+      * no temporal GT is consumed here.
 
-    Controls
-    --------
-    * question-only semantics define Q-Bound topology/routing;
-    * no answer-choice leakage into DECOMPOSE / RELATE / COMPOSE / REFINE;
-    * no CRA -> Q-Bound handover;
-    * no direct reasoned-event residual into answer space;
-    * refined-task gradients are blocked from span_composer_score inside core;
-    * the differentiable coarse branch remains available to supervise Composer;
-    * main start/end/mask come from frame-level refined boundaries;
-    * temporal GT is never consumed here for training;
-    * selected ordered event tokens remain available for a future frozen
-      LLM/MLLM adapter.
+    selected_reasoned_event_tokens and selected_event_mask remain available
+    for a future frozen LLM/MLLM adapter.
     """
 
     def __init__(self, cfgs, tokenizer) -> None:
@@ -79,7 +85,7 @@ class CRA(nn.Module):
                 "version",
                 model_cfg.get(
                     "qbound_version",
-                    model_cfg.get("gpeb_version", "1.7"),
+                    model_cfg.get("gpeb_version", "1.8"),
                 ),
             )
         )
@@ -296,18 +302,12 @@ class CRA(nn.Module):
         qbound_mix=1.0,
     ):
         """
-        Refined CRA/Q-Bound V1.7 forward.
+        Refined CRA/Q-Bound V1.8 forward.
 
-        ``question`` is required by default when Q-Bound is active because all
-        temporal reasoning remains question-only.
+        The returned ``video_proj`` is the official uncertainty-calibrated MAIN
+        representation. Raw-refined and coarse representations are diagnostics.
 
-        ``qbound_mix`` is compatibility-only. V1.7 uses the pure Q-Bound refined
-        path when active; there is no CRA/Q-Bound temporal handover.
-
-        The returned ``video_proj`` is ALWAYS the refined V1.7 representation.
-        The differentiable coarse representation is exposed separately through:
-            outs["qbound_coarse_video_proj"]
-            outs["qbound_aux"]["qbound_coarse_video_proj"]
+        ``qbound_mix`` is compatibility-only; V1.8 has no CRA/Q-Bound handover.
         """
         mode = mode.upper()
 
@@ -338,14 +338,12 @@ class CRA(nn.Module):
         qsn_gt = None
 
         if mode == "VQ" and answer_indices is not None:
-            # Preserve original CRA VQ behavior.
             qsn_g = self._select_candidate_features(
                 answer_g,
                 answer_indices,
             )
             qsn_gt = qsn_g
         else:
-            # Preserve original CRA candidate-conditioned context.
             qsn_g = answer_g.max(dim=1).values
             if answer_indices is not None:
                 qsn_gt = self._select_candidate_features(
@@ -365,17 +363,15 @@ class CRA(nn.Module):
             if question is None:
                 if self.qbound_require_question_only:
                     raise ValueError(
-                        "Q-Bound V1.7 requires question-only token ids. "
+                        "Q-Bound V1.8 requires question-only token ids. "
                         "Pass them through CRA.forward(..., question=...). "
-                        "Do not reuse candidate answer features because that "
-                        "would leak answer-choice semantics into temporal reasoning."
+                        "Do not reuse candidate-answer features."
                     )
             else:
                 question_g, question_tokens = self._encode_question(
                     question,
                     device,
                 )
-
                 if question_g.size(0) != batch_size:
                     raise ValueError(
                         "Question and answer batch sizes do not match: "
@@ -394,7 +390,6 @@ class CRA(nn.Module):
             ),
             use_qbound=use_qbound,
             question_feature=question_g,
-            # Compatibility only; RefineDecoder V1.7 ignores handover mixing.
             qbound_mix=(
                 qbound_mix
                 if use_qbound
@@ -402,7 +397,7 @@ class CRA(nn.Module):
             ),
         )
 
-        # Keep CRA's original answer-scoring interface unchanged.
+        # Keep CRA's answer candidate interface unchanged.
         answer_proj = answer_g
 
         qbound_aux = (
@@ -412,33 +407,38 @@ class CRA(nn.Module):
         )
 
         # --------------------------------------------------------------
-        # Validate the V1.7 decoder/core interface early.
+        # Validate V1.8 decoder/core contract.
         # --------------------------------------------------------------
         if use_qbound:
             required_time_keys = {
-                # Main/coarse answer representations.
+                # Official calibrated MAIN.
                 "qbound_grounding_feature",
                 "qbound_temporal_main_feature",
-                "qbound_coarse_grounding_feature",
-                "qbound_coarse_video_proj",
-                "qbound_refined_video_proj",
-
-                # Explicit coarse/refined temporal keys.
+                "qbound_calibrated_grounding_feature",
+                "qbound_calibrated_video_proj",
                 "qbound_key",
-                "qbound_coarse_key",
+                "qbound_calibrated_key",
                 "refined_key",
 
-                # Stable routing contract.
+                # Diagnostic answer/key branches.
+                "qbound_raw_refined_grounding_feature",
+                "qbound_raw_refined_video_proj",
+                "qbound_raw_refined_key",
+                "qbound_coarse_grounding_feature",
+                "qbound_coarse_video_proj",
+                "qbound_coarse_key",
+
+                # Routing/calibration.
                 "qbound_stable_refiner_enabled",
+                "qbound_uncertainty_calibration_enabled",
+                "qbound_minimal_sufficient_enabled",
                 "qbound_refine_hard_coarse_route",
                 "qbound_refine_coarse_detached",
                 "qbound_all_span_refine_marginal_enabled",
-
-                # Minimal-sufficient differentiable interface.
-                "qbound_expected_refined_span_length",
-                "qbound_expected_refined_length_ratio",
-                "qbound_expected_refined_span_fraction",
-                "qbound_expected_refine_trim_fraction",
+                "qbound_calibration_uncertainty",
+                "qbound_calibration_information",
+                "qbound_calibration_confidence",
+                "qbound_calibration_confidence_detached",
 
                 # COMPOSE.
                 "qbound_span_posterior",
@@ -453,21 +453,42 @@ class CRA(nn.Module):
                 "qbound_selected_span_frame_length",
                 "qbound_selected_span_fraction",
 
-                # STABLE REFINE.
-                "qbound_refined_temporal_prob",
+                # Raw fine proposal.
+                "qbound_raw_refined_temporal_prob",
                 "qbound_refine_selected_pair_entropy",
                 "qbound_refine_selected_pair_effective_count",
                 "qbound_refine_selected_pair_top1_posterior",
                 "qbound_refine_selected_pair_candidate_count",
                 "qbound_refine_selected_pair_entropy_ratio",
+
+                # Calibrated core interval.
+                "qbound_calibrated_temporal_prob",
+                "qbound_calibrated_span_start_frame",
+                "qbound_calibrated_span_end_frame",
+                "qbound_calibrated_span_frame_length",
+                "qbound_calibrated_span_fraction",
+                "qbound_calibrated_retained_fraction",
+                "qbound_calibrated_inside_coarse",
+
+                # Raw refined core interval.
                 "qbound_refined_span_start_frame",
                 "qbound_refined_span_end_frame",
-                "qbound_refined_span_length",
+                "qbound_refined_span_frame_length",
                 "qbound_refined_span_fraction",
-                "qbound_refine_trim_total_frames",
                 "qbound_refined_inside_coarse",
 
-                # DECOMPOSE / RELATE essentials.
+                # Adapter-level intervals.
+                "qbound_calibrated_start",
+                "qbound_calibrated_end",
+                "qbound_calibrated_mask",
+                "qbound_raw_refined_start",
+                "qbound_raw_refined_end",
+                "qbound_raw_refined_mask",
+                "qbound_coarse_start",
+                "qbound_coarse_end",
+                "qbound_coarse_mask",
+
+                # DECOMPOSE / RELATE.
                 "qbound_event_assignment",
                 "qbound_event_mass",
                 "qbound_soft_effective_event_count",
@@ -479,7 +500,7 @@ class CRA(nn.Module):
                 "qbound_ordered_relation_gates",
                 "qbound_ordered_update_gate",
 
-                # Shortcut-removal controls.
+                # Shortcut controls.
                 "qbound_reasoning_residual",
                 "qbound_reasoning_residual_used",
                 "qbound_direct_reasoning_residual_enabled",
@@ -498,46 +519,54 @@ class CRA(nn.Module):
             )
             if missing_time_keys:
                 raise KeyError(
-                    "RefineDecoder/Q-Bound V1.7 time_param output is missing: "
+                    "RefineDecoder/Q-Bound V1.8 time_param output is missing: "
                     + ", ".join(missing_time_keys)
                 )
 
             if qbound_aux is None:
                 raise KeyError(
-                    "RefineDecoder/Q-Bound V1.7 must expose "
+                    "RefineDecoder/Q-Bound V1.8 must expose "
                     "time_param['qbound_aux']."
                 )
 
             required_aux_keys = {
-                # Main/refined and differentiable coarse answer branches.
+                # Answer representations.
                 "main_video_proj",
                 "qbound_video_proj",
+                "qbound_calibrated_video_proj",
                 "qbound_refined_video_proj",
+                "qbound_raw_refined_video_proj",
                 "qbound_coarse_video_proj",
+
+                # Temporal keys.
                 "qbound_key",
+                "qbound_calibrated_key",
+                "qbound_raw_refined_key",
                 "qbound_coarse_key",
                 "final_key",
 
-                # Main/coarse temporal distributions.
+                # Temporal probabilities.
                 "main_temporal_prob",
                 "main_temporal_logits",
-                "refined_temporal_prob",
-                "refined_temporal_logits",
+                "calibrated_temporal_prob",
+                "calibrated_temporal_logits",
+                "raw_refined_temporal_prob",
+                "raw_refined_temporal_logits",
                 "composed_temporal_prob",
                 "composed_temporal_logits",
 
-                # Stable route.
+                # Routing/calibration.
                 "stable_refiner_enabled",
+                "uncertainty_calibration_enabled",
+                "minimal_sufficient_enabled",
                 "all_span_refine_marginal_enabled",
                 "refine_hard_coarse_route",
                 "refine_coarse_detached",
                 "refine_selected_span_index",
-
-                # Minimal-sufficient quantities.
-                "expected_refined_span_length",
-                "expected_refined_length_ratio",
-                "expected_refined_span_fraction",
-                "expected_refine_trim_fraction",
+                "calibration_uncertainty",
+                "calibration_information",
+                "calibration_confidence",
+                "calibration_confidence_detached",
 
                 # Pair posterior.
                 "refine_selected_pair_posterior",
@@ -547,7 +576,15 @@ class CRA(nn.Module):
                 "refine_selected_pair_candidate_count",
                 "refine_selected_pair_entropy_ratio",
 
-                # Coarse/refined hard intervals.
+                # Calibrated hard interval.
+                "calibrated_span_start_frame",
+                "calibrated_span_end_frame",
+                "calibrated_span_frame_length",
+                "calibrated_span_fraction",
+                "calibrated_retained_fraction",
+                "calibrated_inside_coarse",
+
+                # Coarse/raw-refined intervals.
                 "coarse_span_start_frame",
                 "coarse_span_end_frame",
                 "coarse_span_frame_length",
@@ -558,7 +595,7 @@ class CRA(nn.Module):
                 "refined_span_fraction",
                 "refined_inside_coarse",
 
-                # DECOMPOSE/RELATE/COMPOSE essentials.
+                # DECOMPOSE/RELATE/COMPOSE.
                 "event_count",
                 "event_assignment",
                 "event_mass",
@@ -570,9 +607,10 @@ class CRA(nn.Module):
                 "selected_event_mask",
                 "selected_reasoned_event_tokens",
 
-                # Decoder controls/diagnostics.
+                # Decoder controls.
                 "qbound_handover_enabled",
-                "qbound_stable_refiner_enabled",
+                "qbound_uncertainty_calibration_enabled",
+                "qbound_minimal_sufficient_enabled",
                 "qbound_direct_reasoning_residual_enabled",
                 "merge_counterfactual_available",
             }
@@ -582,29 +620,44 @@ class CRA(nn.Module):
             )
             if missing_aux_keys:
                 raise KeyError(
-                    "Q-Bound V1.7 auxiliary output is missing: "
+                    "Q-Bound V1.8 auxiliary output is missing: "
                     + ", ".join(missing_aux_keys)
                 )
 
-            # Fail fast on accidental V1.6 routing.
-            if float(
-                qbound_aux["all_span_refine_marginal_enabled"]
-                .detach()
-                .item()
-            ) != 0.0:
+            def _scalar_flag(name):
+                value = qbound_aux[name]
+                if not torch.is_tensor(value):
+                    raise TypeError(
+                        f"Q-Bound flag {name!r} must be a tensor."
+                    )
+                return float(value.detach().item())
+
+            if _scalar_flag("uncertainty_calibration_enabled") != 1.0:
                 raise RuntimeError(
-                    "Q-Bound V1.7 expected all-span REFINE marginalization "
-                    "to be disabled."
+                    "Q-Bound V1.8 requires uncertainty calibration."
                 )
 
-            if float(
-                qbound_aux["refine_coarse_detached"]
-                .detach()
-                .item()
-            ) != 1.0:
+            if _scalar_flag("minimal_sufficient_enabled") != 0.0:
                 raise RuntimeError(
-                    "Q-Bound V1.7 expected the coarse route into REFINE "
-                    "to be detached."
+                    "Q-Bound V1.8 requires V1.7 minimal-sufficient "
+                    "routing to be disabled."
+                )
+
+            if _scalar_flag("all_span_refine_marginal_enabled") != 0.0:
+                raise RuntimeError(
+                    "Q-Bound V1.8 requires V1.6 all-span REFINE "
+                    "marginalization to remain disabled."
+                )
+
+            if _scalar_flag("refine_coarse_detached") != 1.0:
+                raise RuntimeError(
+                    "Q-Bound V1.8 requires the hard coarse route into REFINE "
+                    "to remain detached."
+                )
+
+            if _scalar_flag("calibration_confidence_detached") != 1.0:
+                raise RuntimeError(
+                    "Q-Bound V1.8 requires detached calibration confidence."
                 )
 
         # --------------------------------------------------------------
@@ -619,11 +672,9 @@ class CRA(nn.Module):
             "fatt": video_attn,
             "time_param": time_param,
 
-            # Original CRA semantic context.
             "align_gt": qsn_gt,
             "qa_condition": qsn_g,
 
-            # Strict question-only Q-Bound condition.
             "question_condition": question_g,
             "question_tokens": question_tokens,
             "question_only_conditioning": torch.as_tensor(
@@ -632,11 +683,9 @@ class CRA(nn.Module):
                 dtype=video_proj.dtype,
             ),
 
-            # Weak alignment.
             "qbound_align_question": question_g,
             "qbound_align_qa": qsn_gt,
 
-            # Complete diagnostic package.
             "qbound_aux": qbound_aux,
 
             "qbound_active": use_qbound,
@@ -652,13 +701,9 @@ class CRA(nn.Module):
             ),
             "qbound_version": self.qbound_version,
 
-            # Compatibility alias.
             "gpeb_active": use_qbound,
         }
 
-        # --------------------------------------------------------------
-        # Core event/decomposition/reasoning outputs used by pipeline/loggers.
-        # --------------------------------------------------------------
         common_output_names = [
             "qbound_grounding_feature",
             "qbound_temporal_main_feature",
@@ -717,7 +762,6 @@ class CRA(nn.Module):
             "qbound_reasoning_scale",
             "qbound_direct_reasoning_residual_enabled",
 
-            # Compatibility event-relevance aliases.
             "qbound_event_relevance_weights",
             "qbound_event_relevance_gates",
             "qbound_event_relevance_effective_count",
@@ -726,9 +770,6 @@ class CRA(nn.Module):
         for name in common_output_names:
             outs[name] = _tp(name)
 
-        # --------------------------------------------------------------
-        # V1.7 COMPOSE / STABLE REFINE / minimal-sufficient interfaces.
-        # --------------------------------------------------------------
         qbound_output_names = [
             # COMPOSE.
             "qbound_span_candidate_event_mask",
@@ -754,7 +795,7 @@ class CRA(nn.Module):
             "qbound_composed_temporal_logits",
             "qbound_composed_temporal_prob",
 
-            # Selected coarse chain / future LLM interface.
+            # Selected event-chain / future LLM interface.
             "qbound_selected_span_index",
             "qbound_selected_event_mask",
             "qbound_selected_reasoned_event_tokens",
@@ -771,13 +812,21 @@ class CRA(nn.Module):
             "qbound_soft_selected_event_weights",
             "qbound_composed_reasoned_event_repr",
 
-            # Stable route flags.
+            # Routing/calibration flags.
             "qbound_refiner_enabled",
             "qbound_stable_refiner_enabled",
+            "qbound_uncertainty_calibration_enabled",
+            "qbound_minimal_sufficient_enabled",
             "qbound_all_span_refine_marginal_enabled",
             "qbound_refine_hard_coarse_route",
             "qbound_refine_coarse_detached",
             "qbound_refine_selected_span_index",
+
+            # Calibration values.
+            "qbound_calibration_uncertainty",
+            "qbound_calibration_information",
+            "qbound_calibration_confidence",
+            "qbound_calibration_confidence_detached",
 
             # Pair posterior.
             "qbound_refine_start_logits",
@@ -794,7 +843,7 @@ class CRA(nn.Module):
             "qbound_refine_selected_start_candidate_count",
             "qbound_refine_selected_end_candidate_count",
 
-            # Differentiable minimal-sufficient quantities.
+            # Raw fine proposal statistics.
             "qbound_expected_refined_span_length",
             "qbound_expected_refined_length_ratio",
             "qbound_expected_refined_span_fraction",
@@ -802,21 +851,29 @@ class CRA(nn.Module):
             "qbound_expected_refined_start_frame",
             "qbound_expected_refined_end_frame",
 
-            # Refined temporal support.
             "qbound_refine_conditional_support",
             "qbound_refined_soft_support",
             "qbound_refined_support_log_bias",
             "qbound_refined_temporal_logits",
             "qbound_refined_temporal_prob",
+            "qbound_raw_refined_temporal_logits",
+            "qbound_raw_refined_temporal_prob",
+
+            # Official calibrated temporal support.
+            "qbound_calibrated_soft_support",
+            "qbound_calibrated_temporal_logits",
+            "qbound_calibrated_temporal_prob",
             "qbound_main_temporal_logits",
             "qbound_main_temporal_prob",
 
-            # Core coarse/refined spans.
+            # Coarse core interval.
             "qbound_coarse_span_start_frame",
             "qbound_coarse_span_end_frame",
             "qbound_coarse_span_frame_length",
             "qbound_coarse_span_fraction",
             "qbound_coarse_frame_mask",
+
+            # Raw-refined core interval.
             "qbound_refined_span_start_frame",
             "qbound_refined_span_end_frame",
             "qbound_refined_frame_mask",
@@ -830,9 +887,56 @@ class CRA(nn.Module):
             "qbound_refine_trim_total_frames",
             "qbound_refine_retained_fraction",
             "qbound_refined_inside_coarse",
+
+            # Calibrated core interval.
+            "qbound_calibrated_start_frame_float",
+            "qbound_calibrated_end_frame_float",
+            "qbound_calibrated_expected_span_length",
+            "qbound_calibrated_expected_length_ratio",
+            "qbound_calibrated_span_start_frame",
+            "qbound_calibrated_span_end_frame",
+            "qbound_calibrated_frame_mask",
+            "qbound_calibrated_span_frame_length",
+            "qbound_calibrated_span_fraction",
+            "qbound_calibrated_retained_fraction",
+            "qbound_calibrated_trim_left_frames",
+            "qbound_calibrated_trim_right_frames",
+            "qbound_calibrated_trim_total_frames",
+            "qbound_calibrated_span_start",
+            "qbound_calibrated_span_end",
+            "qbound_calibrated_span_temporal_prob",
+            "qbound_calibrated_inside_coarse",
             "qbound_refiner_temperature",
 
-            # Decoder-level differentiable coarse branch.
+            # Decoder-level calibrated branch.
+            "qbound_calibrated_grounding_feature",
+            "qbound_calibrated_video_proj",
+            "qbound_calibrated_key",
+            "qbound_calibrated_pre_smooth_key",
+            "qbound_calibrated_post_smooth_key",
+            "qbound_calibrated_start",
+            "qbound_calibrated_end",
+            "qbound_calibrated_mask",
+            "qbound_calibrated_span_length",
+            "qbound_calibrated_span_fraction",
+            "qbound_calibrated_span_key_mass",
+
+            # Decoder-level raw-refined branch.
+            "qbound_raw_refined_grounding_feature",
+            "qbound_raw_refined_video_proj",
+            "qbound_raw_refined_key",
+            "qbound_raw_refined_pre_smooth_key",
+            "qbound_raw_refined_post_smooth_key",
+            "qbound_raw_refined_start",
+            "qbound_raw_refined_end",
+            "qbound_raw_refined_mask",
+            "qbound_raw_refined_span_length",
+            "qbound_raw_refined_span_fraction",
+            "qbound_raw_refined_span_key_mass",
+
+            # Decoder-level coarse branch.
+            "qbound_coarse_grounding_feature",
+            "qbound_coarse_video_proj",
             "qbound_coarse_key",
             "qbound_coarse_pre_smooth_key",
             "qbound_coarse_post_smooth_key",
@@ -843,22 +947,20 @@ class CRA(nn.Module):
             "qbound_coarse_span_fraction",
             "qbound_coarse_span_key_mass",
 
-            # Main refined grounding diagnostics.
+            # Compatibility: adaptive/refined == calibrated MAIN.
             "qbound_adaptive_span_enabled",
             "qbound_refined_span_enabled",
+            "qbound_calibrated_span_enabled",
+            "qbound_raw_refined_span_enabled",
             "qbound_adaptive_span_start_frame",
             "qbound_adaptive_span_end_frame",
             "qbound_adaptive_span_length",
             "qbound_adaptive_span_fraction",
             "qbound_adaptive_span_key_mass",
-            "qbound_adaptive_span_peak_in_span",
-            "qbound_adaptive_span_mask_consistency",
             "qbound_refined_span_length",
             "qbound_refined_span_key_mass",
-            "qbound_refined_span_peak_in_span",
-            "qbound_refined_span_mask_consistency",
 
-            # Same refined key + alternative hard readouts.
+            # Same calibrated key + alternate readouts.
             "qbound_coarse_v15_start",
             "qbound_coarse_v15_end",
             "qbound_coarse_v15_mask",
@@ -893,24 +995,51 @@ class CRA(nn.Module):
             outs[name] = _tp(name)
 
         # --------------------------------------------------------------
-        # Explicit answer-space representations required by V1.7 pipeline.
+        # Explicit V1.8 answer/key interfaces.
         # --------------------------------------------------------------
         if isinstance(qbound_aux, dict):
-            outs["qbound_coarse_video_proj"] = qbound_aux.get(
-                "qbound_coarse_video_proj"
+            # Official MAIN.
+            outs["qbound_calibrated_video_proj"] = qbound_aux.get(
+                "qbound_calibrated_video_proj"
             )
+            outs["qbound_calibrated_key"] = qbound_aux.get(
+                "qbound_calibrated_key"
+            )
+
+            # Compatibility: "refined" == calibrated MAIN.
             outs["qbound_refined_video_proj"] = qbound_aux.get(
                 "qbound_refined_video_proj"
-            )
-            outs["qbound_coarse_key"] = qbound_aux.get(
-                "qbound_coarse_key"
             )
             outs["qbound_refined_key"] = qbound_aux.get(
                 "qbound_key"
             )
 
-            # Raw core quantities are exposed too, so the pipeline does not need
-            # to infer them from hard spans.
+            # Diagnostics.
+            outs["qbound_raw_refined_video_proj"] = qbound_aux.get(
+                "qbound_raw_refined_video_proj"
+            )
+            outs["qbound_raw_refined_key"] = qbound_aux.get(
+                "qbound_raw_refined_key"
+            )
+            outs["qbound_coarse_video_proj"] = qbound_aux.get(
+                "qbound_coarse_video_proj"
+            )
+            outs["qbound_coarse_key"] = qbound_aux.get(
+                "qbound_coarse_key"
+            )
+
+            # Calibration.
+            outs["qbound_calibration_uncertainty"] = qbound_aux.get(
+                "calibration_uncertainty"
+            )
+            outs["qbound_calibration_information"] = qbound_aux.get(
+                "calibration_information"
+            )
+            outs["qbound_calibration_confidence"] = qbound_aux.get(
+                "calibration_confidence"
+            )
+
+            # Raw fine proposal statistics.
             outs["qbound_expected_refined_span_length"] = qbound_aux.get(
                 "expected_refined_span_length"
             )
@@ -924,6 +1053,29 @@ class CRA(nn.Module):
                 "expected_refine_trim_fraction"
             )
 
+            # Official calibrated interval.
+            outs["qbound_calibrated_start"] = qbound_aux.get(
+                "qbound_calibrated_start"
+            )
+            outs["qbound_calibrated_end"] = qbound_aux.get(
+                "qbound_calibrated_end"
+            )
+            outs["qbound_calibrated_mask"] = qbound_aux.get(
+                "qbound_calibrated_mask"
+            )
+
+            # Raw-refined interval.
+            outs["qbound_raw_refined_start"] = qbound_aux.get(
+                "qbound_raw_refined_start"
+            )
+            outs["qbound_raw_refined_end"] = qbound_aux.get(
+                "qbound_raw_refined_end"
+            )
+            outs["qbound_raw_refined_mask"] = qbound_aux.get(
+                "qbound_raw_refined_mask"
+            )
+
+            # Compatibility aliases point to calibrated MAIN.
             outs["qbound_refined_start"] = qbound_aux.get(
                 "qbound_refined_start"
             )
@@ -933,8 +1085,6 @@ class CRA(nn.Module):
             outs["qbound_refined_mask"] = qbound_aux.get(
                 "qbound_refined_mask"
             )
-
-            # Compatibility aliases: adaptive == refined in V1.7.
             outs["qbound_adaptive_start"] = qbound_aux.get(
                 "qbound_adaptive_start"
             )
@@ -944,21 +1094,38 @@ class CRA(nn.Module):
             outs["qbound_adaptive_mask"] = qbound_aux.get(
                 "qbound_adaptive_mask"
             )
+
         else:
-            outs["qbound_coarse_video_proj"] = None
-            outs["qbound_refined_video_proj"] = None
-            outs["qbound_coarse_key"] = None
-            outs["qbound_refined_key"] = None
-            outs["qbound_expected_refined_span_length"] = None
-            outs["qbound_expected_refined_length_ratio"] = None
-            outs["qbound_expected_refined_span_fraction"] = None
-            outs["qbound_expected_refine_trim_fraction"] = None
-            outs["qbound_refined_start"] = None
-            outs["qbound_refined_end"] = None
-            outs["qbound_refined_mask"] = None
-            outs["qbound_adaptive_start"] = None
-            outs["qbound_adaptive_end"] = None
-            outs["qbound_adaptive_mask"] = None
+            for name in (
+                "qbound_calibrated_video_proj",
+                "qbound_calibrated_key",
+                "qbound_refined_video_proj",
+                "qbound_refined_key",
+                "qbound_raw_refined_video_proj",
+                "qbound_raw_refined_key",
+                "qbound_coarse_video_proj",
+                "qbound_coarse_key",
+                "qbound_calibration_uncertainty",
+                "qbound_calibration_information",
+                "qbound_calibration_confidence",
+                "qbound_expected_refined_span_length",
+                "qbound_expected_refined_length_ratio",
+                "qbound_expected_refined_span_fraction",
+                "qbound_expected_refine_trim_fraction",
+                "qbound_calibrated_start",
+                "qbound_calibrated_end",
+                "qbound_calibrated_mask",
+                "qbound_raw_refined_start",
+                "qbound_raw_refined_end",
+                "qbound_raw_refined_mask",
+                "qbound_refined_start",
+                "qbound_refined_end",
+                "qbound_refined_mask",
+                "qbound_adaptive_start",
+                "qbound_adaptive_end",
+                "qbound_adaptive_mask",
+            ):
+                outs[name] = None
 
         return video_proj, answer_proj, outs
 

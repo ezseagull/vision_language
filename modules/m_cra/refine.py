@@ -110,52 +110,55 @@ class DecoderLayer(nn.Module):
 
 class Decoder(nn.Module):
     """
-    CRA refinement decoder with Q-Bound Version 1.7.
+    CRA refinement decoder with Q-Bound Version 1.8.
 
-    V1.7 follows:
+    V1.8 follows:
 
-        DECOMPOSE -> RELATE -> COMPOSE -> STABLE REFINE -> GROUND
+        DECOMPOSE -> RELATE -> COMPOSE -> REFINE
+        -> UNCERTAINTY CALIBRATION -> GROUND
 
-    Relative to V1.6, the latent event topology, Q-OEI, Composer scorer, and
-    frame-level boundary scorer are preserved. The key change is gradient and
-    representation routing:
+    The Q-Bound core now exposes three temporal branches:
 
-        COMPOSE
-          |-- differentiable coarse temporal branch
-          |      -> coarse grounded CRA feature
-          |
-          `-- detached top-1 coarse event chain
-                 -> STABLE REFINE
-                    -> refined temporal branch
-                    -> refined grounded CRA feature (MAIN)
+        1) COARSE:
+           differentiable COMPOSE probability. It participates inside the
+           calibrated MAIN probability so the main VQA task can supervise the
+           Composer without a separate coarse-answer loss.
 
-    This decoder exposes BOTH grounded representations using the same CRA
-    feature tensor and the same video-projection dropout realization:
+        2) RAW REFINE:
+           V1.7-style fine boundary proposal inside one detached top-1 coarse
+           chain. It remains available for diagnostics/ablation.
 
-        qbound_coarse_video_proj
-        qbound_refined_video_proj
+        3) CALIBRATED MAIN:
+           uncertainty-calibrated mixture of coarse and raw-refined temporal
+           probabilities. This is the official V1.8 answer/grounding branch.
 
-    The pipeline can therefore compare coarse/refined answer sufficiency without
-    introducing projection/dropout noise. The core also exposes differentiable
-    expected refined span length for the later minimal-sufficient objective.
+    The hard coarse chain routed into REFINE remains detached, preventing the
+    V1.6 Refiner->Composer feedback loop. Unlike V1.7, this decoder does not
+    require an explicit differentiable coarse-answer branch for training:
+    Composer receives main-task gradients directly through the coarse component
+    of the calibrated probability.
 
-    Important controls
-    ------------------
-    * Refined-task gradients do not flow from REFINE into span_composer_score;
-      the hard coarse route is detached inside QBoundCore V1.7.
-    * The differentiable COMPOSE probability is retained as a separate coarse
-      answer branch so Composer can still receive weak VQA supervision.
-    * CRA temporal grounding remains diagnostic-only when Q-Bound is active.
-    * No CRA -> Q-Bound handover.
-    * No direct reasoned-event residual into answer space.
-    * No temporal GT is consumed here.
-    * No explicit minimality loss is implemented in this decoder; it only
-      exposes the quantities required by the pipeline.
+    The decoder therefore exposes answer-space representations:
 
-    Future LLM path
-    ---------------
-    selected_reasoned_event_tokens and selected_event_mask remain propagated for
-    later projection into a frozen LLM/MLLM.
+        qbound_calibrated_video_proj     # MAIN
+        qbound_raw_refined_video_proj    # diagnostic
+        qbound_coarse_video_proj         # diagnostic
+
+    All three use the same CRA x_bar representation, projection layer, and
+    projection-dropout realization for fair comparisons.
+
+    Compatibility:
+      * qbound_video_proj aliases the calibrated MAIN representation.
+      * qbound_refined_video_proj also aliases the calibrated MAIN
+        representation so older wrappers do not silently revert to raw V1.7.
+      * raw V1.7-refined outputs are always named qbound_raw_refined_*.
+
+    No temporal GT, IoU/IoP loss, target span length, minimality loss,
+    CRA->Q-Bound handover, or direct reasoned-event answer residual is
+    introduced here.
+
+    selected_reasoned_event_tokens and selected_event_mask remain propagated
+    for a future frozen LLM/MLLM adapter.
     """
 
     def __init__(
@@ -226,7 +229,7 @@ class Decoder(nn.Module):
         self.do = VisualIntervention(self.cfgs)
 
         # --------------------------------------------------------------
-        # Q-Bound V1.7
+        # Q-Bound V1.8
         # --------------------------------------------------------------
         self.qbound_enabled = bool(
             qbound_cfg.get(
@@ -357,7 +360,7 @@ class Decoder(nn.Module):
                 ),
             )
 
-            # Controlled first V1.7 experiment: Q-Bound learns its own
+            # Controlled first V1.8 experiment: Q-Bound learns its own
             # parameters without changing the upstream video/language
             # representation through the Q-Bound input path.
             self.qbound_detach_backbone_inputs = bool(
@@ -534,26 +537,33 @@ class Decoder(nn.Module):
         window_sizes,
         qbound_time=None,
         coarse_qbound_key=None,
+        raw_refined_qbound_key=None,
     ):
         """
         Build the final temporal contract.
 
-        V1.7 active:
-            official start/end/mask use the frame-refined interval.
+        V1.8 active:
+            official key/start/end/mask are UNCERTAINTY-CALIBRATED.
 
-        The differentiable coarse Composer key is stored separately as
-        ``qbound_coarse_key`` and must never replace the MAIN refined key.
+        Explicit branches:
+            qbound_key / qbound_calibrated_key
+                -> official calibrated MAIN key
+
+            qbound_raw_refined_key
+                -> raw V1.7-style fine-boundary diagnostic key
+
+            qbound_coarse_key
+                -> COMPOSE coarse diagnostic key
 
         Q-Bound inactive:
-            preserve the original CRA fixed-window extraction.
+            preserve the original CRA fixed-window path.
         """
         if qbound_active:
             if qbound_time is None:
                 raise ValueError(
-                    "qbound_time is required for active Q-Bound V1.7."
+                    "qbound_time is required for active Q-Bound V1.8."
                 )
 
-            # MAIN evaluation interval is the V1.7 frame-refined interval.
             time_param = dict(qbound_time)
             time_param["key"] = final_key
         else:
@@ -564,28 +574,35 @@ class Decoder(nn.Module):
 
         if coarse_qbound_key is None:
             coarse_qbound_key = qbound_key
+        if raw_refined_qbound_key is None:
+            raw_refined_qbound_key = qbound_key
 
         time_param["ori_key"] = base_temporal["ori_key"]
         time_param["cra_key"] = base_temporal["cra_key"]
+
+        # Official V1.8 MAIN aliases.
         time_param["qbound_key"] = qbound_key
-        time_param["qbound_coarse_key"] = coarse_qbound_key
+        time_param["qbound_calibrated_key"] = final_key
         time_param["refined_key"] = final_key
 
-        # Compatibility only: V1.7 has no temporal handover.
+        # Controlled diagnostic branches.
+        time_param["qbound_raw_refined_key"] = raw_refined_qbound_key
+        time_param["qbound_coarse_key"] = coarse_qbound_key
+
+        # No CRA/Q-Bound temporal handover.
         time_param["qbound_mix"] = torch.full(
             (final_key.size(0),),
             1.0 if qbound_active else 0.0,
             dtype=final_key.dtype,
             device=final_key.device,
         )
-
         time_param["qbound_handover_enabled"] = torch.as_tensor(
             0.0,
             dtype=final_key.dtype,
             device=final_key.device,
         )
 
-        # Compatibility alias: "adaptive" means final refined interval.
+        # Compatibility aliases: adaptive/refined now mean calibrated MAIN.
         time_param["qbound_adaptive_span_enabled"] = torch.as_tensor(
             1.0 if qbound_active else 0.0,
             dtype=final_key.dtype,
@@ -597,9 +614,29 @@ class Decoder(nn.Module):
             device=final_key.device,
         )
 
-        # Explicit V1.7 routing diagnostics.
+        # Explicit V1.8 branch flags.
+        time_param["qbound_calibrated_span_enabled"] = torch.as_tensor(
+            1.0 if qbound_active else 0.0,
+            dtype=final_key.dtype,
+            device=final_key.device,
+        )
+        time_param["qbound_raw_refined_span_enabled"] = torch.as_tensor(
+            1.0 if qbound_active else 0.0,
+            dtype=final_key.dtype,
+            device=final_key.device,
+        )
         time_param["qbound_stable_refiner_enabled"] = torch.as_tensor(
             1.0 if qbound_active else 0.0,
+            dtype=final_key.dtype,
+            device=final_key.device,
+        )
+        time_param["qbound_uncertainty_calibration_enabled"] = torch.as_tensor(
+            1.0 if qbound_active else 0.0,
+            dtype=final_key.dtype,
+            device=final_key.device,
+        )
+        time_param["qbound_minimal_sufficient_enabled"] = torch.as_tensor(
+            0.0,
             dtype=final_key.dtype,
             device=final_key.device,
         )
@@ -623,7 +660,7 @@ class Decoder(nn.Module):
         use_gpeb=None,
     ):
         del gsub
-        del qbound_mix  # V1.7 intentionally has no CRA->Q-Bound handover.
+        del qbound_mix  # V1.8 intentionally has no CRA->Q-Bound handover.
 
         if use_gpeb is not None:
             use_qbound = bool(use_qbound or use_gpeb)
@@ -718,6 +755,7 @@ class Decoder(nn.Module):
         # --------------------------------------------------------------
         qbound_aux = None
         qbound_time = None
+        raw_refined_qbound_time = None
         coarse_qbound_time = None
         legacy_v15_time = None
         legacy_v14_time = None
@@ -728,7 +766,7 @@ class Decoder(nn.Module):
                 and self.qbound_require_question_only
             ):
                 raise ValueError(
-                    "Q-Bound V1.7 requires question_feature=[B,D]. "
+                    "Q-Bound V1.8 requires question_feature=[B,D]. "
                     "Pass question-only features through CRA.forward(...)."
                 )
 
@@ -754,10 +792,17 @@ class Decoder(nn.Module):
             )
 
             required_keys = {
-                # Main V1.7 and controlled coarse/legacy temporal branches.
+                # Official V1.8 MAIN.
                 "event_temporal_prob",
                 "main_temporal_prob",
                 "main_temporal_logits",
+                "calibrated_temporal_prob",
+                "calibrated_temporal_logits",
+                "calibrated_soft_support",
+
+                # Raw fine and coarse branches.
+                "raw_refined_temporal_prob",
+                "raw_refined_temporal_logits",
                 "refined_temporal_prob",
                 "refined_temporal_logits",
                 "composed_temporal_prob",
@@ -765,12 +810,18 @@ class Decoder(nn.Module):
                 "legacy_v15_composed_temporal_prob",
                 "legacy_v14_event_temporal_prob",
 
-                # V1.7 stable routing.
+                # V1.8 routing/calibration.
                 "stable_refiner_enabled",
+                "uncertainty_calibration_enabled",
+                "minimal_sufficient_enabled",
                 "all_span_refine_marginal_enabled",
                 "refine_hard_coarse_route",
                 "refine_coarse_detached",
                 "refine_selected_span_index",
+                "calibration_uncertainty",
+                "calibration_information",
+                "calibration_confidence",
+                "calibration_confidence_detached",
 
                 # Dynamic latent decomposition.
                 "boundary_hard",
@@ -837,7 +888,7 @@ class Decoder(nn.Module):
                 "soft_selected_event_weights",
                 "composed_reasoned_event_repr",
 
-                # STABLE REFINE.
+                # Raw REFINE posterior.
                 "refiner_enabled",
                 "refine_start_logits",
                 "refine_end_logits",
@@ -860,6 +911,8 @@ class Decoder(nn.Module):
                 "expected_refine_trim_fraction",
                 "expected_refined_start_frame",
                 "expected_refined_end_frame",
+
+                # Coarse and raw-refined hard spans.
                 "coarse_span_start_frame",
                 "coarse_span_end_frame",
                 "coarse_span_frame_length",
@@ -878,68 +931,91 @@ class Decoder(nn.Module):
                 "refine_trim_total_frames",
                 "refine_retained_fraction",
                 "refined_inside_coarse",
+
+                # Official V1.8 calibrated hard span.
+                "calibrated_start_frame_float",
+                "calibrated_end_frame_float",
+                "calibrated_expected_span_length",
+                "calibrated_expected_length_ratio",
+                "calibrated_span_start_frame",
+                "calibrated_span_end_frame",
+                "calibrated_frame_mask",
+                "calibrated_span_frame_length",
+                "calibrated_span_fraction",
+                "calibrated_retained_fraction",
+                "calibrated_trim_left_frames",
+                "calibrated_trim_right_frames",
+                "calibrated_trim_total_frames",
+                "calibrated_span_start",
+                "calibrated_span_end",
+                "calibrated_span_temporal_prob",
+                "calibrated_inside_coarse",
                 "refiner_temperature",
             }
 
             missing = sorted(required_keys.difference(qbound_aux))
             if missing:
                 raise KeyError(
-                    "Q-Bound V1.7 output is missing: "
+                    "Q-Bound V1.8 output is missing: "
                     + ", ".join(missing)
                 )
 
-            # ----------------------------------------------------------
-            # 3a) Differentiable COARSE answer branch.
-            #
-            # IMPORTANT: do NOT wrap in no_grad and do NOT detach
-            # composed_temporal_prob. This branch is how Composer continues
-            # to receive weak VQA supervision after refined gradients are
-            # deliberately blocked at the hard coarse route.
-            # ----------------------------------------------------------
-            coarse_qbound_time = (
-                self.grounding_module
-                .finalize_composed_grounding(
-                    temporal_probability=qbound_aux[
-                        "composed_temporal_prob"
-                    ],
-                    selected_span_start_frame=qbound_aux[
-                        "selected_span_start_frame"
-                    ],
-                    selected_span_end_frame=qbound_aux[
-                        "selected_span_end_frame"
-                    ],
-                    valid_mask=valid_mask,
-                    selected_frame_mask=qbound_aux[
-                        "selected_frame_mask"
-                    ],
-                    window_sizes=window_sizes,
-                    detach_sigma=True,
+            # Fail early if an older routing mechanism is accidentally loaded.
+            if float(
+                qbound_aux["uncertainty_calibration_enabled"]
+                .detach().item()
+            ) != 1.0:
+                raise RuntimeError(
+                    "Q-Bound V1.8 requires uncertainty calibration."
                 )
-            )
-
-            coarse_qbound_key = self._normalize_temporal_distribution(
-                coarse_qbound_time["key"],
-                valid_mask,
-            )
+            if float(
+                qbound_aux["minimal_sufficient_enabled"]
+                .detach().item()
+            ) != 0.0:
+                raise RuntimeError(
+                    "Q-Bound V1.8 must not enable V1.7 minimal-sufficient "
+                    "routing inside the core."
+                )
+            if float(
+                qbound_aux["all_span_refine_marginal_enabled"]
+                .detach().item()
+            ) != 0.0:
+                raise RuntimeError(
+                    "Q-Bound V1.8 must keep V1.6 all-span REFINE "
+                    "marginalization disabled."
+                )
+            if float(
+                qbound_aux["refine_coarse_detached"]
+                .detach().item()
+            ) != 1.0:
+                raise RuntimeError(
+                    "Q-Bound V1.8 requires the hard coarse route into "
+                    "REFINE to remain detached."
+                )
 
             # ----------------------------------------------------------
-            # 3b) V1.7 MAIN refined grounding branch.
+            # 3a) OFFICIAL V1.8 calibrated grounding branch.
+            #
+            # This branch stays differentiable. Its temporal probability
+            # already contains both:
+            #   coarse COMPOSE contribution -> Composer task gradient
+            #   raw REFINE contribution     -> Refiner task gradient
             # ----------------------------------------------------------
             qbound_time = (
                 self.grounding_module
                 .finalize_refined_grounding(
                     temporal_probability=qbound_aux[
-                        "refined_temporal_prob"
+                        "calibrated_temporal_prob"
                     ],
                     refined_span_start_frame=qbound_aux[
-                        "refined_span_start_frame"
+                        "calibrated_span_start_frame"
                     ],
                     refined_span_end_frame=qbound_aux[
-                        "refined_span_end_frame"
+                        "calibrated_span_end_frame"
                     ],
                     valid_mask=valid_mask,
                     refined_frame_mask=qbound_aux[
-                        "refined_frame_mask"
+                        "calibrated_frame_mask"
                     ],
                     coarse_span_start_frame=qbound_aux[
                         "coarse_span_start_frame"
@@ -955,15 +1031,84 @@ class Decoder(nn.Module):
                 )
             )
 
-            qbound_key = self._normalize_temporal_distribution(
+            calibrated_qbound_key = self._normalize_temporal_distribution(
                 qbound_time["key"],
                 valid_mask,
             )
+            qbound_key = calibrated_qbound_key
+            final_key = calibrated_qbound_key
 
             # ----------------------------------------------------------
-            # Historical detached readouts for controlled ablation only.
+            # 3b) RAW REFINE / COARSE / historical diagnostic branches.
+            #
+            # They are intentionally detached. V1.8 no longer needs a
+            # separate coarse-answer training loss: the main calibrated
+            # probability directly supplies task gradient to Composer.
             # ----------------------------------------------------------
             with torch.no_grad():
+                raw_refined_qbound_time = (
+                    self.grounding_module
+                    .finalize_refined_grounding(
+                        temporal_probability=qbound_aux[
+                            "raw_refined_temporal_prob"
+                        ].detach(),
+                        refined_span_start_frame=qbound_aux[
+                            "refined_span_start_frame"
+                        ],
+                        refined_span_end_frame=qbound_aux[
+                            "refined_span_end_frame"
+                        ],
+                        valid_mask=valid_mask,
+                        refined_frame_mask=qbound_aux[
+                            "refined_frame_mask"
+                        ],
+                        coarse_span_start_frame=qbound_aux[
+                            "coarse_span_start_frame"
+                        ],
+                        coarse_span_end_frame=qbound_aux[
+                            "coarse_span_end_frame"
+                        ],
+                        coarse_frame_mask=qbound_aux[
+                            "coarse_frame_mask"
+                        ],
+                        window_sizes=window_sizes,
+                        detach_sigma=True,
+                    )
+                )
+                raw_refined_qbound_key = (
+                    self._normalize_temporal_distribution(
+                        raw_refined_qbound_time["key"],
+                        valid_mask,
+                    )
+                )
+
+                coarse_qbound_time = (
+                    self.grounding_module
+                    .finalize_composed_grounding(
+                        temporal_probability=qbound_aux[
+                            "composed_temporal_prob"
+                        ].detach(),
+                        selected_span_start_frame=qbound_aux[
+                            "selected_span_start_frame"
+                        ],
+                        selected_span_end_frame=qbound_aux[
+                            "selected_span_end_frame"
+                        ],
+                        valid_mask=valid_mask,
+                        selected_frame_mask=qbound_aux[
+                            "selected_frame_mask"
+                        ],
+                        window_sizes=window_sizes,
+                        detach_sigma=True,
+                    )
+                )
+                coarse_qbound_key = (
+                    self._normalize_temporal_distribution(
+                        coarse_qbound_time["key"],
+                        valid_mask,
+                    )
+                )
+
                 legacy_v15_time = (
                     self.grounding_module
                     .finalize_composed_grounding(
@@ -997,36 +1142,54 @@ class Decoder(nn.Module):
                     )
                 )
 
-            final_key = qbound_key
-
-            # SAME x_bar, SAME dropout mask, SAME projection layer.
-            coarse_qbound_video_proj = self._project_grounded_video(
+            # SAME x_bar, SAME projection layer, SAME dropout realization.
+            calibrated_qbound_video_proj = self._project_grounded_video(
                 x_bar=x_bar,
-                temporal_weights=coarse_qbound_key,
+                temporal_weights=calibrated_qbound_key,
                 valid_mask=valid_mask,
                 do=do,
                 projection_dropout_mask=projection_dropout_mask,
                 x_star_proj=x_star_proj,
             )
 
-            refined_qbound_video_proj = self._project_grounded_video(
-                x_bar=x_bar,
-                temporal_weights=qbound_key,
-                valid_mask=valid_mask,
-                do=do,
-                projection_dropout_mask=projection_dropout_mask,
-                x_star_proj=x_star_proj,
-            )
+            # Diagnostic projections do not define training objectives.
+            with torch.no_grad():
+                raw_refined_qbound_video_proj = (
+                    self._project_grounded_video(
+                        x_bar=x_bar,
+                        temporal_weights=raw_refined_qbound_key,
+                        valid_mask=valid_mask,
+                        do=do,
+                        projection_dropout_mask=projection_dropout_mask,
+                        x_star_proj=x_star_proj,
+                    )
+                )
+                coarse_qbound_video_proj = (
+                    self._project_grounded_video(
+                        x_bar=x_bar,
+                        temporal_weights=coarse_qbound_key,
+                        valid_mask=valid_mask,
+                        do=do,
+                        projection_dropout_mask=projection_dropout_mask,
+                        x_star_proj=x_star_proj,
+                    )
+                )
 
-            qbound_video_proj = refined_qbound_video_proj
-            video_proj = refined_qbound_video_proj
+            # Compatibility: "refined" now aliases calibrated MAIN.
+            refined_qbound_video_proj = calibrated_qbound_video_proj
+            qbound_video_proj = calibrated_qbound_video_proj
+            video_proj = calibrated_qbound_video_proj
 
         else:
             coarse_qbound_key = cra_key
+            raw_refined_qbound_key = cra_key
+            calibrated_qbound_key = cra_key
             qbound_key = cra_key
             final_key = cra_key
 
             coarse_qbound_video_proj = cra_video_proj
+            raw_refined_qbound_video_proj = cra_video_proj
+            calibrated_qbound_video_proj = cra_video_proj
             refined_qbound_video_proj = cra_video_proj
             qbound_video_proj = cra_video_proj
             video_proj = cra_video_proj
@@ -1039,26 +1202,45 @@ class Decoder(nn.Module):
             base_temporal=base_temporal,
             qbound_key=qbound_key,
             coarse_qbound_key=coarse_qbound_key,
+            raw_refined_qbound_key=raw_refined_qbound_key,
             qbound_active=qbound_active,
             window_sizes=window_sizes,
             qbound_time=qbound_time,
         )
 
-        # Main answer feature remains the refined branch.
+        # Official answer feature is the V1.8 calibrated MAIN branch.
         time_param["grounding_feature"] = video_proj
         time_param["qbound_feature"] = video_proj
-        time_param["qbound_grounding_feature"] = refined_qbound_video_proj
-        time_param["qbound_temporal_main_feature"] = refined_qbound_video_proj
+        time_param["qbound_grounding_feature"] = (
+            calibrated_qbound_video_proj
+        )
+        time_param["qbound_temporal_main_feature"] = (
+            calibrated_qbound_video_proj
+        )
 
-        # Explicit V1.7 coarse/refined representations.
+        # Explicit V1.8 answer-space branches.
+        time_param["qbound_calibrated_grounding_feature"] = (
+            calibrated_qbound_video_proj
+        )
+        time_param["qbound_calibrated_video_proj"] = (
+            calibrated_qbound_video_proj
+        )
+        time_param["qbound_raw_refined_grounding_feature"] = (
+            raw_refined_qbound_video_proj
+        )
+        time_param["qbound_raw_refined_video_proj"] = (
+            raw_refined_qbound_video_proj
+        )
         time_param["qbound_coarse_grounding_feature"] = (
             coarse_qbound_video_proj
         )
         time_param["qbound_coarse_video_proj"] = (
             coarse_qbound_video_proj
         )
+
+        # Compatibility: refined == calibrated MAIN in V1.8.
         time_param["qbound_refined_video_proj"] = (
-            refined_qbound_video_proj
+            calibrated_qbound_video_proj
         )
         time_param["cra_grounding_feature"] = cra_video_proj
 
@@ -1080,7 +1262,7 @@ class Decoder(nn.Module):
         )
 
         time_param["qbound_reasoned_video_feature"] = (
-            refined_qbound_video_proj
+            calibrated_qbound_video_proj
         )
 
         if qbound_aux is not None:
@@ -1244,28 +1426,24 @@ class Decoder(nn.Module):
                     time_param[f"qbound_{key}"] = qbound_aux[key]
 
             # ----------------------------------------------------------
-            # 9) V1.7 STABLE REFINE outputs.
+            # ----------------------------------------------------------
+            # 9) V1.8 REFINE + UNCERTAINTY CALIBRATION outputs.
             # ----------------------------------------------------------
             refiner_keys = [
                 "refiner_enabled",
                 "stable_refiner_enabled",
+                "uncertainty_calibration_enabled",
+                "minimal_sufficient_enabled",
                 "all_span_refine_marginal_enabled",
                 "refine_hard_coarse_route",
                 "refine_coarse_detached",
                 "refine_selected_span_index",
+
                 "refine_start_logits",
                 "refine_end_logits",
                 "refine_start_candidate_mask",
                 "refine_end_candidate_mask",
                 "refine_selected_pair_valid_mask",
-                "refine_conditional_support",
-                "refined_soft_support",
-                "refined_support_log_bias",
-                "refined_temporal_logits",
-                "refined_temporal_prob",
-                "main_temporal_logits",
-                "main_temporal_prob",
-                "refine_expected_pair_entropy",
                 "refine_selected_pair_posterior",
                 "refine_selected_pair_entropy",
                 "refine_selected_pair_effective_count",
@@ -1274,17 +1452,43 @@ class Decoder(nn.Module):
                 "refine_selected_pair_entropy_ratio",
                 "refine_selected_start_candidate_count",
                 "refine_selected_end_candidate_count",
+
+                "calibration_uncertainty",
+                "calibration_information",
+                "calibration_confidence",
+                "calibration_confidence_detached",
+
+                # Raw-refined differentiable statistics/diagnostics.
+                "refine_conditional_support",
+                "refined_soft_support",
+                "refined_support_log_bias",
+                "refined_temporal_logits",
+                "refined_temporal_prob",
+                "raw_refined_temporal_logits",
+                "raw_refined_temporal_prob",
+                "refine_expected_pair_entropy",
                 "expected_refined_span_length",
                 "expected_refined_length_ratio",
                 "expected_refined_span_fraction",
                 "expected_refine_trim_fraction",
                 "expected_refined_start_frame",
                 "expected_refined_end_frame",
+
+                # Official calibrated soft branch.
+                "calibrated_soft_support",
+                "calibrated_temporal_logits",
+                "calibrated_temporal_prob",
+                "main_temporal_logits",
+                "main_temporal_prob",
+
+                # Coarse interval.
                 "coarse_span_start_frame",
                 "coarse_span_end_frame",
                 "coarse_span_frame_length",
                 "coarse_span_fraction",
                 "coarse_frame_mask",
+
+                # Raw V1.7-style hard-refined interval.
                 "refined_span_start_frame",
                 "refined_span_end_frame",
                 "refined_frame_mask",
@@ -1298,6 +1502,26 @@ class Decoder(nn.Module):
                 "refine_trim_total_frames",
                 "refine_retained_fraction",
                 "refined_inside_coarse",
+
+                # Official V1.8 calibrated hard interval.
+                "calibrated_start_frame_float",
+                "calibrated_end_frame_float",
+                "calibrated_expected_span_length",
+                "calibrated_expected_length_ratio",
+                "calibrated_span_start_frame",
+                "calibrated_span_end_frame",
+                "calibrated_frame_mask",
+                "calibrated_span_frame_length",
+                "calibrated_span_fraction",
+                "calibrated_retained_fraction",
+                "calibrated_trim_left_frames",
+                "calibrated_trim_right_frames",
+                "calibrated_trim_total_frames",
+                "calibrated_span_start",
+                "calibrated_span_end",
+                "calibrated_span_temporal_prob",
+                "calibrated_inside_coarse",
+
                 "refiner_temperature",
             ]
             for key in refiner_keys:
@@ -1305,7 +1529,7 @@ class Decoder(nn.Module):
                     time_param[f"qbound_{key}"] = qbound_aux[key]
 
             # ----------------------------------------------------------
-            # 10) Grounding-adapter diagnostics from the MAIN refined key.
+            # 10) Grounding-adapter diagnostics from calibrated MAIN key.
             # ----------------------------------------------------------
             grounding_diag_keys = [
                 "adaptive_span_used",
@@ -1383,6 +1607,34 @@ class Decoder(nn.Module):
                 coarse_qbound_time["adaptive_span_key_mass"]
             )
 
+            # ----------------------------------------------------------
+            # 11b) RAW V1.7-style REFINE diagnostic branch.
+            # ----------------------------------------------------------
+            time_param["qbound_raw_refined_pre_smooth_key"] = (
+                raw_refined_qbound_time["pre_smooth_key"]
+            )
+            time_param["qbound_raw_refined_post_smooth_key"] = (
+                raw_refined_qbound_key
+            )
+            time_param["qbound_raw_refined_start"] = (
+                raw_refined_qbound_time["start"]
+            )
+            time_param["qbound_raw_refined_end"] = (
+                raw_refined_qbound_time["end"]
+            )
+            time_param["qbound_raw_refined_mask"] = (
+                raw_refined_qbound_time["mask"]
+            )
+            time_param["qbound_raw_refined_span_length"] = (
+                raw_refined_qbound_time["refined_span_length"]
+            )
+            time_param["qbound_raw_refined_span_fraction"] = (
+                raw_refined_qbound_time["refined_span_fraction"]
+            )
+            time_param["qbound_raw_refined_span_key_mass"] = (
+                raw_refined_qbound_time["refined_span_key_mass"]
+            )
+
             # Historical detached readouts.
             if legacy_v15_time is not None:
                 time_param["qbound_v15_diagnostic_key"] = (
@@ -1423,55 +1675,110 @@ class Decoder(nn.Module):
                 )
 
             # ----------------------------------------------------------
-            # 12) Populate qbound_aux with decoder/adaptor interfaces.
+            # ----------------------------------------------------------
+            # 12) Populate qbound_aux with V1.8 decoder/adaptor interfaces.
             # ----------------------------------------------------------
             qbound_aux["cra_key"] = cra_key
-            qbound_aux["event_key"] = qbound_key
-            qbound_aux["qbound_key"] = qbound_key
-            qbound_aux["qbound_coarse_key"] = coarse_qbound_key
+
+            # Official calibrated MAIN.
+            qbound_aux["event_key"] = calibrated_qbound_key
+            qbound_aux["qbound_key"] = calibrated_qbound_key
+            qbound_aux["qbound_calibrated_key"] = calibrated_qbound_key
             qbound_aux["final_key"] = final_key
+
+            # Compatibility: refined_key now means calibrated MAIN.
             qbound_aux["refined_key"] = final_key
+
+            # Explicit diagnostic temporal branches.
+            qbound_aux["qbound_raw_refined_key"] = (
+                raw_refined_qbound_key
+            )
+            qbound_aux["qbound_coarse_key"] = coarse_qbound_key
 
             qbound_aux["qbound_mix"] = torch.ones(
                 batch_size,
-                dtype=qbound_key.dtype,
-                device=qbound_key.device,
+                dtype=calibrated_qbound_key.dtype,
+                device=calibrated_qbound_key.device,
             )
             qbound_aux["qbound_handover_enabled"] = torch.as_tensor(
                 0.0,
-                dtype=qbound_key.dtype,
-                device=qbound_key.device,
+                dtype=calibrated_qbound_key.dtype,
+                device=calibrated_qbound_key.device,
             )
+
+            # Branch flags.
             qbound_aux["qbound_adaptive_span_enabled"] = torch.as_tensor(
                 1.0,
-                dtype=qbound_key.dtype,
-                device=qbound_key.device,
+                dtype=calibrated_qbound_key.dtype,
+                device=calibrated_qbound_key.device,
             )
             qbound_aux["qbound_refined_span_enabled"] = torch.as_tensor(
                 1.0,
-                dtype=qbound_key.dtype,
-                device=qbound_key.device,
+                dtype=calibrated_qbound_key.dtype,
+                device=calibrated_qbound_key.device,
+            )
+            qbound_aux["qbound_calibrated_span_enabled"] = torch.as_tensor(
+                1.0,
+                dtype=calibrated_qbound_key.dtype,
+                device=calibrated_qbound_key.device,
+            )
+            qbound_aux["qbound_raw_refined_span_enabled"] = torch.as_tensor(
+                1.0,
+                dtype=calibrated_qbound_key.dtype,
+                device=calibrated_qbound_key.device,
             )
             qbound_aux["qbound_stable_refiner_enabled"] = torch.as_tensor(
                 1.0,
-                dtype=qbound_key.dtype,
-                device=qbound_key.device,
+                dtype=calibrated_qbound_key.dtype,
+                device=calibrated_qbound_key.device,
+            )
+            qbound_aux[
+                "qbound_uncertainty_calibration_enabled"
+            ] = torch.as_tensor(
+                1.0,
+                dtype=calibrated_qbound_key.dtype,
+                device=calibrated_qbound_key.device,
+            )
+            qbound_aux["qbound_minimal_sufficient_enabled"] = (
+                torch.as_tensor(
+                    0.0,
+                    dtype=calibrated_qbound_key.dtype,
+                    device=calibrated_qbound_key.device,
+                )
             )
 
-            # V1.7 answer-space representations.
+            # ----------------------------------------------------------
+            # V1.8 answer-space representations.
+            # ----------------------------------------------------------
             qbound_aux["cra_video_proj"] = cra_video_proj
-            qbound_aux["qbound_video_proj"] = refined_qbound_video_proj
+
+            qbound_aux["qbound_video_proj"] = (
+                calibrated_qbound_video_proj
+            )
+            qbound_aux["main_video_proj"] = (
+                calibrated_qbound_video_proj
+            )
+            qbound_aux["temporal_main_video_proj"] = (
+                calibrated_qbound_video_proj
+            )
+            qbound_aux["qbound_calibrated_video_proj"] = (
+                calibrated_qbound_video_proj
+            )
+
+            # Compatibility: "refined" == calibrated MAIN.
             qbound_aux["qbound_refined_video_proj"] = (
-                refined_qbound_video_proj
+                calibrated_qbound_video_proj
+            )
+
+            # Diagnostic-only branch representations.
+            qbound_aux["qbound_raw_refined_video_proj"] = (
+                raw_refined_qbound_video_proj
             )
             qbound_aux["qbound_coarse_video_proj"] = (
                 coarse_qbound_video_proj
             )
-            qbound_aux["temporal_main_video_proj"] = (
-                refined_qbound_video_proj
-            )
-            qbound_aux["main_video_proj"] = video_proj
 
+            # No direct event-token residual into answer space.
             qbound_aux["qbound_reasoning_residual"] = zero_residual
             qbound_aux["qbound_reasoning_residual_used"] = zero_residual
             qbound_aux["qbound_reasoning_scale"] = torch.as_tensor(
@@ -1487,13 +1794,31 @@ class Decoder(nn.Module):
                 )
             )
 
-            # MAIN refined key.
+            # ----------------------------------------------------------
+            # MAIN calibrated key before/after grounding-module smoothing.
+            # ----------------------------------------------------------
             qbound_aux["qbound_pre_smooth_key"] = (
                 qbound_time["pre_smooth_key"]
             )
-            qbound_aux["qbound_post_smooth_key"] = qbound_key
+            qbound_aux["qbound_post_smooth_key"] = (
+                calibrated_qbound_key
+            )
+            qbound_aux["qbound_calibrated_pre_smooth_key"] = (
+                qbound_time["pre_smooth_key"]
+            )
+            qbound_aux["qbound_calibrated_post_smooth_key"] = (
+                calibrated_qbound_key
+            )
 
-            # Differentiable coarse key.
+            # RAW REFINE diagnostic key.
+            qbound_aux["qbound_raw_refined_pre_smooth_key"] = (
+                raw_refined_qbound_time["pre_smooth_key"]
+            )
+            qbound_aux["qbound_raw_refined_post_smooth_key"] = (
+                raw_refined_qbound_key
+            )
+
+            # COARSE diagnostic key.
             qbound_aux["qbound_coarse_pre_smooth_key"] = (
                 coarse_qbound_time["pre_smooth_key"]
             )
@@ -1501,7 +1826,23 @@ class Decoder(nn.Module):
                 coarse_qbound_key
             )
 
-            # Main refined interval.
+            # ----------------------------------------------------------
+            # Official V1.8 calibrated interval.
+            # ----------------------------------------------------------
+            qbound_aux["qbound_calibrated_start"] = qbound_time["start"]
+            qbound_aux["qbound_calibrated_end"] = qbound_time["end"]
+            qbound_aux["qbound_calibrated_mask"] = qbound_time["mask"]
+            qbound_aux["qbound_calibrated_span_length"] = qbound_time[
+                "refined_span_length"
+            ]
+            qbound_aux["qbound_calibrated_span_fraction"] = qbound_time[
+                "refined_span_fraction"
+            ]
+            qbound_aux["qbound_calibrated_span_key_mass"] = qbound_time[
+                "refined_span_key_mass"
+            ]
+
+            # Compatibility: adaptive/refined aliases mean calibrated MAIN.
             qbound_aux["qbound_adaptive_start"] = qbound_time["start"]
             qbound_aux["qbound_adaptive_end"] = qbound_time["end"]
             qbound_aux["qbound_adaptive_mask"] = qbound_time["mask"]
@@ -1528,7 +1869,31 @@ class Decoder(nn.Module):
                 "refined_span_key_mass"
             ]
 
-            # Explicit differentiable coarse interval/key.
+            # ----------------------------------------------------------
+            # RAW V1.7-style refined interval.
+            # ----------------------------------------------------------
+            qbound_aux["qbound_raw_refined_start"] = (
+                raw_refined_qbound_time["start"]
+            )
+            qbound_aux["qbound_raw_refined_end"] = (
+                raw_refined_qbound_time["end"]
+            )
+            qbound_aux["qbound_raw_refined_mask"] = (
+                raw_refined_qbound_time["mask"]
+            )
+            qbound_aux["qbound_raw_refined_span_length"] = (
+                raw_refined_qbound_time["refined_span_length"]
+            )
+            qbound_aux["qbound_raw_refined_span_fraction"] = (
+                raw_refined_qbound_time["refined_span_fraction"]
+            )
+            qbound_aux["qbound_raw_refined_span_key_mass"] = (
+                raw_refined_qbound_time["refined_span_key_mass"]
+            )
+
+            # ----------------------------------------------------------
+            # COARSE interval/key.
+            # ----------------------------------------------------------
             qbound_aux["qbound_coarse_start"] = (
                 coarse_qbound_time["start"]
             )
@@ -1548,7 +1913,7 @@ class Decoder(nn.Module):
                 coarse_qbound_time["adaptive_span_key_mass"]
             )
 
-            # Same refined key + coarse/fixed readout diagnostics.
+            # Same calibrated MAIN key + alternate hard readouts.
             qbound_aux["qbound_coarse_v15_start"] = qbound_time[
                 "coarse_v15_start"
             ]
@@ -1581,40 +1946,68 @@ class Decoder(nn.Module):
                 "legacy_fixed_window_span_length"
             ]
 
-            qbound_aux["qbound_refined_vs_coarse_span_length_ratio"] = (
-                qbound_time["refined_vs_coarse_span_length_ratio"]
-            )
-            qbound_aux["qbound_refined_vs_legacy_span_length_ratio"] = (
-                qbound_time["refined_vs_legacy_span_length_ratio"]
-            )
-            qbound_aux["qbound_refined_minus_coarse_key_mass"] = qbound_time[
-                "refined_minus_coarse_key_mass"
-            ]
-            qbound_aux["qbound_refined_minus_legacy_key_mass"] = qbound_time[
-                "refined_minus_legacy_key_mass"
-            ]
-            qbound_aux["qbound_refined_trimmed_frame_count"] = qbound_time[
-                "refined_trimmed_frame_count"
-            ]
+            qbound_aux[
+                "qbound_refined_vs_coarse_span_length_ratio"
+            ] = qbound_time["refined_vs_coarse_span_length_ratio"]
+            qbound_aux[
+                "qbound_refined_vs_legacy_span_length_ratio"
+            ] = qbound_time["refined_vs_legacy_span_length_ratio"]
+            qbound_aux[
+                "qbound_refined_minus_coarse_key_mass"
+            ] = qbound_time["refined_minus_coarse_key_mass"]
+            qbound_aux[
+                "qbound_refined_minus_legacy_key_mass"
+            ] = qbound_time["refined_minus_legacy_key_mass"]
+            qbound_aux[
+                "qbound_refined_trimmed_frame_count"
+            ] = qbound_time["refined_trimmed_frame_count"]
 
             # Historical detached readouts.
             if legacy_v15_time is not None:
                 qbound_aux["v15_diagnostic_key"] = legacy_v15_time["key"]
-                qbound_aux["v15_diagnostic_start"] = legacy_v15_time["start"]
-                qbound_aux["v15_diagnostic_end"] = legacy_v15_time["end"]
-                qbound_aux["v15_diagnostic_mask"] = legacy_v15_time["mask"]
+                qbound_aux["v15_diagnostic_start"] = (
+                    legacy_v15_time["start"]
+                )
+                qbound_aux["v15_diagnostic_end"] = (
+                    legacy_v15_time["end"]
+                )
+                qbound_aux["v15_diagnostic_mask"] = (
+                    legacy_v15_time["mask"]
+                )
 
             if legacy_v14_time is not None:
                 qbound_aux["v14_diagnostic_key"] = legacy_v14_time["key"]
-                qbound_aux["v14_diagnostic_start"] = legacy_v14_time["start"]
-                qbound_aux["v14_diagnostic_end"] = legacy_v14_time["end"]
-                qbound_aux["v14_diagnostic_mask"] = legacy_v14_time["mask"]
+                qbound_aux["v14_diagnostic_start"] = (
+                    legacy_v14_time["start"]
+                )
+                qbound_aux["v14_diagnostic_end"] = (
+                    legacy_v14_time["end"]
+                )
+                qbound_aux["v14_diagnostic_mask"] = (
+                    legacy_v14_time["mask"]
+                )
 
+            # Key-distance diagnostics.
             qbound_aux["cra_qbound_key_l1"] = (
-                (qbound_key - cra_key).abs().mean(dim=-1)
+                (calibrated_qbound_key - cra_key)
+                .abs().mean(dim=-1)
             )
+            qbound_aux["coarse_calibrated_key_l1"] = (
+                (coarse_qbound_key - calibrated_qbound_key)
+                .abs().mean(dim=-1)
+            )
+            qbound_aux["raw_refined_calibrated_key_l1"] = (
+                (raw_refined_qbound_key - calibrated_qbound_key)
+                .abs().mean(dim=-1)
+            )
+            qbound_aux["coarse_raw_refined_key_l1"] = (
+                (coarse_qbound_key - raw_refined_qbound_key)
+                .abs().mean(dim=-1)
+            )
+
+            # Compatibility alias used by old loggers.
             qbound_aux["coarse_refined_key_l1"] = (
-                (coarse_qbound_key - qbound_key).abs().mean(dim=-1)
+                qbound_aux["coarse_calibrated_key_l1"]
             )
 
             qbound_aux["question_only_conditioning"] = torch.as_tensor(
@@ -1623,7 +2016,7 @@ class Decoder(nn.Module):
                 device=video_proj.device,
             )
 
-            # Old compatibility fields remain disabled.
+            # Old counterfactual/merge interfaces remain disabled.
             qbound_aux["merge_reasoning_counterfactual"] = torch.as_tensor(
                 0.0,
                 dtype=video_proj.dtype,
