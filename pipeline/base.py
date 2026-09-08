@@ -51,7 +51,7 @@ class BasePipeline(object):
         self.optimizer = build_optimizer(cfgs, self.model)
         self._configure_qbound_optimizer_groups()
         self._check_qbound_optimizer()
-        self._check_qbound_v18_components()
+        self._check_qbound_components()
         self._check_optimizer_coverage()
 
         # Build the scheduler only after the parameter groups are final.
@@ -108,7 +108,7 @@ class BasePipeline(object):
     @staticmethod
     def _is_qbound_parameter_name(name):
         """
-        Q-Bound V1.8 trainable parameters live under:
+        Q-Bound trainable parameters live under:
             decoder.qbound.*
 
         DataParallel may prefix names with ``module.``; substring matching is
@@ -126,7 +126,7 @@ class BasePipeline(object):
 
         The grounding module and shared CRA projection remain base-model
         parameters. Only QBoundCore trainable parameters use the dedicated
-        Q-Bound learning rate in V1.8.
+        Q-Bound learning rate.
         """
         if not self._qbound_enabled():
             return
@@ -159,7 +159,7 @@ class BasePipeline(object):
         if not named_qbound_parameters:
             raise RuntimeError(
                 "Q-Bound is enabled, but no trainable parameter whose "
-                "name contains 'qbound' was found. Check that the V1.7 "
+                "name contains 'qbound' was found. Check that the Q-Bound "
                 "refine decoder is instantiated."
             )
 
@@ -443,7 +443,7 @@ class BasePipeline(object):
             f"{actual_qbound_lr}"
         )
 
-        # V1.8 debug summary: all trainable Q-Bound tensors should live under
+        # Debug summary: all trainable Q-Bound tensors should live under
         # decoder.qbound.*. This catches accidental trainable Q-Bound tensors
         # added outside the dedicated core while remaining DataParallel-safe.
         prefix_counts = {}
@@ -471,26 +471,26 @@ class BasePipeline(object):
             print(f"  {prefix}: {count} tensors")
         print("")
 
-    def _check_qbound_v18_components(self):
+    def _check_qbound_components(self):
         """
-        V1.8 structural safety check for trainable Q-Bound stages.
+        Structural safety check for controlled Q-Bound V1.8/V1.9 runs.
 
-        V1.8 does NOT add a new trainable calibration module. The method reuses the
-        same trainable Q-Bound components as V1.7:
+        V1.9 intentionally keeps the same trainable stage modules as V1.8:
 
             DECOMPOSE -> RELATE -> COMPOSE -> REFINE -> GROUND
 
-        Uncertainty calibration is parameter-free and is implemented in the core's
-        routing/fusion logic, so there should be no separate calibration optimizer
-        group.
+        The V1.9 changes are routing/fusion changes:
+          * no hard top-1 Composer route into REFINE;
+          * detached Composer posterior defines the Refiner pair prior;
+          * posterior-stable reliability calibration is parameter-free.
 
-        This check verifies:
-          * all expected trainable Q-Bound stage modules exist;
-          * every such tensor is inside the dedicated ``qbound`` optimizer group;
-          * the group uses ``optim.qbound_lr``;
-          * calibration has not accidentally introduced a separately named
-            trainable Q-Bound parameter;
-          * the shared CRA ``video_proj`` remains outside the Q-Bound group.
+        Therefore:
+          * no new optimizer group is expected;
+          * all trainable Q-Bound tensors must remain in the dedicated
+            ``qbound`` optimizer group and use ``optim.qbound_lr``;
+          * shared CRA ``decoder.video_proj`` must remain in the base group;
+          * V1.9 config must advertise the expected routing contract;
+          * no trainable calibration/reliability gate may silently appear.
         """
         if not self._qbound_enabled():
             return
@@ -505,10 +505,32 @@ class BasePipeline(object):
         if not isinstance(refinement_cfg, dict):
             refinement_cfg = {}
 
-        # Keep BasePipeline reusable for older versions; enforce this stronger
-        # contract only for the controlled V1.8 run.
-        if version != "1.8":
+        # Keep BasePipeline reusable for older/other experimental versions.
+        if version not in {"1.8", "1.9"}:
             return
+
+        if version == "1.9":
+            expected_v19_flags = {
+                "hard_coarse_route": False,
+                "detach_coarse": True,
+                "posterior_guided": True,
+                "posterior_stable_reliability": True,
+            }
+
+            for key, expected in expected_v19_flags.items():
+                if key not in refinement_cfg:
+                    raise RuntimeError(
+                        "Q-Bound V1.9 config is missing refinement."
+                        f"{key}. Expected {expected!r}."
+                    )
+
+                actual = bool(refinement_cfg[key])
+                if actual != expected:
+                    raise RuntimeError(
+                        "Q-Bound V1.9 routing config mismatch for "
+                        f"refinement.{key}: expected {expected!r}, "
+                        f"got {actual!r}."
+                    )
 
         required_component_tokens = {
             "DECOMPOSE": ("boundary_classifier",),
@@ -538,7 +560,8 @@ class BasePipeline(object):
 
         if qbound_group is None:
             raise RuntimeError(
-                "Q-Bound V1.8 is enabled but optimizer group 'qbound' is missing."
+                f"Q-Bound V{version} is enabled but optimizer group "
+                "'qbound' is missing."
             )
 
         qbound_group_ids = {
@@ -580,20 +603,18 @@ class BasePipeline(object):
 
         if missing_components:
             raise RuntimeError(
-                "Q-Bound V1.8 expected trainable components are missing:\n"
+                f"Q-Bound V{version} expected trainable components are missing:\n"
                 + "\n".join(missing_components)
             )
 
         if misplaced_parameters:
             raise RuntimeError(
-                "Q-Bound V1.8 trainable tensors found outside optimizer group "
-                "'qbound':\n"
+                f"Q-Bound V{version} trainable tensors found outside "
+                "optimizer group 'qbound':\n"
                 + "\n".join(misplaced_parameters)
             )
 
-        expected_qbound_lr = float(
-            self.cfgs["optim"]["qbound_lr"]
-        )
+        expected_qbound_lr = float(self.cfgs["optim"]["qbound_lr"])
         actual_qbound_lr = float(qbound_group["lr"])
 
         if not math.isclose(
@@ -603,36 +624,40 @@ class BasePipeline(object):
             abs_tol=0.0,
         ):
             raise RuntimeError(
-                "Q-Bound V1.8 component group LR mismatch: "
+                f"Q-Bound V{version} component group LR mismatch: "
                 f"expected {expected_qbound_lr}, got {actual_qbound_lr}."
             )
 
-        # V1.8 calibration must remain parameter-free. A newly introduced
-        # trainable Q-Bound parameter whose name explicitly advertises calibration
-        # would indicate that the controlled V1.8 mechanism was changed.
-        calibration_tokens = (
+        forbidden_trainable_tokens = (
             "calibration_gate",
             "calibration_score",
             "uncertainty_gate",
             "uncertainty_score",
+            "reliability_gate",
+            "reliability_score",
+            "posterior_gate",
+            "posterior_score",
         )
-        unexpected_calibration_parameters = [
+        unexpected_routing_parameters = [
             name
             for name, parameter in trainable_named_parameters
             if (
                 self._is_qbound_parameter_name(name)
-                and any(token in name.lower() for token in calibration_tokens)
+                and any(
+                    token in name.lower()
+                    for token in forbidden_trainable_tokens
+                )
             )
         ]
 
-        if unexpected_calibration_parameters:
+        if unexpected_routing_parameters:
             raise RuntimeError(
-                "Q-Bound V1.8 calibration is intended to be parameter-free, "
-                "but trainable calibration parameters were found:\n"
-                + "\n".join(unexpected_calibration_parameters)
+                f"Q-Bound V{version} controlled routing/calibration is "
+                "intended to be parameter-free, but trainable routing "
+                "parameters were found:\n"
+                + "\n".join(unexpected_routing_parameters)
             )
 
-        # Shared CRA video_proj is intentionally NOT a Q-Bound parameter.
         shared_video_proj_in_qbound_group = []
         for name, parameter in trainable_named_parameters:
             normalized_name = (
@@ -655,23 +680,28 @@ class BasePipeline(object):
                 + "\n".join(shared_video_proj_in_qbound_group)
             )
 
-        print("[Q-Bound V1.8 Component Check]")
+        print(f"[Q-Bound V{version} Component Check]")
         for component_name, summary in component_summary.items():
             print(
                 f"  {component_name}: "
                 f"{summary['tensors']} tensors, "
                 f"{summary['parameters']:,} parameters"
             )
+
+        if version == "1.9":
+            print("  detached posterior-guided refinement config: YES")
+            print("  posterior-stable reliability config: YES")
+
+        print("  routing/calibration is parameter-free: YES")
+        print("  shared CRA video_proj remains in base optimizer group: YES")
         print(
-            "  uncertainty calibration is parameter-free: YES"
-        )
-        print(
-            "  shared CRA video_proj remains in base optimizer group: YES"
-        )
-        print(
-            "  all V1.8 Q-Bound trainable components use qbound_lr: "
+            f"  all V{version} Q-Bound trainable components use qbound_lr: "
             f"{actual_qbound_lr}\n"
         )
+
+    # Backward-compatible alias for older debug code.
+    def _check_qbound_v18_components(self):
+        return self._check_qbound_components()
 
 
     def _check_optimizer_coverage(self):

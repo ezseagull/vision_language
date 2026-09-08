@@ -11,46 +11,54 @@ from modules.m_cra.causal_module import LinguisticInterventionGraph
 
 class CRA(nn.Module):
     """
-    CRA wrapper with Q-Bound Version 1.8.
+    CRA wrapper with Q-Bound Version 1.9.
 
-    Q-Bound V1.8:
+    Q-Bound V1.9:
 
-        DECOMPOSE -> RELATE -> COMPOSE -> REFINE
-        -> UNCERTAINTY CALIBRATION -> GROUND
+        DECOMPOSE -> RELATE -> COMPOSE
+                    |
+                    +-> differentiable coarse MAIN component
+                    |
+                    +-> detached Composer posterior -> posterior-guided REFINE
+                                                       -> reliability calibration
+                                                       -> GROUND
 
-    CRA remains the downstream VideoQA testbed. The official returned
-    ``video_proj`` is always the uncertainty-calibrated V1.8 representation.
+    CRA remains only the downstream VideoQA testbed. The official returned
+    ``video_proj`` is the reliability-calibrated V1.9 MAIN representation.
 
     Three answer-space branches are exposed:
 
         qbound_calibrated_video_proj
-            Official MAIN branch.
+            Official V1.9 MAIN branch.
 
         qbound_raw_refined_video_proj
-            Raw V1.7-style REFINE branch, diagnostics/ablation only.
+            Posterior-guided fine REFINE branch, diagnostics/ablation only.
 
         qbound_coarse_video_proj
-            COMPOSE coarse branch, diagnostics/ablation only.
+            Detached hard-top1 COMPOSE branch, diagnostics/ablation only.
 
     Compatibility:
       * qbound_refined_video_proj aliases the calibrated MAIN branch.
-      * raw fine refinement is always named qbound_raw_refined_*.
+      * legacy V1.8 calibration names remain available, but
+        ``calibration_confidence`` now aliases the detached V1.9 reliability.
 
     Gradient/routing controls:
       * question-only semantics define Q-Bound temporal reasoning;
-      * the top-1 coarse chain routed into REFINE remains detached;
-      * V1.6 all-span REFINE marginalization remains disabled;
-      * V1.7 minimal-sufficient routing is disabled;
-      * the calibrated MAIN probability contains both differentiable coarse
-        and fine components, so the main task can train Composer and Refiner
-        without a separate coarse-answer or minimality objective;
-      * calibration confidence is detached inside QBoundCore;
-      * no CRA->Q-Bound handover;
+      * REFINE no longer receives a deterministic hard top-1 Composer region;
+      * the Composer posterior routed into REFINE is explicitly detached;
+      * V1.6 differentiable all-span REFINE marginalization remains disabled;
+      * V1.7 minimal-sufficient routing remains disabled;
+      * the MAIN probability contains differentiable coarse and refined
+        components, so the task can train Composer and Refiner while the
+        Composer->Refiner routing prior stays stop-gradient;
+      * V1.9 reliability is detached before coarse/fine fusion;
+      * no CRA->Q-Bound temporal handover;
       * no direct reasoned-event residual into answer space;
-      * no temporal GT is consumed here.
+      * no temporal GT, IoU/IoP loss, or target span length is consumed here.
 
-    selected_reasoned_event_tokens and selected_event_mask remain available
-    for a future frozen LLM/MLLM adapter.
+    Hard top-1 Composer outputs are intentionally retained as diagnostics and
+    as a future selected-event-token interface; they no longer define the
+    Refiner search domain.
     """
 
     def __init__(self, cfgs, tokenizer) -> None:
@@ -85,10 +93,18 @@ class CRA(nn.Module):
                 "version",
                 model_cfg.get(
                     "qbound_version",
-                    model_cfg.get("gpeb_version", "1.8"),
+                    model_cfg.get("gpeb_version", "1.9"),
                 ),
             )
         )
+
+        # This wrapper is the controlled V1.9 contract. Fail early instead of
+        # silently pairing the V1.9 decoder with a V1.8 core/config.
+        if self.qbound_enabled and self.qbound_version != "1.9":
+            raise ValueError(
+                "Q-Bound is enabled, but this CRA wrapper expects "
+                f"model.qbound.version='1.9'; got {self.qbound_version!r}."
+            )
         self.qbound_require_question_only = bool(
             qbound_cfg.get(
                 "require_question_only",
@@ -302,12 +318,13 @@ class CRA(nn.Module):
         qbound_mix=1.0,
     ):
         """
-        Refined CRA/Q-Bound V1.8 forward.
+        Refined CRA/Q-Bound V1.9 forward.
 
-        The returned ``video_proj`` is the official uncertainty-calibrated MAIN
-        representation. Raw-refined and coarse representations are diagnostics.
+        The returned ``video_proj`` is the official posterior-stable,
+        reliability-calibrated V1.9 MAIN representation. The raw posterior-guided
+        Refiner and hard-top1 Composer representations are diagnostics only.
 
-        ``qbound_mix`` is compatibility-only; V1.8 has no CRA/Q-Bound handover.
+        ``qbound_mix`` is compatibility-only; V1.9 has no CRA/Q-Bound handover.
         """
         mode = mode.upper()
 
@@ -363,7 +380,7 @@ class CRA(nn.Module):
             if question is None:
                 if self.qbound_require_question_only:
                     raise ValueError(
-                        "Q-Bound V1.8 requires question-only token ids. "
+                        "Q-Bound V1.9 requires question-only token ids. "
                         "Pass them through CRA.forward(..., question=...). "
                         "Do not reuse candidate-answer features."
                     )
@@ -407,7 +424,7 @@ class CRA(nn.Module):
         )
 
         # --------------------------------------------------------------
-        # Validate V1.8 decoder/core contract.
+        # Validate V1.9 decoder/core contract.
         # --------------------------------------------------------------
         if use_qbound:
             required_time_keys = {
@@ -439,6 +456,31 @@ class CRA(nn.Module):
                 "qbound_calibration_information",
                 "qbound_calibration_confidence",
                 "qbound_calibration_confidence_detached",
+                "qbound_calibration_reliability",
+                "qbound_refiner_information_gain",
+                "qbound_refined_semantic_retention",
+                "qbound_base_refiner_confidence",
+
+                # V1.9 posterior-guided routing / posterior-stable reliability.
+                "qbound_posterior_guided_refinement_enabled",
+                "qbound_posterior_stable_reliability_enabled",
+                "qbound_reliability_gain_factor",
+                "qbound_composer_pair_prior",
+                "qbound_composer_endpoint_pair_prior",
+                "qbound_composer_pair_prior_valid_mask",
+                "qbound_composer_pair_prior_entropy",
+                "qbound_composer_pair_prior_entropy_ratio",
+                "qbound_composer_pair_prior_effective_count",
+                "qbound_composer_pair_prior_top1_posterior",
+                "qbound_composer_pair_prior_candidate_count",
+                "qbound_composer_pair_soft_support",
+                "qbound_composer_expected_start_frame",
+                "qbound_composer_expected_end_frame",
+                "qbound_composer_expected_span_length",
+                "qbound_main_pair_posterior",
+                "qbound_main_pair_entropy",
+                "qbound_main_pair_effective_count",
+                "qbound_main_pair_top1_posterior",
 
                 # COMPOSE.
                 "qbound_span_posterior",
@@ -519,13 +561,13 @@ class CRA(nn.Module):
             )
             if missing_time_keys:
                 raise KeyError(
-                    "RefineDecoder/Q-Bound V1.8 time_param output is missing: "
+                    "RefineDecoder/Q-Bound V1.9 time_param output is missing: "
                     + ", ".join(missing_time_keys)
                 )
 
             if qbound_aux is None:
                 raise KeyError(
-                    "RefineDecoder/Q-Bound V1.8 must expose "
+                    "RefineDecoder/Q-Bound V1.9 must expose "
                     "time_param['qbound_aux']."
                 )
 
@@ -567,6 +609,31 @@ class CRA(nn.Module):
                 "calibration_information",
                 "calibration_confidence",
                 "calibration_confidence_detached",
+                "calibration_reliability",
+                "refiner_information_gain",
+                "refined_semantic_retention",
+                "base_refiner_confidence",
+                "reliability_gain_factor",
+                "posterior_guided_refinement_enabled",
+                "posterior_stable_reliability_enabled",
+
+                # Detached Composer pair prior / V1.9 MAIN pair posterior.
+                "composer_pair_prior",
+                "composer_endpoint_pair_prior",
+                "composer_pair_prior_valid_mask",
+                "composer_pair_prior_entropy",
+                "composer_pair_prior_entropy_ratio",
+                "composer_pair_prior_effective_count",
+                "composer_pair_prior_top1_posterior",
+                "composer_pair_prior_candidate_count",
+                "composer_pair_soft_support",
+                "composer_expected_start_frame",
+                "composer_expected_end_frame",
+                "composer_expected_span_length",
+                "main_pair_posterior",
+                "main_pair_entropy",
+                "main_pair_effective_count",
+                "main_pair_top1_posterior",
 
                 # Pair posterior.
                 "refine_selected_pair_posterior",
@@ -610,6 +677,8 @@ class CRA(nn.Module):
                 # Decoder controls.
                 "qbound_handover_enabled",
                 "qbound_uncertainty_calibration_enabled",
+                "qbound_posterior_guided_refinement_enabled",
+                "qbound_posterior_stable_reliability_enabled",
                 "qbound_minimal_sufficient_enabled",
                 "qbound_direct_reasoning_residual_enabled",
                 "merge_counterfactual_available",
@@ -620,7 +689,7 @@ class CRA(nn.Module):
             )
             if missing_aux_keys:
                 raise KeyError(
-                    "Q-Bound V1.8 auxiliary output is missing: "
+                    "Q-Bound V1.9 auxiliary output is missing: "
                     + ", ".join(missing_aux_keys)
                 )
 
@@ -634,30 +703,46 @@ class CRA(nn.Module):
 
             if _scalar_flag("uncertainty_calibration_enabled") != 1.0:
                 raise RuntimeError(
-                    "Q-Bound V1.8 requires uncertainty calibration."
+                    "Q-Bound V1.9 requires calibrated coarse/fine fusion."
+                )
+
+            if _scalar_flag("posterior_guided_refinement_enabled") != 1.0:
+                raise RuntimeError(
+                    "Q-Bound V1.9 requires detached posterior-guided REFINE."
+                )
+
+            if _scalar_flag("posterior_stable_reliability_enabled") != 1.0:
+                raise RuntimeError(
+                    "Q-Bound V1.9 requires posterior-stable reliability calibration."
                 )
 
             if _scalar_flag("minimal_sufficient_enabled") != 0.0:
                 raise RuntimeError(
-                    "Q-Bound V1.8 requires V1.7 minimal-sufficient "
-                    "routing to be disabled."
+                    "Q-Bound V1.9 requires V1.7 minimal-sufficient routing "
+                    "to remain disabled."
                 )
 
             if _scalar_flag("all_span_refine_marginal_enabled") != 0.0:
                 raise RuntimeError(
-                    "Q-Bound V1.8 requires V1.6 all-span REFINE "
+                    "Q-Bound V1.9 requires V1.6 differentiable all-span REFINE "
                     "marginalization to remain disabled."
                 )
 
             if _scalar_flag("refine_coarse_detached") != 1.0:
                 raise RuntimeError(
-                    "Q-Bound V1.8 requires the hard coarse route into REFINE "
-                    "to remain detached."
+                    "Q-Bound V1.9 requires the Composer posterior routed into "
+                    "REFINE to remain detached."
+                )
+
+            if _scalar_flag("refine_hard_coarse_route") != 0.0:
+                raise RuntimeError(
+                    "Q-Bound V1.9 must not restrict REFINE to the V1.8 hard "
+                    "top-1 Composer chain."
                 )
 
             if _scalar_flag("calibration_confidence_detached") != 1.0:
                 raise RuntimeError(
-                    "Q-Bound V1.8 requires detached calibration confidence."
+                    "Q-Bound V1.9 requires detached reliability calibration."
                 )
 
         # --------------------------------------------------------------
@@ -827,6 +912,31 @@ class CRA(nn.Module):
             "qbound_calibration_information",
             "qbound_calibration_confidence",
             "qbound_calibration_confidence_detached",
+            "qbound_calibration_reliability",
+            "qbound_refiner_information_gain",
+            "qbound_refined_semantic_retention",
+            "qbound_base_refiner_confidence",
+            "qbound_reliability_gain_factor",
+
+            # V1.9 detached Composer pair prior / MAIN pair posterior.
+            "qbound_posterior_guided_refinement_enabled",
+            "qbound_posterior_stable_reliability_enabled",
+            "qbound_composer_pair_prior",
+            "qbound_composer_endpoint_pair_prior",
+            "qbound_composer_pair_prior_valid_mask",
+            "qbound_composer_pair_prior_entropy",
+            "qbound_composer_pair_prior_entropy_ratio",
+            "qbound_composer_pair_prior_effective_count",
+            "qbound_composer_pair_prior_top1_posterior",
+            "qbound_composer_pair_prior_candidate_count",
+            "qbound_composer_pair_soft_support",
+            "qbound_composer_expected_start_frame",
+            "qbound_composer_expected_end_frame",
+            "qbound_composer_expected_span_length",
+            "qbound_main_pair_posterior",
+            "qbound_main_pair_entropy",
+            "qbound_main_pair_effective_count",
+            "qbound_main_pair_top1_posterior",
 
             # Pair posterior.
             "qbound_refine_start_logits",
@@ -995,7 +1105,7 @@ class CRA(nn.Module):
             outs[name] = _tp(name)
 
         # --------------------------------------------------------------
-        # Explicit V1.8 answer/key interfaces.
+        # Explicit V1.9 answer/key interfaces.
         # --------------------------------------------------------------
         if isinstance(qbound_aux, dict):
             # Official MAIN.
@@ -1038,6 +1148,55 @@ class CRA(nn.Module):
             outs["qbound_calibration_confidence"] = qbound_aux.get(
                 "calibration_confidence"
             )
+            # V1.9 reliability diagnostics. Legacy calibration_confidence is
+            # retained as a compatibility alias of calibration_reliability.
+            outs["qbound_calibration_reliability"] = qbound_aux.get(
+                "calibration_reliability"
+            )
+            outs["qbound_refiner_information_gain"] = qbound_aux.get(
+                "refiner_information_gain"
+            )
+            outs["qbound_refined_semantic_retention"] = qbound_aux.get(
+                "refined_semantic_retention"
+            )
+            outs["qbound_base_refiner_confidence"] = qbound_aux.get(
+                "base_refiner_confidence"
+            )
+            outs["qbound_reliability_gain_factor"] = qbound_aux.get(
+                "reliability_gain_factor"
+            )
+
+            # Posterior-guided route diagnostics.
+            outs["qbound_posterior_guided_refinement_enabled"] = qbound_aux.get(
+                "posterior_guided_refinement_enabled"
+            )
+            outs["qbound_posterior_stable_reliability_enabled"] = qbound_aux.get(
+                "posterior_stable_reliability_enabled"
+            )
+            outs["qbound_composer_pair_prior_entropy"] = qbound_aux.get(
+                "composer_pair_prior_entropy"
+            )
+            outs["qbound_composer_pair_prior_entropy_ratio"] = qbound_aux.get(
+                "composer_pair_prior_entropy_ratio"
+            )
+            outs["qbound_composer_pair_prior_effective_count"] = qbound_aux.get(
+                "composer_pair_prior_effective_count"
+            )
+            outs["qbound_composer_pair_prior_top1_posterior"] = qbound_aux.get(
+                "composer_pair_prior_top1_posterior"
+            )
+            outs["qbound_composer_expected_span_length"] = qbound_aux.get(
+                "composer_expected_span_length"
+            )
+            outs["qbound_main_pair_entropy"] = qbound_aux.get(
+                "main_pair_entropy"
+            )
+            outs["qbound_main_pair_effective_count"] = qbound_aux.get(
+                "main_pair_effective_count"
+            )
+            outs["qbound_main_pair_top1_posterior"] = qbound_aux.get(
+                "main_pair_top1_posterior"
+            )
 
             # Raw fine proposal statistics.
             outs["qbound_expected_refined_span_length"] = qbound_aux.get(
@@ -1053,7 +1212,7 @@ class CRA(nn.Module):
                 "expected_refine_trim_fraction"
             )
 
-            # Official calibrated interval.
+            # Official V1.9 calibrated interval.
             outs["qbound_calibrated_start"] = qbound_aux.get(
                 "qbound_calibrated_start"
             )
@@ -1108,6 +1267,21 @@ class CRA(nn.Module):
                 "qbound_calibration_uncertainty",
                 "qbound_calibration_information",
                 "qbound_calibration_confidence",
+                "qbound_calibration_reliability",
+                "qbound_refiner_information_gain",
+                "qbound_refined_semantic_retention",
+                "qbound_base_refiner_confidence",
+                "qbound_reliability_gain_factor",
+                "qbound_posterior_guided_refinement_enabled",
+                "qbound_posterior_stable_reliability_enabled",
+                "qbound_composer_pair_prior_entropy",
+                "qbound_composer_pair_prior_entropy_ratio",
+                "qbound_composer_pair_prior_effective_count",
+                "qbound_composer_pair_prior_top1_posterior",
+                "qbound_composer_expected_span_length",
+                "qbound_main_pair_entropy",
+                "qbound_main_pair_effective_count",
+                "qbound_main_pair_top1_posterior",
                 "qbound_expected_refined_span_length",
                 "qbound_expected_refined_length_ratio",
                 "qbound_expected_refined_span_fraction",
