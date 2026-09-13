@@ -473,23 +473,27 @@ class BasePipeline(object):
 
     def _check_qbound_components(self):
         """
-        Structural safety check for controlled Q-Bound V1.8/V1.9 runs.
+        Structural safety check for controlled Q-Bound V1.8/V1.9/V1.10.1 runs.
 
-        V1.9 intentionally keeps the same trainable stage modules as V1.8:
+        V1.10.1 intentionally keeps the same trainable stage modules as V1.9:
 
             DECOMPOSE -> RELATE -> COMPOSE -> REFINE -> GROUND
 
-        The V1.9 changes are routing/fusion changes:
+        The V1.10.1 change is the Composer->Refiner pair geometry:
           * no hard top-1 Composer route into REFINE;
-          * detached Composer posterior defines the Refiner pair prior;
-          * posterior-stable reliability calibration is parameter-free.
+          * the Composer posterior routed into REFINE remains detached;
+          * BAPGR anchors starts toward the first-event left boundary and
+            ends toward the last-event right boundary;
+          * posterior-stable reliability calibration remains parameter-free.
 
         Therefore:
           * no new optimizer group is expected;
-          * all trainable Q-Bound tensors must remain in the dedicated
-            ``qbound`` optimizer group and use ``optim.qbound_lr``;
-          * shared CRA ``decoder.video_proj`` must remain in the base group;
-          * V1.9 config must advertise the expected routing contract;
+          * all trainable Q-Bound tensors remain in the dedicated ``qbound``
+            optimizer group and use ``optim.qbound_lr``;
+          * shared CRA ``decoder.video_proj`` remains in the base group;
+          * V1.10.1 config must advertise the BAPGR routing contract;
+          * boundary anchoring is a fixed structural prior, not a trainable
+            gate and not a span-length objective;
           * no trainable calibration/reliability gate may silently appear.
         """
         if not self._qbound_enabled():
@@ -506,31 +510,109 @@ class BasePipeline(object):
             refinement_cfg = {}
 
         # Keep BasePipeline reusable for older/other experimental versions.
-        if version not in {"1.8", "1.9"}:
+        if version not in {"1.8", "1.9", "1.10.1"}:
             return
 
-        if version == "1.9":
-            expected_v19_flags = {
+        if version in {"1.9", "1.10.1"}:
+            expected_routing_flags = {
                 "hard_coarse_route": False,
                 "detach_coarse": True,
                 "posterior_guided": True,
                 "posterior_stable_reliability": True,
             }
 
-            for key, expected in expected_v19_flags.items():
+            if version == "1.10.1":
+                expected_routing_flags["boundary_structured"] = True
+
+            for key, expected in expected_routing_flags.items():
                 if key not in refinement_cfg:
                     raise RuntimeError(
-                        "Q-Bound V1.9 config is missing refinement."
-                        f"{key}. Expected {expected!r}."
+                        f"Q-Bound V{version} config is missing "
+                        f"refinement.{key}. Expected {expected!r}."
                     )
 
                 actual = bool(refinement_cfg[key])
                 if actual != expected:
                     raise RuntimeError(
-                        "Q-Bound V1.9 routing config mismatch for "
+                        f"Q-Bound V{version} routing config mismatch for "
                         f"refinement.{key}: expected {expected!r}, "
                         f"got {actual!r}."
                     )
+
+        if version == "1.10.1":
+            expected_refinement_type = (
+                "boundary_anchored_posterior_guided_reliability_refiner"
+            )
+            actual_refinement_type = str(
+                refinement_cfg.get("type", "")
+            )
+            if actual_refinement_type != expected_refinement_type:
+                raise RuntimeError(
+                    "Q-Bound V1.10.1 refinement.type mismatch: "
+                    f"expected {expected_refinement_type!r}, "
+                    f"got {actual_refinement_type!r}."
+                )
+
+            if "boundary_anchor_power" not in refinement_cfg:
+                raise RuntimeError(
+                    "Q-Bound V1.10.1 config is missing "
+                    "refinement.boundary_anchor_power."
+                )
+
+            boundary_anchor_power = float(
+                refinement_cfg["boundary_anchor_power"]
+            )
+            if (
+                not math.isfinite(boundary_anchor_power)
+                or boundary_anchor_power <= 0.0
+            ):
+                raise ValueError(
+                    "Q-Bound V1.10.1 refinement.boundary_anchor_power "
+                    "must be finite and > 0; got "
+                    f"{boundary_anchor_power}."
+                )
+
+            # Controlled first V1.10.1 run uses p=2.0. Fail fast if this
+            # config is accidentally changed, so V1.9 -> V1.10.1 remains a
+            # clean one-factor comparison.
+            if not math.isclose(
+                boundary_anchor_power,
+                2.0,
+                rel_tol=1e-9,
+                abs_tol=0.0,
+            ):
+                raise RuntimeError(
+                    "Controlled Q-Bound V1.10.1 expects "
+                    "refinement.boundary_anchor_power=2.0; got "
+                    f"{boundary_anchor_power}."
+                )
+
+            # CRA wrapper and RefineDecoder already check this themselves;
+            # BasePipeline verifies it again after optional DataParallel
+            # wrapping so silent cross-version pairing is impossible.
+            model_core = (
+                self.model.module
+                if hasattr(self.model, "module")
+                else self.model
+            )
+            model_version = str(
+                getattr(model_core, "qbound_version", "")
+            )
+            if model_version != version:
+                raise RuntimeError(
+                    "BasePipeline/model Q-Bound version mismatch: "
+                    f"config={version!r}, model={model_version!r}."
+                )
+
+            decoder = getattr(model_core, "decoder", None)
+            decoder_version = str(
+                getattr(decoder, "qbound_version", "")
+            )
+            if decoder_version != version:
+                raise RuntimeError(
+                    "BasePipeline/RefineDecoder Q-Bound version mismatch: "
+                    f"config={version!r}, decoder={decoder_version!r}."
+                )
 
         required_component_tokens = {
             "DECOMPOSE": ("boundary_classifier",),
@@ -638,6 +720,15 @@ class BasePipeline(object):
             "posterior_gate",
             "posterior_score",
         )
+
+        if version == "1.10.1":
+            # BAPGR's boundary anchor is intentionally a fixed structural
+            # prior. A trainable "boundary_anchor*" tensor would silently
+            # turn V1.10.1 into a different experiment.
+            forbidden_trainable_tokens = (
+                *forbidden_trainable_tokens,
+                "boundary_anchor",
+            )
         unexpected_routing_parameters = [
             name
             for name, parameter in trainable_named_parameters
@@ -692,6 +783,15 @@ class BasePipeline(object):
             print("  detached posterior-guided refinement config: YES")
             print("  posterior-stable reliability config: YES")
 
+        if version == "1.10.1":
+            print("  detached posterior-guided refinement config: YES")
+            print("  boundary-structured BAPGR config: YES")
+            print(
+                "  boundary_anchor_power: "
+                f"{float(refinement_cfg['boundary_anchor_power'])}"
+            )
+            print("  posterior-stable reliability config: YES")
+
         print("  routing/calibration is parameter-free: YES")
         print("  shared CRA video_proj remains in base optimizer group: YES")
         print(
@@ -699,7 +799,7 @@ class BasePipeline(object):
             f"{actual_qbound_lr}\n"
         )
 
-    # Backward-compatible alias for older debug code.
+    # Backward-compatible alias for older V1.8-era debug code.
     def _check_qbound_v18_components(self):
         return self._check_qbound_components()
 
