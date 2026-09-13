@@ -1,3 +1,4 @@
+import math
 import collections
 import os
 import time
@@ -21,16 +22,16 @@ from utils.misc.misc import (
 
 class CRAPipeline(BasePipeline):
     """
-    CRA training pipeline with Q-Bound Version 1.9.
+    CRA training pipeline with Q-Bound Version 1.10.1.
 
     Architecture:
 
         DECOMPOSE -> RELATE -> COMPOSE
-                   -> DETACHED POSTERIOR-GUIDED REFINE
+                   -> BOUNDARY-ANCHORED POSTERIOR-GUIDED REFINE
                    -> POSTERIOR-STABLE RELIABILITY CALIBRATION
                    -> GROUND
 
-    V1.9 is a mechanism change motivated by the V1.8 diagnostics rather than
+    V1.10.1 is a controlled mechanism change motivated by the V1.9 diagnostics rather than
     an additional supervision change.  The training objective is intentionally
     kept identical to the controlled V1.8 run:
 
@@ -39,19 +40,23 @@ class CRAPipeline(BasePipeline):
             + lambda_align * L_weak_align
             + lambda_decomp * L_decomp
 
-    The two V1.8 failure mechanisms addressed here are:
+    The V1.9 failure addressed here is:
 
-      1) an uncertain Composer posterior was collapsed to one hard top-1 chain
-         before REFINE, so a small rank change could abruptly shrink the fine
-         search region;
-      2) Refiner posterior concentration was treated as localization
-         reliability even when it came from a smaller/easier search domain or
-         answer-discriminative but temporally incomplete evidence.
+      1) V1.9 preserved Composer uncertainty with a detached posterior-guided
+         pair prior, but distributed each candidate's mass over many legal
+         start/end pairs. The resulting pair prior remained highly diffuse and
+         the Refiner learned an answer-discriminative interior micro-span
+         shortcut: RAW spans collapsed to roughly 1--3 frames while semantic
+         retention and RAW IoU collapsed.
 
-    V1.9 therefore routes the *detached Composer span posterior* into a single
-    boundary-pair prior.  REFINE updates this prior, but no Refiner gradient can
-    flow back through the routed Composer posterior.  The V1.6 differentiable
-    all-span feedback loop therefore remains disabled.
+    V1.10.1 keeps the *detached Composer span posterior* and the V1.9
+    posterior-stable reliability safety net, but replaces the uniform
+    boundary-event pair geometry with Boundary-Anchored Posterior-Guided
+    Refinement (BAPGR). Starts are structurally biased toward the left boundary
+    of each candidate's first event and ends toward the right boundary of its
+    last event. This preserves multiple Composer hypotheses while discouraging
+    interior micro-span shortcuts without temporal GT or a span-length target.
+    The V1.6 differentiable all-span feedback loop remains disabled.
 
     The MAIN temporal probability remains a coarse/fine mixture:
 
@@ -59,7 +64,7 @@ class CRAPipeline(BasePipeline):
             = (1 - reliability) * p_coarse(t)
             + reliability * p_refine(t)
 
-    where the detached V1.9 reliability combines:
+    where the detached V1.10.1 reliability keeps the V1.9 formulation:
 
         base_confidence   = exp(- normalized_refiner_entropy)
         information_gain = relative entropy reduction beyond the Composer prior
@@ -75,7 +80,9 @@ class CRAPipeline(BasePipeline):
 
     No temporal GT, IoU/IoP loss, target duration, trim/minimality loss,
     Composer/Refiner entropy loss, event-count forcing, CRA->Q-Bound handover,
-    or direct event-token answer residual is introduced.
+    or direct event-token answer residual is introduced. CRA answer machinery,
+    VisualIntervention, smoothing, and all loss weights are intentionally kept
+    unchanged in V1.10.1 so the BAPGR geometry change is isolated.
 
     Evaluation keeps three same-checkpoint branches:
 
@@ -84,7 +91,7 @@ class CRAPipeline(BasePipeline):
         hard-top1 COMPOSE coarse diagnostic
 
     The hard top-1 Composer branch is retained only as a controlled diagnostic;
-    it is no longer the V1.9 route into REFINE.
+    it is no longer the route into REFINE.
     """
 
     def __init__(self, cfgs) -> None:
@@ -119,9 +126,9 @@ class CRAPipeline(BasePipeline):
         """
         return 1.0, 0
 
-    def _qbound_v19_loss_settings(self):
+    def _qbound_v1101_loss_settings(self):
         """
-        Read the controlled V1.9 objective settings.
+        Read the controlled V1.10.1 objective settings.
 
         Preferred YAML:
 
@@ -132,7 +139,7 @@ class CRAPipeline(BasePipeline):
                 decomposition:
                   loss_weight: 0.10
 
-        V1.9 deliberately keeps the V1.8 loss unchanged: no coarse-answer
+        V1.10.1 deliberately keeps the V1.9/V1.8 loss unchanged: no coarse-answer
         auxiliary loss and no minimal-sufficient/span-length/reliability loss.
         """
         model_cfg = self.cfgs.get("model", {})
@@ -199,7 +206,7 @@ class CRAPipeline(BasePipeline):
         """
         if evidence_visual_token is None or question_state is None:
             raise ValueError(
-                "Q-Bound V1.9 weak alignment requires evidence_visual_token "
+                "Q-Bound V1.10.1 weak alignment requires evidence_visual_token "
                 "and qa_state."
             )
         if evidence_visual_token.ndim != 2 or question_state.ndim != 2:
@@ -258,14 +265,14 @@ class CRAPipeline(BasePipeline):
         decomp_loss = qbound_aux.get("decomp_loss")
         if not torch.is_tensor(decomp_loss):
             raise KeyError(
-                "Q-Bound V1.9 decomposition requires qbound_aux['decomp_loss']."
+                "Q-Bound V1.10.1 decomposition requires qbound_aux['decomp_loss']."
             )
 
         value = decomp_loss.mean()
 
         if not torch.isfinite(value):
             raise FloatingPointError(
-                "Q-Bound V1.9 decomposition loss is NaN/Inf."
+                "Q-Bound V1.10.1 decomposition loss is NaN/Inf."
             )
 
         return value
@@ -290,7 +297,7 @@ class CRAPipeline(BasePipeline):
         return 1.0 if self._qbound_enabled() else 0.0
 
     def _get_qbound_aux(self, gqa_output):
-        """Safely extract Q-Bound V1.9 outputs from a CRA VQA forward."""
+        """Safely extract Q-Bound V1.10.1 outputs from a CRA VQA forward."""
         if not self._qbound_enabled():
             return None
 
@@ -490,7 +497,7 @@ class CRAPipeline(BasePipeline):
         return 0.5 * (first_kl + second_kl)
 
     # ------------------------------------------------------------------
-    # Q-Bound V1.9 diagnostics
+    # Q-Bound V1.10.1 diagnostics
     # ------------------------------------------------------------------
     @staticmethod
     def _distribution_entropy(
@@ -514,7 +521,7 @@ class CRAPipeline(BasePipeline):
             dim=-1,
         )
 
-    def _compute_qbound_v19_diagnostics(
+    def _compute_qbound_v1101_diagnostics(
         self,
         gqa_output,
         answer_proj,
@@ -526,10 +533,10 @@ class CRAPipeline(BasePipeline):
         """
         Diagnostics only; nothing returned here is added to total_loss.
 
-        V1.9 separates three same-checkpoint branches:
+        V1.10.1 separates three same-checkpoint branches:
 
             MAIN        = posterior-stable reliability-calibrated support
-            RAW REFINE  = posterior-guided fine proposal
+            RAW REFINE  = boundary-anchored posterior-guided fine proposal
             COARSE      = hard-top1 COMPOSE diagnostic
 
         The diagnostics answer:
@@ -564,9 +571,11 @@ class CRAPipeline(BasePipeline):
             "calibration_confidence",
             "calibration_confidence_detached",
 
-            # V1.9 posterior-guided routing / reliability.
+            # V1.10.1 BAPGR routing / reliability.
             "posterior_guided_refinement_enabled",
+            "boundary_structured_refinement_enabled",
             "posterior_stable_reliability_enabled",
+            "refine_boundary_anchor_power",
             "refine_hard_coarse_route",
             "calibration_reliability",
             "refiner_information_gain",
@@ -578,6 +587,13 @@ class CRAPipeline(BasePipeline):
             "composer_pair_prior_effective_count",
             "composer_pair_prior_top1_posterior",
             "composer_pair_prior_candidate_count",
+            "composer_uniform_pair_prior_entropy",
+            "composer_uniform_pair_prior_entropy_ratio",
+            "composer_uniform_pair_prior_effective_count",
+            "composer_uniform_pair_prior_top1_posterior",
+            "composer_pair_prior_expected_span_length",
+            "composer_uniform_pair_prior_expected_span_length",
+            "composer_pair_prior_length_gain",
             "composer_expected_span_length",
             "main_pair_entropy",
             "main_pair_effective_count",
@@ -605,7 +621,7 @@ class CRAPipeline(BasePipeline):
         missing = sorted(required_keys.difference(qbound_aux))
         if missing:
             raise KeyError(
-                "Missing Q-Bound V1.9 diagnostic outputs: "
+                "Missing Q-Bound V1.10.1 diagnostic outputs: "
                 + ", ".join(missing)
             )
 
@@ -732,28 +748,28 @@ class CRAPipeline(BasePipeline):
             ).abs().mean()
 
             v15_key_raw = qbound_aux.get("v15_diagnostic_key")
-            v19_v15_js = None
-            v19_v15_l1 = None
+            v1101_v15_js = None
+            v1101_v15_l1 = None
             if torch.is_tensor(v15_key_raw):
                 v15_key = self._normalize_distribution(v15_key_raw)
-                v19_v15_js = self._js_divergence(
+                v1101_v15_js = self._js_divergence(
                     calibrated_key,
                     v15_key,
                 ).mean()
-                v19_v15_l1 = (
+                v1101_v15_l1 = (
                     calibrated_key - v15_key
                 ).abs().mean()
 
             v14_key_raw = qbound_aux.get("v14_diagnostic_key")
-            v19_v14_js = None
-            v19_v14_l1 = None
+            v1101_v14_js = None
+            v1101_v14_l1 = None
             if torch.is_tensor(v14_key_raw):
                 v14_key = self._normalize_distribution(v14_key_raw)
-                v19_v14_js = self._js_divergence(
+                v1101_v14_js = self._js_divergence(
                     calibrated_key,
                     v14_key,
                 ).mean()
-                v19_v14_l1 = (
+                v1101_v14_l1 = (
                     calibrated_key - v14_key
                 ).abs().mean()
 
@@ -808,6 +824,32 @@ class CRAPipeline(BasePipeline):
             ].detach().float()
             reliability_gain_factor = qbound_aux[
                 "reliability_gain_factor"
+            ].detach().float()
+
+            boundary_anchor_power = qbound_aux[
+                "refine_boundary_anchor_power"
+            ].detach().float()
+
+            composer_uniform_pair_prior_entropy = qbound_aux[
+                "composer_uniform_pair_prior_entropy"
+            ].detach().float()
+            composer_uniform_pair_prior_entropy_ratio = qbound_aux[
+                "composer_uniform_pair_prior_entropy_ratio"
+            ].detach().float()
+            composer_uniform_pair_prior_effective_count = qbound_aux[
+                "composer_uniform_pair_prior_effective_count"
+            ].detach().float()
+            composer_uniform_pair_prior_top1 = qbound_aux[
+                "composer_uniform_pair_prior_top1_posterior"
+            ].detach().float()
+            composer_pair_prior_expected_span_length = qbound_aux[
+                "composer_pair_prior_expected_span_length"
+            ].detach().float()
+            composer_uniform_pair_prior_expected_span_length = qbound_aux[
+                "composer_uniform_pair_prior_expected_span_length"
+            ].detach().float()
+            composer_pair_prior_length_gain = qbound_aux[
+                "composer_pair_prior_length_gain"
             ].detach().float()
 
             composer_pair_prior_entropy = qbound_aux[
@@ -886,6 +928,9 @@ class CRAPipeline(BasePipeline):
             posterior_guided_enabled = self._scalar_mean(
                 qbound_aux.get("posterior_guided_refinement_enabled")
             )
+            boundary_structured_enabled = self._scalar_mean(
+                qbound_aux.get("boundary_structured_refinement_enabled")
+            )
             posterior_stable_enabled = self._scalar_mean(
                 qbound_aux.get("posterior_stable_reliability_enabled")
             )
@@ -963,7 +1008,7 @@ class CRAPipeline(BasePipeline):
                 confidence.std(unbiased=False).item()
             ),
 
-            # V1.9 reliability decomposition.
+            # V1.10.1 reliability decomposition.
             "qbound_calibration_reliability": reliability.mean().item(),
             "qbound_calibration_reliability_min": reliability.min().item(),
             "qbound_calibration_reliability_max": reliability.max().item(),
@@ -997,7 +1042,51 @@ class CRAPipeline(BasePipeline):
                 (semantic_retention < 0.50).float().mean().item()
             ),
 
-            # Detached Composer pair-prior / MAIN pair behavior.
+            # V1.10.1 anchored-vs-uniform Composer pair-prior behavior.
+            "qbound_refine_boundary_anchor_power": (
+                boundary_anchor_power.mean().item()
+            ),
+            "qbound_composer_uniform_pair_prior_entropy": (
+                composer_uniform_pair_prior_entropy.mean().item()
+            ),
+            "qbound_composer_uniform_pair_prior_entropy_ratio": (
+                composer_uniform_pair_prior_entropy_ratio.mean().item()
+            ),
+            "qbound_composer_uniform_pair_prior_effective_count": (
+                composer_uniform_pair_prior_effective_count.mean().item()
+            ),
+            "qbound_composer_uniform_pair_prior_top1_posterior": (
+                composer_uniform_pair_prior_top1.mean().item()
+            ),
+            "qbound_composer_pair_prior_expected_span_length": (
+                composer_pair_prior_expected_span_length.mean().item()
+            ),
+            "qbound_composer_uniform_pair_prior_expected_span_length": (
+                composer_uniform_pair_prior_expected_span_length.mean().item()
+            ),
+            "qbound_composer_pair_prior_length_gain": (
+                composer_pair_prior_length_gain.mean().item()
+            ),
+            "qbound_composer_pair_prior_entropy_ratio_reduction_vs_uniform": (
+                (
+                    composer_uniform_pair_prior_entropy_ratio
+                    - composer_pair_prior_entropy_ratio
+                ).mean().item()
+            ),
+            "qbound_composer_pair_prior_effective_count_reduction_vs_uniform": (
+                (
+                    composer_uniform_pair_prior_effective_count
+                    - composer_pair_prior_effective_count
+                ).mean().item()
+            ),
+            "qbound_composer_pair_prior_top1_gain_vs_uniform": (
+                (
+                    composer_pair_prior_top1
+                    - composer_uniform_pair_prior_top1
+                ).mean().item()
+            ),
+
+            # Active anchored Composer pair-prior / MAIN pair behavior.
             "qbound_composer_pair_prior_entropy": (
                 composer_pair_prior_entropy.mean().item()
             ),
@@ -1121,6 +1210,11 @@ class CRAPipeline(BasePipeline):
                 if posterior_guided_enabled is None
                 else float(posterior_guided_enabled)
             ),
+            "qbound_boundary_structured_refinement_enabled": (
+                0.0
+                if boundary_structured_enabled is None
+                else float(boundary_structured_enabled)
+            ),
             "qbound_posterior_stable_reliability_enabled": (
                 0.0
                 if posterior_stable_enabled is None
@@ -1160,15 +1254,15 @@ class CRAPipeline(BasePipeline):
             ),
         }
 
-        if v19_v15_js is not None:
-            diagnostics["qbound_v19_v15_key_js"] = v19_v15_js.item()
-        if v19_v15_l1 is not None:
-            diagnostics["qbound_v19_v15_key_l1"] = v19_v15_l1.item()
+        if v1101_v15_js is not None:
+            diagnostics["qbound_v1101_v15_key_js"] = v1101_v15_js.item()
+        if v1101_v15_l1 is not None:
+            diagnostics["qbound_v1101_v15_key_l1"] = v1101_v15_l1.item()
 
-        if v19_v14_js is not None:
-            diagnostics["qbound_v19_v14_key_js"] = v19_v14_js.item()
-        if v19_v14_l1 is not None:
-            diagnostics["qbound_v19_v14_key_l1"] = v19_v14_l1.item()
+        if v1101_v14_js is not None:
+            diagnostics["qbound_v1101_v14_key_js"] = v1101_v14_js.item()
+        if v1101_v14_l1 is not None:
+            diagnostics["qbound_v1101_v14_key_l1"] = v1101_v14_l1.item()
 
         return diagnostics
 
@@ -1208,9 +1302,9 @@ class CRAPipeline(BasePipeline):
             return stats
 
         # ----------------------------------------------------------
-        # V1.9 posterior-guided reliability / routing statistics.
+        # V1.10.1 BAPGR reliability / routing statistics.
         # ----------------------------------------------------------
-        v19_scalar_keys = [
+        v1101_scalar_keys = [
             "stable_refiner_enabled",
             "uncertainty_calibration_enabled",
             "minimal_sufficient_enabled",
@@ -1223,9 +1317,11 @@ class CRAPipeline(BasePipeline):
             "calibration_confidence",
             "calibration_confidence_detached",
 
-            # V1.9 reliability decomposition.
+            # V1.10.1 BAPGR + reliability decomposition.
             "posterior_guided_refinement_enabled",
+            "boundary_structured_refinement_enabled",
             "posterior_stable_reliability_enabled",
+            "refine_boundary_anchor_power",
             "refine_hard_coarse_route",
             "calibration_reliability",
             "refiner_information_gain",
@@ -1237,6 +1333,13 @@ class CRAPipeline(BasePipeline):
             "composer_pair_prior_effective_count",
             "composer_pair_prior_top1_posterior",
             "composer_pair_prior_candidate_count",
+            "composer_uniform_pair_prior_entropy",
+            "composer_uniform_pair_prior_entropy_ratio",
+            "composer_uniform_pair_prior_effective_count",
+            "composer_uniform_pair_prior_top1_posterior",
+            "composer_pair_prior_expected_span_length",
+            "composer_uniform_pair_prior_expected_span_length",
+            "composer_pair_prior_length_gain",
             "composer_expected_span_length",
             "main_pair_entropy",
             "main_pair_effective_count",
@@ -1266,15 +1369,16 @@ class CRAPipeline(BasePipeline):
             "coarse_raw_refined_key_l1",
         ]
 
-        for key in v19_scalar_keys:
+        for key in v1101_scalar_keys:
             scalar = self._scalar_mean(qbound_aux.get(key))
             if scalar is not None:
                 stats[f"qbound_{key}"] = scalar
 
-        v19_prefixed_keys = [
+        v1101_prefixed_keys = [
             "qbound_stable_refiner_enabled",
             "qbound_uncertainty_calibration_enabled",
             "qbound_posterior_guided_refinement_enabled",
+            "qbound_boundary_structured_refinement_enabled",
             "qbound_posterior_stable_reliability_enabled",
             "qbound_minimal_sufficient_enabled",
 
@@ -1293,7 +1397,7 @@ class CRAPipeline(BasePipeline):
             "qbound_coarse_span_key_mass",
         ]
 
-        for key in v19_prefixed_keys:
+        for key in v1101_prefixed_keys:
             scalar = self._scalar_mean(qbound_aux.get(key))
             if scalar is not None:
                 stats[key] = scalar
@@ -1504,7 +1608,7 @@ class CRAPipeline(BasePipeline):
             )
 
         # ----------------------------------------------------------
-        # V1.9 posterior-guided REFINE + reliability-calibrated boundary diagnostics.
+        # V1.10.1 BAPGR REFINE + reliability-calibrated boundary diagnostics.
         # ----------------------------------------------------------
         refiner_scalar_keys = [
             "refine_expected_pair_entropy",
@@ -1523,7 +1627,7 @@ class CRAPipeline(BasePipeline):
             "refine_retained_fraction",
             "refined_inside_coarse",
 
-            # V1.9 reliability-calibrated interval.
+            # V1.10.1 reliability-calibrated interval.
             "calibrated_expected_span_length",
             "calibrated_expected_length_ratio",
             "calibrated_span_frame_length",
@@ -1534,7 +1638,7 @@ class CRAPipeline(BasePipeline):
             "calibrated_trim_total_frames",
             "calibrated_inside_coarse",
 
-            # V1.9 reliability calibration.
+            # V1.10.1 reliability calibration.
             "calibration_uncertainty",
             "calibration_information",
             "calibration_confidence",
@@ -1548,6 +1652,13 @@ class CRAPipeline(BasePipeline):
             "composer_pair_prior_effective_count",
             "composer_pair_prior_top1_posterior",
             "composer_pair_prior_candidate_count",
+            "composer_uniform_pair_prior_entropy",
+            "composer_uniform_pair_prior_entropy_ratio",
+            "composer_uniform_pair_prior_effective_count",
+            "composer_uniform_pair_prior_top1_posterior",
+            "composer_pair_prior_expected_span_length",
+            "composer_uniform_pair_prior_expected_span_length",
+            "composer_pair_prior_length_gain",
             "composer_expected_span_length",
             "main_pair_entropy",
             "main_pair_effective_count",
@@ -2066,7 +2177,7 @@ class CRAPipeline(BasePipeline):
 
     def _qbound_component_grad_norms(self):
         """
-        Diagnostic gradient norms for V1.9.
+        Diagnostic gradient norms for V1.10.1.
 
         ``composer`` checks span_composer_score. It should receive the MAIN
         calibrated VQA signal through the differentiable coarse component.
@@ -2333,7 +2444,19 @@ class CRAPipeline(BasePipeline):
                 "qbound_reliability_above_050_ratio",
                 "qbound_semantic_retention_below_050_ratio",
                 "qbound_posterior_guided_refinement_enabled",
+                "qbound_boundary_structured_refinement_enabled",
                 "qbound_posterior_stable_reliability_enabled",
+                "qbound_refine_boundary_anchor_power",
+                "qbound_composer_uniform_pair_prior_entropy",
+                "qbound_composer_uniform_pair_prior_entropy_ratio",
+                "qbound_composer_uniform_pair_prior_effective_count",
+                "qbound_composer_uniform_pair_prior_top1_posterior",
+                "qbound_composer_pair_prior_expected_span_length",
+                "qbound_composer_uniform_pair_prior_expected_span_length",
+                "qbound_composer_pair_prior_length_gain",
+                "qbound_composer_pair_prior_entropy_ratio_reduction_vs_uniform",
+                "qbound_composer_pair_prior_effective_count_reduction_vs_uniform",
+                "qbound_composer_pair_prior_top1_gain_vs_uniform",
                 "qbound_composer_pair_prior_entropy",
                 "qbound_composer_pair_prior_entropy_ratio",
                 "qbound_composer_pair_prior_effective_count",
@@ -2378,10 +2501,10 @@ class CRAPipeline(BasePipeline):
                 "qbound_raw_refined_key_entropy_ratio",
                 "qbound_calibrated_key_max",
                 "qbound_raw_refined_key_max",
-                "qbound_v19_v15_key_js",
-                "qbound_v19_v15_key_l1",
-                "qbound_v19_v14_key_js",
-                "qbound_v19_v14_key_l1",
+                "qbound_v1101_v15_key_js",
+                "qbound_v1101_v15_key_l1",
+                "qbound_v1101_v14_key_js",
+                "qbound_v1101_v14_key_l1",
         ]
 
         # ------------------------------------------------------------------
@@ -2393,7 +2516,7 @@ class CRAPipeline(BasePipeline):
         qbound_mix=1.0,
     ):
         """
-        Controlled V1.9 objective:
+        Controlled V1.10.1 objective:
 
             L =
                 L_CRA/main_reliability_calibrated_task
@@ -2490,7 +2613,7 @@ class CRAPipeline(BasePipeline):
             )
 
         # ----------------------------------------------------------
-        # MAIN VQA: V1.9 posterior-stable reliability-calibrated branch.
+        # MAIN VQA: V1.10.1 BAPGR + posterior-stable reliability-calibrated branch.
         # ----------------------------------------------------------
         gqa_output = self.model(
             video_frames,
@@ -2540,7 +2663,7 @@ class CRAPipeline(BasePipeline):
                 align_weight,
                 align_temperature,
                 decomp_weight,
-            ) = self._qbound_v19_loss_settings()
+            ) = self._qbound_v1101_loss_settings()
 
             # Fail fast if a V1.7 objective/routing mechanism is accidentally on.
             minimality_flag = qbound_aux.get(
@@ -2549,7 +2672,7 @@ class CRAPipeline(BasePipeline):
             if torch.is_tensor(minimality_flag):
                 if float(minimality_flag.detach().item()) != 0.0:
                     raise RuntimeError(
-                        "Q-Bound V1.9 must keep minimal-sufficient routing disabled."
+                        "Q-Bound V1.10.1 must keep minimal-sufficient routing disabled."
                     )
 
             uncertainty_flag = qbound_aux.get(
@@ -2558,24 +2681,27 @@ class CRAPipeline(BasePipeline):
             if torch.is_tensor(uncertainty_flag):
                 if float(uncertainty_flag.detach().item()) != 1.0:
                     raise RuntimeError(
-                        "Q-Bound V1.9 requires calibrated coarse/fine fusion."
+                        "Q-Bound V1.10.1 requires calibrated coarse/fine fusion."
                     )
 
             def _require_scalar_flag(name, expected):
                 value = qbound_aux.get(name)
                 if not torch.is_tensor(value):
                     raise KeyError(
-                        f"Q-Bound V1.9 requires scalar flag {name!r}."
+                        f"Q-Bound V1.10.1 requires scalar flag {name!r}."
                     )
                 actual = float(value.detach().item())
                 if actual != float(expected):
                     raise RuntimeError(
-                        f"Q-Bound V1.9 flag {name!r} must be {float(expected):.1f}; "
+                        f"Q-Bound V1.10.1 flag {name!r} must be {float(expected):.1f}; "
                         f"got {actual:.1f}."
                     )
 
             _require_scalar_flag(
                 "posterior_guided_refinement_enabled", 1.0
+            )
+            _require_scalar_flag(
+                "boundary_structured_refinement_enabled", 1.0
             )
             _require_scalar_flag(
                 "posterior_stable_reliability_enabled", 1.0
@@ -2584,6 +2710,41 @@ class CRAPipeline(BasePipeline):
             _require_scalar_flag("refine_coarse_detached", 1.0)
             _require_scalar_flag("all_span_refine_marginal_enabled", 0.0)
             _require_scalar_flag("calibration_confidence_detached", 1.0)
+
+            refinement_cfg = (
+                self.cfgs.get("model", {})
+                .get("qbound", {})
+                .get("refinement", {})
+            )
+            if not isinstance(refinement_cfg, dict):
+                raise TypeError(
+                    "model.qbound.refinement must be a mapping/dict."
+                )
+            expected_anchor_power = float(
+                refinement_cfg.get("boundary_anchor_power", 2.0)
+            )
+            actual_anchor_power = qbound_aux.get(
+                "refine_boundary_anchor_power"
+            )
+            if not torch.is_tensor(actual_anchor_power):
+                raise KeyError(
+                    "Q-Bound V1.10.1 requires "
+                    "qbound_aux['refine_boundary_anchor_power']."
+                )
+            actual_anchor_power = float(
+                actual_anchor_power.detach().item()
+            )
+            if not math.isclose(
+                actual_anchor_power,
+                expected_anchor_power,
+                rel_tol=1e-6,
+                abs_tol=1e-6,
+            ):
+                raise RuntimeError(
+                    "Q-Bound V1.10.1 boundary_anchor_power mismatch: "
+                    f"config={expected_anchor_power}, "
+                    f"core={actual_anchor_power}."
+                )
 
             # ------------------------------------------------------
             # Weak question/event semantic alignment.
@@ -2647,7 +2808,7 @@ class CRAPipeline(BasePipeline):
                     detach_answer=True,
                 )
 
-        qbound_logs = self._compute_qbound_v19_diagnostics(
+        qbound_logs = self._compute_qbound_v1101_diagnostics(
             gqa_output=gqa_output,
             answer_proj=answer_proj,
             answer_id=answer_id,
@@ -2882,10 +3043,10 @@ class CRAPipeline(BasePipeline):
 
         def _print_readouts(split_prefix):
             display_names = [
-                ("pre-hoc", "V1.9 reliability-calibrated MAIN"),
+                ("pre-hoc", "V1.10.1 BAPGR reliability-calibrated MAIN"),
                 (
                     "raw-refined",
-                    "posterior-guided REFINE diagnostic",
+                    "boundary-anchored REFINE diagnostic",
                 ),
                 (
                     "coarse-branch",
@@ -3226,7 +3387,7 @@ class CRAPipeline(BasePipeline):
                     ),
                 )
 
-                # Official V1.9 reliability-calibrated MAIN.
+                # Official V1.10.1 reliability-calibrated MAIN.
                 calibrated_logits = self._score_answer_candidates(
                     answer_proj=answer_proj,
                     representation=fusion_proj,
@@ -3299,7 +3460,7 @@ class CRAPipeline(BasePipeline):
                         ).sum().item()
                         coarse_count += batch_size
 
-                    diagnostic_logs = self._compute_qbound_v19_diagnostics(
+                    diagnostic_logs = self._compute_qbound_v1101_diagnostics(
                         gqa_output=eval_wrapper,
                         answer_proj=answer_proj,
                         answer_id=answer_id,
@@ -3333,7 +3494,7 @@ class CRAPipeline(BasePipeline):
                     video_attention = video_attention[None, :]
 
                 if time_param is not None:
-                    # Official V1.9 reliability-calibrated hard interval.
+                    # Official V1.10.1 reliability-calibrated hard interval.
                     start_time = (
                         time_param["start"]
                         .detach().cpu().numpy()
@@ -3724,7 +3885,7 @@ class CRAPipeline(BasePipeline):
         if qbound_keyframe:
             if not hasattr(self.metric, "temporal_key_metrics"):
                 raise AttributeError(
-                    "Q-Bound V1.9 requires "
+                    "Q-Bound V1.10.1 requires "
                     "Metric.temporal_key_metrics()."
                 )
             score.update(
@@ -3840,7 +4001,7 @@ class CRAPipeline(BasePipeline):
                 gs=True,
             )
 
-            # Posterior-guided fine REFINE branch.
+            # Boundary-anchored posterior-guided fine REFINE branch.
             if ground_raw_refined and raw_refined_results:
                 score["raw-refined"] = self.metric(
                     ground_raw_refined,

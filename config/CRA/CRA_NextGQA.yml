@@ -37,15 +37,15 @@ model:
   # Original CRA settings are kept unchanged for controlled
   # comparison with CRA and previous Q-Bound versions.
   #
-  # IMPORTANT V1.9:
+  # IMPORTANT V1.10.1:
   #   window_sizes remains [1,3,5] ONLY for:
   #     (1) the original CRA grounding path, and
   #     (2) controlled fixed-window diagnostics.
   #
-  #   The MAIN Q-Bound V1.9 interval does NOT come from the
-  #   fixed-window search. It is produced by posterior-guided
-  #   refinement followed by posterior-stable reliability
-  #   calibration.
+  #   The MAIN Q-Bound V1.10.1 interval does NOT come from the
+  #   fixed-window search. It is produced by boundary-anchored
+  #   posterior-guided refinement followed by posterior-stable
+  #   reliability calibration.
   #
   # causal_feature_path + do:true still belong to the downstream
   # CRA testbed. They are not inputs to Q-Bound DECOMPOSE,
@@ -62,39 +62,46 @@ model:
   vote: 0
 
   # ============================================================
-  # Q-Bound V1.9
+  # Q-Bound V1.10.1
   #
   #   DECOMPOSE -> RELATE -> COMPOSE
-  #             -> DETACHED POSTERIOR-GUIDED REFINE
+  #             -> DETACHED COMPOSER POSTERIOR
+  #             -> BOUNDARY-ANCHORED POSTERIOR-GUIDED REFINE
   #             -> POSTERIOR-STABLE RELIABILITY CALIBRATION
   #             -> GROUND
   #
-  # Root cause addressed from V1.8:
-  #   * Composer soft posterior could remain uncertain while a
-  #     hard top-1 route switched abruptly to a single-event chain.
-  #   * That hard route shrank the Refiner search domain.
-  #   * Pair entropy then decreased partly because the search
-  #     domain became easier/smaller, not because boundaries were
-  #     necessarily more correct.
-  #   * V1.8 interpreted that concentration as reliability and
-  #     over-trusted raw refinement.
+  # Failure diagnosed in V1.9:
+  #   * Composer event-span posterior remained reasonably healthy,
+  #     but its frame-pair prior was highly diffuse.
+  #   * REFINE then sharpened very aggressively and converged to
+  #     answer-discriminative interior micro-spans.
+  #   * RAW hard span collapsed to roughly 1-2 frames and RAW
+  #     expected span to only a few frames.
+  #   * semantic retention collapsed and RAW IoU approached zero.
+  #   * PSRC correctly reduced reliability and preserved MAIN IoU,
+  #     but MAIN then stayed too close to coarse Composer evidence,
+  #     limiting IoP / TIoP@0.5 / Acc&GQA.
   #
-  # V1.9 changes:
-  #   * no hard top-1 Composer route is used by REFINE;
-  #   * the detached Composer posterior defines a boundary-pair
-  #     prior over all valid contiguous event-span candidates;
-  #   * Refiner updates that prior without sending gradients back
-  #     through the routing prior to Composer;
-  #   * reliability combines Refiner concentration, relative
-  #     information gain, and retained coarse semantic evidence;
-  #   * MAIN remains a calibrated coarse/fine temporal branch.
+  # V1.10.1 changes ONLY the Composer->Refiner pair geometry:
+  #   * keep the soft multi-candidate Composer posterior;
+  #   * keep the routing posterior detached;
+  #   * keep PSRC unchanged;
+  #   * bias start probability toward the LEFT boundary of each
+  #     candidate's first event;
+  #   * bias end probability toward the RIGHT boundary of each
+  #     candidate's last event;
+  #   * do NOT impose a target span length or minimum duration.
   #
-  # Controlled first V1.9 objective remains:
+  # Controlled V1.10.1 objective remains:
   #   L = L_CRA/main + 0.10 L_align + 0.10 L_decomp
+  #
+  # CRA answer machinery, VisualIntervention, smoothing, and all
+  # task/loss settings are intentionally unchanged. CRA ablations
+  # start only in later V1.10.x variants.
   # ============================================================
   qbound:
     enabled: true
-    version: "1.9"
+    version: "1.10.1"
 
     # ----------------------------------------------------------
     # Generic Q-Bound interface / capacity
@@ -114,7 +121,7 @@ model:
     # CRA temporal key/prior is not consumed by Q-Bound.
     use_temporal_prior: false
 
-    # Controlled setting retained from V1.8.
+    # Controlled setting retained from V1.9.
     # Q-Bound learns its own parameters while raw video/question
     # inputs are detached from the upstream backbone via this path.
     detach_backbone_inputs: true
@@ -129,7 +136,7 @@ model:
     # ----------------------------------------------------------
     # DECOMPOSE: dynamic boundary proposals
     # ----------------------------------------------------------
-    # Unchanged to isolate the V1.9 routing/reliability mechanism.
+    # Unchanged to isolate the V1.10.1 Refiner-geometry change.
     boundary_temperature: 0.7
     boundary_threshold: 0.5
     boundary_radius: 2
@@ -161,45 +168,48 @@ model:
     # ----------------------------------------------------------
     # COMPOSE: Latent Contiguous Event-Span Composer
     # ----------------------------------------------------------
-    # Scorer and temperature stay unchanged.
+    # Scorer and temperature stay unchanged from V1.9.
     #
-    # V1.9 preserves:
+    # V1.10.1 preserves:
     #   * differentiable Composer posterior/support for MAIN;
-    #   * hard top-1 Composer readout only as a diagnostic branch.
-    #
-    # V1.9 changes the interface to REFINE:
-    #   * Composer posterior is detached;
-    #   * all valid Composer candidates contribute to a single
-    #     boundary-pair prior;
-    #   * no hard top-1 route is fed into REFINE.
+    #   * hard top-1 Composer readout only as a diagnostic branch;
+    #   * detached multi-candidate posterior on the REFINE route.
     composer:
       enabled: true
       type: latent_contiguous_event_span
       temperature: 0.35
 
     # ----------------------------------------------------------
-    # REFINE: Detached Posterior-Guided Refinement (DPGR)
+    # REFINE:
+    # Boundary-Anchored Posterior-Guided Refinement (BAPGR)
     # + Posterior-Stable Reliability Calibration (PSRC)
     # ----------------------------------------------------------
     refinement:
       enabled: true
-      type: posterior_guided_reliability_refiner
+      type: boundary_anchored_posterior_guided_reliability_refiner
 
-      # Keep the Refiner temperature unchanged for controlled
-      # comparison with V1.8.
+      # Keep Refiner temperature unchanged for a clean V1.9 ->
+      # V1.10.1 comparison.
       temperature: 0.30
 
-      # V1.9 routing contract.
+      # V1.10.1 BAPGR geometry.
       #
-      # These fields document the intended experiment. The V1.9
-      # core/decoder also enforce the contract through runtime flags.
+      # power = 1.0 : mild endpoint anchoring
+      # power = 2.0 : controlled first V1.10.1 run
+      # larger      : stronger endpoint anchoring
+      #
+      # This is a structural prior, NOT a span-length loss.
+      boundary_anchor_power: 2.0
+
+      # Routing contract.
       hard_coarse_route: false
       detach_coarse: true
       posterior_guided: true
       posterior_stable_reliability: true
+      boundary_structured: true
 
       # No V1.7/V1.8 auxiliary routing losses or learned gate.
-      # Reliability is parameter-free in the first controlled V1.9 run.
+      # Reliability remains parameter-free and detached.
 
     # ----------------------------------------------------------
     # Weak semantic alignment inherited from V1.2+
@@ -208,12 +218,13 @@ model:
     weak_align_temperature: 0.07
 
     # ----------------------------------------------------------
-    # Deliberately NOT introduced in the first V1.9 run
+    # Deliberately NOT introduced in the first V1.10.1 run
     # ----------------------------------------------------------
     # No:
     #   temporal-GT supervision
     #   supervised start/end loss
     #   direct span-length target
+    #   minimum-span constraint
     #   minimal-sufficient loss
     #   coarse-answer auxiliary loss
     #   trim target
@@ -228,9 +239,12 @@ model:
     #   differentiable all-span REFINE marginalization
     #
     # First-run goal:
-    # remove hard-routing instability and prevent sharp-but-wrong
-    # fine localization from receiving excessive trust, while
-    # preserving the strong temporal coverage achieved by V1.8.
+    #   1) remove V1.9 RAW micro-span collapse;
+    #   2) increase RAW temporal completeness / semantic retention;
+    #   3) allow PSRC reliability to rise naturally only when
+    #      refinement becomes genuinely useful;
+    #   4) improve MAIN IoP / TIoP@0.5 / Acc&GQA while preserving
+    #      the MAIN IoU coverage achieved by V1.9.
 
 optim:
   pipeline: cra
@@ -238,11 +252,11 @@ optim:
 
   # Original CRA objectives remain unchanged.
   #
-  # CRAPipeline V1.9 adds only:
+  # CRAPipeline V1.10.1 adds only:
   #   + weak_align_weight * L_align
   #   + decomposition.loss_weight * L_decomp
   #
-  # No new V1.9 reliability/routing loss is introduced.
+  # No new V1.10.1 routing/reliability/span-length loss.
   loss:
     ce:
       vq: 1
@@ -259,7 +273,7 @@ optim:
   # use the dedicated Q-Bound optimizer group.
   qbound_lr: 5.e-5
 
-  # Same budget as V1.8 for a controlled comparison.
+  # Same budget as V1.9 for a controlled comparison.
   epochs: 15
   save_period: 1
 
@@ -276,13 +290,13 @@ stat:
 
   record_dir: ./output
 
-  # Start V1.9 from scratch.
-  # Routing and reliability semantics differ from V1.8, so resuming
-  # a V1.8 checkpoint would not be a clean controlled experiment.
+  # Start V1.10.1 from scratch.
+  # Pair-prior geometry differs from V1.9, so resuming a V1.9
+  # checkpoint would not be a clean controlled experiment.
   resume: null
 
 misc:
-  running_name: CRA/NextGQA/QBound_v1.9_seed2024
-  info: "CRA testbed + Q-Bound V1.9 | dynamic latent decomposition + ordered event reasoning + latent contiguous event-span composition + detached posterior-guided refinement + posterior-stable reliability calibration + grounding"
+  running_name: CRA/NextGQA/QBound_v1.10.1_seed2024
+  info: "CRA testbed + Q-Bound V1.10.1 | dynamic latent decomposition + ordered event reasoning + latent contiguous event-span composition + boundary-anchored posterior-guided refinement (BAPGR) + posterior-stable reliability calibration (PSRC) + grounding"
   cuda: "0"
   seed: 2024

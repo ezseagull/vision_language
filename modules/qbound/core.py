@@ -8,40 +8,67 @@ import torch.nn.functional as F
 
 class QBoundCore(nn.Module):
     """
-    Q-Bound Version 1.9 core:
+    Q-Bound Version 1.10.1 core:
         DECOMPOSE -> RELATE -> COMPOSE
-        -> DETACHED POSTERIOR-GUIDED REFINE
+        -> DETACHED BOUNDARY-ANCHORED POSTERIOR-GUIDED REFINE
         -> RELIABILITY CALIBRATION -> GROUND
 
-    V1.9 keeps the dynamic event topology, Q-OEI reasoning, and the
-    differentiable contiguous-event Composer from V1.8, but fixes two failure
-    modes observed in V1.8:
+    V1.10.1 is a controlled correction of the V1.9 Refiner failure.  The
+    V1.9 training diagnostics showed a characteristic mismatch:
 
-      1) A still-uncertain Composer posterior was collapsed to a hard top-1
-         chain before REFINE. Small ranking changes could therefore turn a
-         multi-event search region into a single-event region abruptly.
+      * Composer/coarse support stayed broad and useful (about 20 frames);
+      * the Composer span posterior became reasonably selective;
+      * the Composer -> pair conversion remained very diffuse;
+      * the Refiner became increasingly sharp/confident while collapsing to
+        approximately 1--3 frame RAW intervals;
+      * RAW IoU collapsed, semantic retention approached zero, and PSRC had to
+        reduce Refiner reliability to almost zero to preserve MAIN IoU.
 
-      2) V1.8 treated low Refiner pair entropy as localization reliability.
-         In weakly supervised VideoQA, a Refiner can instead become decisively
-         wrong: pair entropy can fall because the search domain became easier
-         or because a short answer-discriminative cue was found.
+    Inspecting the V1.9 code shows that it did NOT allow arbitrary start/end
+    frames from every interior event of a multi-event chain.  It already
+    restricted start candidates to the first event and end candidates to the
+    last event.  The remaining structural weakness was subtler: every frame
+    inside those boundary events was treated uniformly.  For a one-event
+    candidate, this makes every ordered pair inside the event legal with equal
+    prior mass, including tiny interior intervals.  For longer chains, it also
+    discards the semantic meaning that the first event contributes the left
+    boundary and the last event contributes the right boundary.
 
-    V1.9 therefore constructs a *detached Composer boundary-pair prior* from
-    all valid Composer spans:
+    V1.10.1 keeps the successful parts of V1.9:
+      * soft multi-span Composer uncertainty;
+      * stop-gradient Composer -> Refiner routing;
+      * one Refiner update rather than differentiable all-span marginalization;
+      * posterior-stable reliability calibration (PSRC);
+      * no temporal GT, IoU/IoP loss, target span length, minimality loss,
+        event-count forcing, or direct event-token answer residual.
 
-        q_C(s,e) = sum_k stopgrad(pi_k) q(s,e | span_k)
+    The only principal mechanism change is Boundary-Anchored Posterior-Guided
+    Refinement (BAPGR).  For each Composer candidate span k=[E_i,...,E_j]:
 
-    where q(s,e | span_k) is uniform over legal start/end pairs for that span.
-    REFINE performs one Bayesian-style update of this prior:
+      * start candidates remain inside E_i;
+      * end candidates remain inside E_j;
+      * start prior mass decays smoothly away from the LEFT edge of E_i;
+      * end prior mass decays smoothly away from the RIGHT edge of E_j.
+
+    A normalized boundary-anchor distribution q_B(s,e|span_k) replaces the
+    V1.9 uniform pair distribution:
+
+        q_B(s,e|span_k)
+            propto a_start(s|E_i) * a_end(e|E_j) * 1[s <= e]
+
+        q_C(s,e)
+            = sum_k stopgrad(pi_k) q_B(s,e|span_k)
+
+    with a configurable positive anchor power.  This is a structural prior,
+    not a span-length target: all legal boundary-event frames remain reachable,
+    but micro-spans in event interiors no longer receive the same prior mass as
+    semantically meaningful event boundaries.
+
+    REFINE still performs the same Bayesian-style update:
 
         p_R(s,e) propto q_C(s,e) * exp((l_s + l_e) / tau_R)
 
-    The Composer prior is detached on the REFINE route, so fine-boundary task
-    gradients still cannot flow back through this route to Composer. This is
-    intentionally different from the V1.6 differentiable all-span
-    marginalization that caused coarse-span expansion.
-
-    Reliability is parameter-free and detached. It combines:
+    and PSRC remains unchanged:
 
         information_gain = clip((H(q_C) - H(p_R)) / H(q_C), 0, 1)
         semantic_retention = sum_t p_coarse(t) * support_R(t)
@@ -49,33 +76,24 @@ class QBoundCore(nn.Module):
         gain_factor = 0.5 * (1 + information_gain)
         reliability = base_confidence * semantic_retention * gain_factor
 
-    The entropy term supplies a small parameter-free bootstrap signal so the
-    Refiner is not gradient-starved at initialization, while semantic
-    retention can still drive trust close to zero for decisive but destructive
-    fine proposals. Relative information gain further increases trust only when
-    REFINE actually resolves ambiguity beyond the Composer prior.
-
     MAIN temporal evidence remains:
 
         p_main(t) = (1-reliability) * p_coarse(t)
                   + reliability * p_refine(t)
 
-    Hard MAIN boundaries are read from the same posterior-calibrated boundary
-    distribution rather than interpolating inside a deterministic top-1 chain.
-
     Gradient contract:
       * Composer -> MAIN coarse component remains differentiable.
-      * Composer posterior -> REFINE prior is stop-gradient.
+      * Composer posterior -> BAPGR prior is stop-gradient.
       * Refiner -> MAIN fine component remains differentiable.
       * Reliability is detached, preventing reliability gaming.
-      * No temporal GT, IoU/IoP loss, target span length, entropy loss,
-        minimality loss, forced event count, or direct event-token answer
-        residual is introduced.
+      * Boundary anchoring is parameter-free apart from its fixed/configured
+        geometric power and introduces no auxiliary optimization loss.
 
-    Legacy V1.8 output names are retained where practical so downstream files
-    can be migrated incrementally. New V1.9 diagnostics explicitly expose the
-    Composer pair prior, information gain, semantic retention, reliability,
-    and posterior-guided routing state.
+    Legacy V1.9 output names are retained so downstream files can be migrated
+    incrementally.  V1.10.1 additionally exposes the counterfactual V1.9
+    uniform pair prior and boundary-anchor diagnostics, making it possible to
+    verify that the new routing prior reduces pair dilution without hiding a
+    new tiny-span shortcut.
     """
 
     def __init__(
@@ -97,11 +115,12 @@ class QBoundCore(nn.Module):
         min_event_mass: float = 0.25,
         composer_temperature: float = 0.35,
         refiner_temperature: float = 0.30,
+        refiner_boundary_anchor_power: float = 2.0,
     ) -> None:
         super().__init__()
 
         if max_events < 2:
-            raise ValueError("Version 1.9 requires max_events >= 2.")
+            raise ValueError("Version 1.10.1 requires max_events >= 2.")
         if proposal_candidates < 1:
             raise ValueError("proposal_candidates must be >= 1.")
         if proposal_candidates < max_events - 1:
@@ -131,12 +150,17 @@ class QBoundCore(nn.Module):
             raise ValueError("composer_temperature must be positive.")
         if refiner_temperature <= 0.0:
             raise ValueError("refiner_temperature must be positive.")
+        if refiner_boundary_anchor_power <= 0.0:
+            raise ValueError(
+                "refiner_boundary_anchor_power must be positive."
+            )
 
         self.input_dim = int(input_dim)
         self.hidden_dim = int(hidden_dim)
         self.max_events = int(max_events)
         self.max_transitions = self.max_events - 1
         self.proposal_candidates = int(proposal_candidates)
+        self.qbound_version = "1.10.1"
 
         self.use_temporal_prior = bool(use_temporal_prior)
         self.boundary_temperature = float(boundary_temperature)
@@ -149,6 +173,9 @@ class QBoundCore(nn.Module):
         self.min_event_mass = float(min_event_mass)
         self.composer_temperature = float(composer_temperature)
         self.refiner_temperature = float(refiner_temperature)
+        self.refiner_boundary_anchor_power = float(
+            refiner_boundary_anchor_power
+        )
 
         # ------------------------------------------------------------------
         # A. TOPOLOGY / DECOMPOSITION BRANCH
@@ -397,11 +424,12 @@ class QBoundCore(nn.Module):
         nn.init.zeros_(self.span_composer_score[-1].bias)
 
         # ------------------------------------------------------------------
-        # F. REFINE: Boundary proposal + uncertainty calibration (V1.8)
+        # F. REFINE: boundary scorer + BAPGR + PSRC (V1.10.1)
         # ------------------------------------------------------------------
-        # Trainable boundary scorer is unchanged. REFINE still sees only
-        # the detached top-1 coarse chain. V1.8 removes explicit minimality
-        # pressure and calibrates fine support with pair-posterior uncertainty.
+        # The trainable boundary scorer is intentionally unchanged from V1.9.
+        # V1.10.1 changes only the detached Composer -> pair geometry: legal
+        # frames inside the first/last event are softly anchored toward the
+        # semantic span endpoints before the Refiner logits update the prior.
         refiner_input_dim = hidden_dim * 6 + 2
         self.boundary_refine_encoder = nn.Sequential(
             nn.Linear(refiner_input_dim, hidden_dim),
@@ -429,7 +457,7 @@ class QBoundCore(nn.Module):
     # Generic helpers
     # ----------------------------------------------------------------------
     def _summarize_qa(self, qa_features: torch.Tensor) -> torch.Tensor:
-        """Compatibility helper. V1.8 should receive question-only [B,D]."""
+        """Compatibility helper. Q-Bound receives question-only [B,D]."""
         if qa_features.ndim < 2:
             raise ValueError("qa_features must have at least two dimensions.")
         if qa_features.size(-1) != self.input_dim:
@@ -1783,30 +1811,36 @@ class QBoundCore(nn.Module):
         video_mask: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         """
-        V1.9 detached posterior-guided refinement and reliability calibration.
+        V1.10.1 detached Boundary-Anchored Posterior-Guided Refinement.
 
-        Unlike V1.8, REFINE is not restricted to the detached hard top-1
-        Composer chain.  Instead, every valid Composer span contributes to a
-        detached boundary-pair prior.  This preserves Composer uncertainty
-        without reopening the V1.6 Refiner->Composer gradient path.
+        V1.9 already used all valid detached Composer spans, but each candidate
+        assigned UNIFORM mass to every legal pair formed by frames in its first
+        and last events.  This made one-event candidates especially vulnerable
+        to tiny interior-pair shortcuts.
 
-        Reliability is based on two detached quantities:
+        V1.10.1 preserves the detached multi-span route while replacing that
+        uniform conditional pair distribution with a smooth endpoint-anchored
+        distribution.  Start positions are biased toward the left edge of the
+        candidate's first event and end positions toward the right edge of its
+        last event.  Every legal boundary-event frame remains reachable.
+
+        PSRC is deliberately unchanged so this run isolates pair geometry:
 
             information_gain
-                Relative entropy reduction from the Composer pair prior to the
-                Refiner pair posterior.
+                Relative entropy reduction from the anchored Composer pair
+                prior to the Refiner pair posterior.
 
             semantic_retention
-                Probability mass of the differentiable coarse temporal
-                evidence still covered by the Refiner soft interval support.
+                Coarse temporal probability still covered by the Refiner soft
+                interval support.
 
-        base_confidence = exp(-normalized_refiner_entropy)
-        gain_factor = 0.5 * (1 + information_gain)
-        reliability = base_confidence * semantic_retention * gain_factor
+            reliability
+                = exp(-normalized_refiner_entropy)
+                  * semantic_retention
+                  * 0.5 * (1 + information_gain)
 
-        This bootstrap-safe form avoids the near-zero Refiner gradient that a
-        pure information_gain * retention product would create at uniform
-        initialization. No temporal GT or span-length target is used.
+        No temporal GT, span-length target, minimality loss, or IoU/IoP loss is
+        introduced.
         """
         batch_size, time_steps, hidden_dim = raw_states.shape
 
@@ -1839,7 +1873,7 @@ class QBoundCore(nn.Module):
         coarse_temporal_prob = composition.get("composed_temporal_prob")
         if not torch.is_tensor(coarse_temporal_prob):
             raise KeyError(
-                "V1.9 requires composition['composed_temporal_prob']."
+                "V1.10.1 requires composition['composed_temporal_prob']."
             )
         if coarse_temporal_prob.shape != (batch_size, time_steps):
             raise ValueError("composed_temporal_prob must be [B,T].")
@@ -1850,16 +1884,16 @@ class QBoundCore(nn.Module):
         span_end_events = composition.get("span_candidate_end_event")
 
         if not torch.is_tensor(span_posterior) or span_posterior.ndim != 2:
-            raise KeyError("V1.9 requires composition['span_posterior'] [B,S].")
+            raise KeyError("V1.10.1 requires composition['span_posterior'] [B,S].")
         if not torch.is_tensor(span_valid_mask):
             raise KeyError(
-                "V1.9 requires composition['span_candidate_valid_mask']."
+                "V1.10.1 requires composition['span_candidate_valid_mask']."
             )
         if not torch.is_tensor(span_start_events) or not torch.is_tensor(
             span_end_events
         ):
             raise KeyError(
-                "V1.9 requires Composer candidate start/end event indices."
+                "V1.10.1 requires Composer candidate start/end event indices."
             )
 
         num_spans = span_posterior.size(1)
@@ -1872,7 +1906,7 @@ class QBoundCore(nn.Module):
 
         # --------------------------------------------------------------
         # Keep V1.8 hard top-1 Composer outputs as diagnostics only.
-        # They no longer define the V1.9 Refiner search region.
+        # They no longer define the V1.10.1 Refiner search region.
         # --------------------------------------------------------------
         selected_span_index = composition["selected_span_index"].detach().long()
         coarse_start_frame = composition["selected_span_start_frame"].detach().long()
@@ -1941,11 +1975,21 @@ class QBoundCore(nn.Module):
         end_logits_raw = end_logits_raw * mask_f
 
         # --------------------------------------------------------------
-        # V1.9 Detached Posterior-Guided Refinement (DPGR).
+        # V1.10.1 Boundary-Anchored Posterior-Guided Refinement (BAPGR).
         #
-        # Map every valid Composer span to a normalized distribution over
-        # legal boundary pairs, then mix those distributions with detached
-        # Composer span probabilities.
+        # V1.9 already restricted start frames to the first event and end
+        # frames to the last event of each Composer candidate.  Its remaining
+        # weakness was UNIFORM probability inside those boundary events.  In a
+        # one-event candidate that makes tiny interior intervals just as likely
+        # a priori as the event's semantic endpoints.
+        #
+        # Here we keep the same legal support but impose a smooth geometric
+        # anchor:
+        #   start: maximum at the LEFT edge of the first event;
+        #   end:   maximum at the RIGHT edge of the last event.
+        #
+        # No pair is removed solely because of the anchor; it only changes
+        # prior mass.  Composer span weights remain detached exactly as in V1.9.
         # --------------------------------------------------------------
         span_start_events = span_start_events.to(
             device=raw_states.device,
@@ -1966,7 +2010,7 @@ class QBoundCore(nn.Module):
             num_classes=self.max_events,
         ).to(event_assignment.dtype)
 
-        # [B,S,T]
+        # [B,S,T]: all frames belonging to the candidate's first/last event.
         span_start_candidate_mask = (
             torch.einsum(
                 "btk,sk->bst",
@@ -2005,7 +2049,7 @@ class QBoundCore(nn.Module):
         ).view(1, 1, 1, time_steps)
         ordered_pair_mask = start_grid <= end_grid
 
-        # [B,S,T,T]
+        # [B,S,T,T] legal pair support retained from V1.9.
         span_pair_valid_mask = (
             span_start_candidate_mask.unsqueeze(-1)
             & span_end_candidate_mask.unsqueeze(-2)
@@ -2016,9 +2060,100 @@ class QBoundCore(nn.Module):
         )
         span_has_pair = span_pair_count > 0
 
-        span_pair_distribution = (
+        # ----------------------------------------------------------
+        # Counterfactual V1.9 prior (diagnostic only): uniform over all
+        # legal pairs inside the boundary events.
+        # ----------------------------------------------------------
+        span_uniform_pair_distribution = (
             span_pair_valid_mask.to(raw_states.dtype)
             / span_pair_count.clamp_min(1.0).unsqueeze(-1).unsqueeze(-1)
+        )
+
+        # ----------------------------------------------------------
+        # Boundary anchor weights.
+        #
+        # For a boundary event of length L:
+        #   start_anchor(t) = ((right - t + 1) / L)^p
+        #   end_anchor(t)   = ((t - left + 1) / L)^p
+        #
+        # Thus the semantic full-event endpoints receive weight 1 while
+        # interior frames remain legal with smoothly smaller prior mass.
+        # ----------------------------------------------------------
+        span_frame_index = torch.arange(
+            time_steps,
+            device=raw_states.device,
+            dtype=torch.long,
+        ).view(1, 1, time_steps)
+
+        start_event_left = torch.where(
+            span_start_candidate_mask,
+            span_frame_index,
+            torch.full_like(span_frame_index, time_steps),
+        ).min(dim=-1).values
+        start_event_right = torch.where(
+            span_start_candidate_mask,
+            span_frame_index,
+            torch.full_like(span_frame_index, -1),
+        ).max(dim=-1).values
+        end_event_left = torch.where(
+            span_end_candidate_mask,
+            span_frame_index,
+            torch.full_like(span_frame_index, time_steps),
+        ).min(dim=-1).values
+        end_event_right = torch.where(
+            span_end_candidate_mask,
+            span_frame_index,
+            torch.full_like(span_frame_index, -1),
+        ).max(dim=-1).values
+
+        start_event_length = (
+            start_event_right - start_event_left + 1
+        ).clamp_min(1).to(raw_states.dtype)
+        end_event_length = (
+            end_event_right - end_event_left + 1
+        ).clamp_min(1).to(raw_states.dtype)
+
+        frame_pos = span_frame_index.to(raw_states.dtype)
+        start_anchor = (
+            (
+                start_event_right.to(raw_states.dtype).unsqueeze(-1)
+                - frame_pos
+                + 1.0
+            )
+            / start_event_length.unsqueeze(-1)
+        ).clamp(min=0.0, max=1.0)
+        end_anchor = (
+            (
+                frame_pos
+                - end_event_left.to(raw_states.dtype).unsqueeze(-1)
+                + 1.0
+            )
+            / end_event_length.unsqueeze(-1)
+        ).clamp(min=0.0, max=1.0)
+
+        anchor_power = self.refiner_boundary_anchor_power
+        start_anchor = (
+            start_anchor.pow(anchor_power)
+            * span_start_candidate_mask.to(raw_states.dtype)
+        )
+        end_anchor = (
+            end_anchor.pow(anchor_power)
+            * span_end_candidate_mask.to(raw_states.dtype)
+        )
+
+        span_pair_anchor_weight = (
+            start_anchor.unsqueeze(-1)
+            * end_anchor.unsqueeze(-2)
+            * span_pair_valid_mask.to(raw_states.dtype)
+        )
+        span_pair_anchor_mass = span_pair_anchor_weight.sum(
+            dim=(-2, -1),
+            keepdim=True,
+        )
+        span_pair_distribution = torch.where(
+            span_pair_anchor_mass > 1e-8,
+            span_pair_anchor_weight / span_pair_anchor_mass.clamp_min(1e-8),
+            span_uniform_pair_distribution,
         )
 
         detached_span_weights = (
@@ -2043,6 +2178,24 @@ class QBoundCore(nn.Module):
             top1_fallback,
         )
 
+        # V1.9 counterfactual prior retained only for diagnostics.  It uses
+        # the same detached Composer weights but the old uniform conditional
+        # pair distribution, allowing an apples-to-apples routing comparison.
+        composer_uniform_pair_prior = torch.einsum(
+            "bs,bsij->bij",
+            detached_span_weights,
+            span_uniform_pair_distribution,
+        )
+        composer_uniform_pair_mass = composer_uniform_pair_prior.sum(
+            dim=(-2, -1),
+            keepdim=True,
+        )
+        composer_uniform_pair_prior = (
+            composer_uniform_pair_prior
+            / composer_uniform_pair_mass.clamp_min(1e-8)
+        ).detach()
+
+        # V1.10.1 boundary-anchored search prior used by REFINE.
         composer_pair_prior = torch.einsum(
             "bs,bsij->bij",
             detached_span_weights,
@@ -2116,11 +2269,31 @@ class QBoundCore(nn.Module):
             batch_size, -1
         ).max(dim=-1).values
 
+        # Counterfactual V1.9 uniform-prior diagnostics.
+        composer_uniform_pair_entropy = -torch.sum(
+            composer_uniform_pair_prior
+            * torch.log(composer_uniform_pair_prior.clamp_min(1e-8)),
+            dim=(-2, -1),
+        )
+        composer_uniform_pair_effective_count = torch.exp(
+            composer_uniform_pair_entropy
+        )
+        composer_uniform_pair_top1_posterior = (
+            composer_uniform_pair_prior.reshape(batch_size, -1)
+            .max(dim=-1)
+            .values
+        )
+
         pair_max_entropy = torch.log(pair_candidate_count.clamp_min(1.0))
         composer_pair_entropy_ratio = torch.where(
             pair_candidate_count > 1.0,
             composer_pair_entropy / pair_max_entropy.clamp_min(1e-6),
             torch.zeros_like(composer_pair_entropy),
+        ).clamp(0.0, 1.0)
+        composer_uniform_pair_entropy_ratio = torch.where(
+            pair_candidate_count > 1.0,
+            composer_uniform_pair_entropy / pair_max_entropy.clamp_min(1e-6),
+            torch.zeros_like(composer_uniform_pair_entropy),
         ).clamp(0.0, 1.0)
         pair_entropy_ratio = torch.where(
             pair_candidate_count > 1.0,
@@ -2171,7 +2344,8 @@ class QBoundCore(nn.Module):
         )
 
         # --------------------------------------------------------------
-        # V1.9 Posterior-Stable Reliability Calibration (PSRC).
+        # V1.10.1 keeps V1.9 Posterior-Stable Reliability Calibration (PSRC)
+        # unchanged so the controlled experiment isolates search-prior geometry.
         #
         # information_gain asks whether REFINE actually removed ambiguity
         # beyond the Composer prior. semantic_retention prevents a decisive
@@ -2271,6 +2445,22 @@ class QBoundCore(nn.Module):
             end_grid.squeeze(1) - start_grid.squeeze(1) + 1
         ).to(raw_states.dtype).expand(batch_size, -1, -1)
 
+        # Search-prior geometry diagnostics.  These directly quantify whether
+        # BAPGR preserves more Composer boundary extent than the V1.9 uniform
+        # pair prior before any trainable Refiner logits are applied.
+        composer_pair_prior_expected_span_length = torch.sum(
+            composer_pair_prior * pair_length,
+            dim=(-2, -1),
+        )
+        composer_uniform_pair_prior_expected_span_length = torch.sum(
+            composer_uniform_pair_prior * pair_length,
+            dim=(-2, -1),
+        )
+        composer_pair_prior_length_gain = (
+            composer_pair_prior_expected_span_length
+            / composer_uniform_pair_prior_expected_span_length.clamp_min(1.0)
+        )
+
         # Raw Refiner expectations / MAP interval.
         expected_refined_span_length = torch.sum(
             selected_pair_posterior * pair_length,
@@ -2305,8 +2495,8 @@ class QBoundCore(nn.Module):
         # --------------------------------------------------------------
         # Composer endpoint prior for hard MAIN readout.
         #
-        # The search prior above is intentionally uniform over legal boundary
-        # pairs inside each Composer span.  Using that same distribution for
+        # The search prior above is boundary-anchored over legal boundary-event
+        # pairs.  Using that same distribution for
         # the coarse side of the final hard readout would shrink boundaries
         # toward event interiors even when reliability=0.  Instead, preserve
         # the actual semantic coverage of each Composer span by placing its
@@ -2315,7 +2505,7 @@ class QBoundCore(nn.Module):
         span_frame_mask_all = composition.get("span_candidate_frame_mask")
         if not torch.is_tensor(span_frame_mask_all):
             raise KeyError(
-                "V1.9 requires composition['span_candidate_frame_mask']."
+                "V1.10.1 requires composition['span_candidate_frame_mask']."
             )
         span_frame_mask_all = (
             span_frame_mask_all.detach().bool()
@@ -2523,7 +2713,7 @@ class QBoundCore(nn.Module):
         )
 
         # Legacy top-1-relative diagnostics are retained only for comparison
-        # with V1.8.  V1.9 MAIN is allowed to extend outside the top-1 span
+        # with V1.8.  V1.10.1 MAIN is allowed to extend outside the top-1 span
         # because it represents the detached Composer posterior, not one chain.
         expected_refined_length_ratio = (
             expected_refined_span_length
@@ -2596,9 +2786,12 @@ class QBoundCore(nn.Module):
 
         return {
             # ----------------------------------------------------------
-            # V1.9 routing contract.
+            # V1.10.1 routing contract.
             # ----------------------------------------------------------
             "posterior_guided_refinement_enabled": torch.ones(
+                (), dtype=raw_states.dtype, device=raw_states.device
+            ),
+            "boundary_structured_refinement_enabled": torch.ones(
                 (), dtype=raw_states.dtype, device=raw_states.device
             ),
             "posterior_stable_reliability_enabled": torch.ones(
@@ -2609,6 +2802,11 @@ class QBoundCore(nn.Module):
             ),
             "refine_coarse_detached": torch.ones(
                 (), dtype=raw_states.dtype, device=raw_states.device
+            ),
+            "refine_boundary_anchor_power": torch.as_tensor(
+                self.refiner_boundary_anchor_power,
+                dtype=raw_states.dtype,
+                device=raw_states.device,
             ),
             # Top-1 span survives only as a diagnostic identifier.
             "refine_selected_span_index": selected_span_index,
@@ -2631,8 +2829,9 @@ class QBoundCore(nn.Module):
             "refine_selected_end_candidate_count": selected_end_candidate_count,
             "refine_expected_pair_entropy": selected_pair_entropy,
 
-            # Explicit V1.9 Composer boundary prior diagnostics.
+            # V1.10.1 anchored Composer search-prior diagnostics.
             "composer_pair_prior": composer_pair_prior,
+            "composer_uniform_pair_prior": composer_uniform_pair_prior,
             "composer_endpoint_pair_prior": composer_endpoint_pair_prior,
             "composer_pair_prior_valid_mask": composer_pair_valid_mask,
             "composer_pair_prior_entropy": composer_pair_entropy,
@@ -2640,6 +2839,23 @@ class QBoundCore(nn.Module):
             "composer_pair_prior_effective_count": composer_pair_effective_count,
             "composer_pair_prior_top1_posterior": composer_pair_top1_posterior,
             "composer_pair_prior_candidate_count": pair_candidate_count,
+            "composer_uniform_pair_prior_entropy": composer_uniform_pair_entropy,
+            "composer_uniform_pair_prior_entropy_ratio": (
+                composer_uniform_pair_entropy_ratio
+            ),
+            "composer_uniform_pair_prior_effective_count": (
+                composer_uniform_pair_effective_count
+            ),
+            "composer_uniform_pair_prior_top1_posterior": (
+                composer_uniform_pair_top1_posterior
+            ),
+            "composer_pair_prior_expected_span_length": (
+                composer_pair_prior_expected_span_length
+            ),
+            "composer_uniform_pair_prior_expected_span_length": (
+                composer_uniform_pair_prior_expected_span_length
+            ),
+            "composer_pair_prior_length_gain": composer_pair_prior_length_gain,
             "composer_pair_soft_support": composer_pair_soft_support,
             "composer_expected_start_frame": composer_expected_start_frame,
             "composer_expected_end_frame": composer_expected_end_frame,
@@ -2651,7 +2867,7 @@ class QBoundCore(nn.Module):
             "base_refiner_confidence": base_refiner_confidence,
             "reliability_gain_factor": reliability_gain_factor,
             "calibration_reliability": calibration_reliability,
-            # Legacy V1.8 names mapped to V1.9 quantities.
+            # Legacy V1.8 names mapped to V1.10.1 quantities.
             "calibration_uncertainty": calibration_uncertainty,
             "calibration_information": calibration_information,
             "calibration_confidence": calibration_confidence,
@@ -2757,7 +2973,7 @@ class QBoundCore(nn.Module):
                 f"Expected input_dim={self.input_dim}, got {feature_dim}."
             )
         if time_steps < 2:
-            raise ValueError("Version 1.9 requires at least 2 timesteps.")
+            raise ValueError("Version 1.10.1 requires at least 2 timesteps.")
 
         video_mask = self._normalize_mask(
             video_mask,
@@ -2901,7 +3117,7 @@ class QBoundCore(nn.Module):
         )
 
         # ------------------------------------------------------------------
-        # C. COMPOSE (V1.5 mechanism retained in V1.9)
+        # C. COMPOSE (V1.5 mechanism retained in V1.10.1)
         # ------------------------------------------------------------------
         composition = self._compose_event_spans(
             reasoned_event_tokens=grounding["reasoned_event_tokens"],
@@ -2914,7 +3130,7 @@ class QBoundCore(nn.Module):
         )
 
         # --------------------------------------------------------------
-        # D. DETACHED POSTERIOR-GUIDED REFINE + RELIABILITY CALIBRATION (V1.9)
+        # D. BOUNDARY-ANCHORED POSTERIOR-GUIDED REFINE + PSRC (V1.10.1)
         # --------------------------------------------------------------
         refinement = self._refine_selected_span(
             raw_states=raw_states,
@@ -3193,11 +3409,14 @@ class QBoundCore(nn.Module):
             "selected_span_start": composition["selected_span_start"],
             "selected_span_end": composition["selected_span_end"],
 
-            # V1.9 REFINE + posterior-stable reliability calibration outputs.
+            # V1.10.1 BAPGR REFINE + posterior-stable reliability outputs.
             "refiner_enabled": torch.as_tensor(1.0,dtype=video_tokens.dtype,device=video_tokens.device),
             "stable_refiner_enabled": torch.as_tensor(1.0,dtype=video_tokens.dtype,device=video_tokens.device),
             "uncertainty_calibration_enabled": torch.as_tensor(1.0,dtype=video_tokens.dtype,device=video_tokens.device),
             "posterior_guided_refinement_enabled": refinement["posterior_guided_refinement_enabled"],
+            "boundary_structured_refinement_enabled": refinement[
+                "boundary_structured_refinement_enabled"
+            ],
             "posterior_stable_reliability_enabled": refinement["posterior_stable_reliability_enabled"],
             "minimal_sufficient_enabled": torch.as_tensor(0.0,dtype=video_tokens.dtype,device=video_tokens.device),
             "all_span_refine_marginal_enabled": torch.as_tensor(0.0,dtype=video_tokens.dtype,device=video_tokens.device),
@@ -3258,6 +3477,9 @@ class QBoundCore(nn.Module):
             "base_refiner_confidence": refinement["base_refiner_confidence"],
             "reliability_gain_factor": refinement["reliability_gain_factor"],
             "composer_pair_prior": refinement["composer_pair_prior"],
+            "composer_uniform_pair_prior": refinement[
+                "composer_uniform_pair_prior"
+            ],
             "composer_endpoint_pair_prior": refinement["composer_endpoint_pair_prior"],
             "composer_pair_prior_valid_mask": refinement["composer_pair_prior_valid_mask"],
             "composer_pair_prior_entropy": refinement["composer_pair_prior_entropy"],
@@ -3265,6 +3487,27 @@ class QBoundCore(nn.Module):
             "composer_pair_prior_effective_count": refinement["composer_pair_prior_effective_count"],
             "composer_pair_prior_top1_posterior": refinement["composer_pair_prior_top1_posterior"],
             "composer_pair_prior_candidate_count": refinement["composer_pair_prior_candidate_count"],
+            "composer_uniform_pair_prior_entropy": refinement[
+                "composer_uniform_pair_prior_entropy"
+            ],
+            "composer_uniform_pair_prior_entropy_ratio": refinement[
+                "composer_uniform_pair_prior_entropy_ratio"
+            ],
+            "composer_uniform_pair_prior_effective_count": refinement[
+                "composer_uniform_pair_prior_effective_count"
+            ],
+            "composer_uniform_pair_prior_top1_posterior": refinement[
+                "composer_uniform_pair_prior_top1_posterior"
+            ],
+            "composer_pair_prior_expected_span_length": refinement[
+                "composer_pair_prior_expected_span_length"
+            ],
+            "composer_uniform_pair_prior_expected_span_length": refinement[
+                "composer_uniform_pair_prior_expected_span_length"
+            ],
+            "composer_pair_prior_length_gain": refinement[
+                "composer_pair_prior_length_gain"
+            ],
             "composer_pair_soft_support": refinement["composer_pair_soft_support"],
             "composer_expected_start_frame": refinement["composer_expected_start_frame"],
             "composer_expected_end_frame": refinement["composer_expected_end_frame"],
@@ -3281,6 +3524,9 @@ class QBoundCore(nn.Module):
             ],
             "refine_coarse_detached": refinement[
                 "refine_coarse_detached"
+            ],
+            "refine_boundary_anchor_power": refinement[
+                "refine_boundary_anchor_power"
             ],
             "refine_selected_span_index": refinement[
                 "refine_selected_span_index"
@@ -3372,7 +3618,7 @@ class QBoundCore(nn.Module):
             "calibrated_inside_coarse": refinement["calibrated_inside_coarse"],
             "refiner_temperature": refinement["refiner_temperature"],
 
-            # Main V1.9 temporal output: reliability-calibrated fusion.
+            # Main V1.10.1 temporal output: reliability-calibrated fusion.
             "event_temporal_prob": refinement["calibrated_temporal_prob"],
             "main_temporal_prob": refinement["calibrated_temporal_prob"],
             "main_temporal_logits": refinement["calibrated_temporal_logits"],

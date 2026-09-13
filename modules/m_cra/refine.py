@@ -110,12 +110,12 @@ class DecoderLayer(nn.Module):
 
 class Decoder(nn.Module):
     """
-    CRA refinement decoder with Q-Bound Version 1.9.
+    CRA refinement decoder with Q-Bound Version 1.10.1.
 
-    V1.9 follows:
+    V1.10.1 follows:
 
         DECOMPOSE -> RELATE -> COMPOSE
-                           -> DETACHED POSTERIOR-GUIDED REFINE
+                           -> BOUNDARY-ANCHORED POSTERIOR-GUIDED REFINE
                            -> POSTERIOR-STABLE RELIABILITY CALIBRATION
                            -> GROUND
 
@@ -127,10 +127,12 @@ class Decoder(nn.Module):
 
         2) RAW REFINE:
            fine boundary posterior conditioned on a DETACHED Composer posterior
-           pair prior. Unlike V1.8, REFINE is no longer restricted to the
-           detached hard top-1 Composer chain. This removes the discontinuous
-           one-span search-domain collapse observed around the V1.8 phase
-           transition while still blocking Refiner -> Composer gradients.
+           pair prior. V1.10.1 keeps multiple plausible Composer chains, but the
+           pair prior is now boundary-anchored: starts are biased toward the
+           left boundary of the first event and ends toward the right boundary
+           of the last event. This preserves event-chain boundary semantics and
+           reduces the interior micro-span shortcut observed in V1.9, while
+           still blocking Refiner -> Composer gradients.
 
         3) RELIABILITY-CALIBRATED MAIN:
            parameter-free fusion of coarse semantic coverage and raw fine
@@ -144,15 +146,15 @@ class Decoder(nn.Module):
         Composer posterior
             |-- differentiable --> COARSE MAIN component --> task gradient
             |
-            `-- stop-gradient --> Composer pair prior --> REFINE
+            `-- stop-gradient --> boundary-anchored pair prior --> REFINE
 
-    Therefore V1.9 does NOT restore the V1.6 differentiable all-span
+    Therefore V1.10.1 does NOT restore the V1.6 differentiable all-span
     Composer x Refiner marginalization. REFINE cannot train Composer through
     its search prior.
 
     The official answer-space representations are:
 
-        qbound_calibrated_video_proj     # V1.9 MAIN
+        qbound_calibrated_video_proj     # V1.10.1 MAIN
         qbound_raw_refined_video_proj    # diagnostic
         qbound_coarse_video_proj         # diagnostic
 
@@ -160,10 +162,10 @@ class Decoder(nn.Module):
     projection-dropout realization for controlled comparison.
 
     Compatibility:
-      * qbound_video_proj aliases the V1.9 calibrated MAIN representation.
+      * qbound_video_proj aliases the V1.10.1 calibrated MAIN representation.
       * qbound_refined_video_proj also aliases calibrated MAIN.
       * legacy V1.8 calibration names are retained where the core maps them to
-        V1.9 reliability semantics.
+        V1.10.1 reliability semantics.
       * selected_span_* remains available as a diagnostic hard top-1 Composer
         readout, but it no longer defines the Refiner search region.
 
@@ -191,7 +193,7 @@ class Decoder(nn.Module):
 
         self.embed_dim = embed_dim
         self.cfgs = cfgs
-        self.qbound_version = "1.9"
+        self.qbound_version = "1.10.1"
 
         self.layers = clones(
             DecoderLayer(
@@ -234,6 +236,16 @@ class Decoder(nn.Module):
         if not isinstance(refinement_cfg, dict):
             raise ValueError("model.qbound.refinement must be a mapping/dict.")
 
+        configured_qbound_version = str(
+            qbound_cfg.get("version", self.qbound_version)
+        )
+        if configured_qbound_version != self.qbound_version:
+            raise ValueError(
+                "Refine decoder/core version mismatch: expected "
+                f"model.qbound.version={self.qbound_version!r}, got "
+                f"{configured_qbound_version!r}."
+            )
+
         self.grounding_module = GroundingModule(
             d_model=embed_dim,
             dropout=model_cfg["dropout"],
@@ -244,7 +256,7 @@ class Decoder(nn.Module):
         self.do = VisualIntervention(self.cfgs)
 
         # --------------------------------------------------------------
-        # Q-Bound V1.9
+        # Q-Bound V1.10.1
         # --------------------------------------------------------------
         self.qbound_enabled = bool(
             qbound_cfg.get(
@@ -373,9 +385,15 @@ class Decoder(nn.Module):
                         refinement_cfg.get("temperature", 0.30),
                     )
                 ),
+                refiner_boundary_anchor_power=float(
+                    qbound_cfg.get(
+                        "refiner_boundary_anchor_power",
+                        refinement_cfg.get("boundary_anchor_power", 2.0),
+                    )
+                ),
             )
 
-            # Controlled first V1.9 experiment: Q-Bound learns its own
+            # Controlled first V1.10.1 experiment: Q-Bound learns its own
             # parameters without changing the upstream video/language
             # representation through the Q-Bound input path.
             self.qbound_detach_backbone_inputs = bool(
@@ -557,7 +575,7 @@ class Decoder(nn.Module):
         """
         Build the final temporal contract.
 
-        V1.9 active:
+        V1.10.1 active:
             official key/start/end/mask are RELIABILITY-CALIBRATED from the
             Composer endpoint posterior and posterior-guided Refiner.
 
@@ -596,7 +614,7 @@ class Decoder(nn.Module):
         time_param["ori_key"] = base_temporal["ori_key"]
         time_param["cra_key"] = base_temporal["cra_key"]
 
-        # Official V1.9 MAIN aliases.
+        # Official V1.10.1 MAIN aliases.
         time_param["qbound_key"] = qbound_key
         time_param["qbound_calibrated_key"] = final_key
         time_param["refined_key"] = final_key
@@ -618,7 +636,7 @@ class Decoder(nn.Module):
             device=final_key.device,
         )
 
-        # Compatibility aliases: adaptive/refined mean V1.9 calibrated MAIN.
+        # Compatibility aliases: adaptive/refined mean V1.10.1 calibrated MAIN.
         time_param["qbound_adaptive_span_enabled"] = torch.as_tensor(
             1.0 if qbound_active else 0.0,
             dtype=final_key.dtype,
@@ -630,7 +648,7 @@ class Decoder(nn.Module):
             device=final_key.device,
         )
 
-        # Explicit V1.9 branch flags.
+        # Explicit V1.10.1 branch flags.
         time_param["qbound_calibrated_span_enabled"] = torch.as_tensor(
             1.0 if qbound_active else 0.0,
             dtype=final_key.dtype,
@@ -652,6 +670,11 @@ class Decoder(nn.Module):
             device=final_key.device,
         )
         time_param["qbound_posterior_guided_refinement_enabled"] = torch.as_tensor(
+            1.0 if qbound_active else 0.0,
+            dtype=final_key.dtype,
+            device=final_key.device,
+        )
+        time_param["qbound_boundary_structured_refinement_enabled"] = torch.as_tensor(
             1.0 if qbound_active else 0.0,
             dtype=final_key.dtype,
             device=final_key.device,
@@ -686,7 +709,7 @@ class Decoder(nn.Module):
         use_gpeb=None,
     ):
         del gsub
-        del qbound_mix  # V1.9 intentionally has no CRA->Q-Bound handover.
+        del qbound_mix  # V1.10.1 intentionally has no CRA->Q-Bound handover.
 
         if use_gpeb is not None:
             use_qbound = bool(use_qbound or use_gpeb)
@@ -772,13 +795,14 @@ class Decoder(nn.Module):
         )
 
         # --------------------------------------------------------------
-        # 3) Q-Bound V1.9:
+        # 3) Q-Bound V1.10.1:
         #
         #    DECOMPOSE -> RELATE -> COMPOSE
         #                         |\
         #                         | \ differentiable coarse MAIN component
         #                         |
-        #                         \-> DETACHED posterior pair prior
+        #                         \-> DETACHED Composer posterior
+        #                              -> boundary-anchored pair prior
         #                              -> REFINE
         #                              -> reliability-calibrated MAIN
         #
@@ -798,7 +822,7 @@ class Decoder(nn.Module):
                 and self.qbound_require_question_only
             ):
                 raise ValueError(
-                    "Q-Bound V1.9 requires question_feature=[B,D]. "
+                    "Q-Bound V1.10.1 requires question_feature=[B,D]. "
                     "Pass question-only features through CRA.forward(...)."
                 )
 
@@ -824,7 +848,7 @@ class Decoder(nn.Module):
             )
 
             required_keys = {
-                # Official V1.9 MAIN.
+                # Official V1.10.1 MAIN.
                 "event_temporal_prob",
                 "main_temporal_prob",
                 "main_temporal_logits",
@@ -842,7 +866,7 @@ class Decoder(nn.Module):
                 "legacy_v15_composed_temporal_prob",
                 "legacy_v14_event_temporal_prob",
 
-                # V1.9 routing/reliability calibration.
+                # V1.10.1 routing/reliability calibration.
                 "stable_refiner_enabled",
                 "uncertainty_calibration_enabled",
                 "minimal_sufficient_enabled",
@@ -860,10 +884,13 @@ class Decoder(nn.Module):
                 "base_refiner_confidence",
                 "reliability_gain_factor",
 
-                # V1.9 detached Composer pair prior / MAIN pair posterior.
+                # V1.10.1 boundary-anchored Composer pair prior / MAIN pair posterior.
                 "posterior_guided_refinement_enabled",
+                "boundary_structured_refinement_enabled",
                 "posterior_stable_reliability_enabled",
+                "refine_boundary_anchor_power",
                 "composer_pair_prior",
+                "composer_uniform_pair_prior",
                 "composer_endpoint_pair_prior",
                 "composer_pair_prior_valid_mask",
                 "composer_pair_prior_entropy",
@@ -871,6 +898,13 @@ class Decoder(nn.Module):
                 "composer_pair_prior_effective_count",
                 "composer_pair_prior_top1_posterior",
                 "composer_pair_prior_candidate_count",
+                "composer_uniform_pair_prior_entropy",
+                "composer_uniform_pair_prior_entropy_ratio",
+                "composer_uniform_pair_prior_effective_count",
+                "composer_uniform_pair_prior_top1_posterior",
+                "composer_pair_prior_expected_span_length",
+                "composer_uniform_pair_prior_expected_span_length",
+                "composer_pair_prior_length_gain",
                 "composer_pair_soft_support",
                 "composer_expected_start_frame",
                 "composer_expected_end_frame",
@@ -989,7 +1023,7 @@ class Decoder(nn.Module):
                 "refine_retained_fraction",
                 "refined_inside_coarse",
 
-                # Official V1.9 calibrated hard span.
+                # Official V1.10.1 calibrated hard span.
                 "calibrated_start_frame_float",
                 "calibrated_end_frame_float",
                 "calibrated_expected_span_length",
@@ -1013,7 +1047,7 @@ class Decoder(nn.Module):
             missing = sorted(required_keys.difference(qbound_aux))
             if missing:
                 raise KeyError(
-                    "Q-Bound V1.9 output is missing: "
+                    "Q-Bound V1.10.1 output is missing: "
                     + ", ".join(missing)
                 )
 
@@ -1023,35 +1057,62 @@ class Decoder(nn.Module):
                 .detach().item()
             ) != 1.0:
                 raise RuntimeError(
-                    "Q-Bound V1.9 requires calibrated coarse/fine fusion."
+                    "Q-Bound V1.10.1 requires calibrated coarse/fine fusion."
                 )
             if float(
                 qbound_aux["posterior_guided_refinement_enabled"]
                 .detach().item()
             ) != 1.0:
                 raise RuntimeError(
-                    "Q-Bound V1.9 requires detached posterior-guided REFINE."
+                    "Q-Bound V1.10.1 requires detached posterior-guided REFINE."
+                )
+            if float(
+                qbound_aux["boundary_structured_refinement_enabled"]
+                .detach().item()
+            ) != 1.0:
+                raise RuntimeError(
+                    "Q-Bound V1.10.1 requires boundary-anchored "
+                    "posterior-guided refinement."
                 )
             if float(
                 qbound_aux["posterior_stable_reliability_enabled"]
                 .detach().item()
             ) != 1.0:
                 raise RuntimeError(
-                    "Q-Bound V1.9 requires posterior-stable reliability calibration."
+                    "Q-Bound V1.10.1 requires posterior-stable reliability calibration."
+                )
+            configured_anchor_power = float(
+                refinement_cfg.get(
+                    "boundary_anchor_power",
+                    qbound_cfg.get("refiner_boundary_anchor_power", 2.0),
+                )
+            )
+            actual_anchor_power = float(
+                qbound_aux["refine_boundary_anchor_power"].detach().item()
+            )
+            if not math.isclose(
+                actual_anchor_power,
+                configured_anchor_power,
+                rel_tol=1e-6,
+                abs_tol=1e-6,
+            ):
+                raise RuntimeError(
+                    "Q-Bound V1.10.1 boundary anchor power mismatch: "
+                    f"config={configured_anchor_power}, core={actual_anchor_power}."
                 )
             if float(
                 qbound_aux["minimal_sufficient_enabled"]
                 .detach().item()
             ) != 0.0:
                 raise RuntimeError(
-                    "Q-Bound V1.9 must not enable V1.7 minimal-sufficient routing."
+                    "Q-Bound V1.10.1 must not enable V1.7 minimal-sufficient routing."
                 )
             if float(
                 qbound_aux["all_span_refine_marginal_enabled"]
                 .detach().item()
             ) != 0.0:
                 raise RuntimeError(
-                    "Q-Bound V1.9 must keep V1.6 differentiable all-span "
+                    "Q-Bound V1.10.1 must keep V1.6 differentiable all-span "
                     "REFINE marginalization disabled."
                 )
             if float(
@@ -1059,7 +1120,7 @@ class Decoder(nn.Module):
                 .detach().item()
             ) != 1.0:
                 raise RuntimeError(
-                    "Q-Bound V1.9 requires the Composer posterior routed into "
+                    "Q-Bound V1.10.1 requires the Composer posterior routed into "
                     "REFINE to remain detached."
                 )
             if float(
@@ -1067,12 +1128,12 @@ class Decoder(nn.Module):
                 .detach().item()
             ) != 0.0:
                 raise RuntimeError(
-                    "Q-Bound V1.9 must not restrict REFINE to the V1.8 hard "
+                    "Q-Bound V1.10.1 must not restrict REFINE to the V1.8 hard "
                     "top-1 Composer chain."
                 )
 
             # ----------------------------------------------------------
-            # 3a) OFFICIAL V1.9 reliability-calibrated grounding branch.
+            # 3a) OFFICIAL V1.10.1 reliability-calibrated grounding branch.
             #
             # This branch stays differentiable. Its temporal probability
             # already contains both:
@@ -1119,7 +1180,7 @@ class Decoder(nn.Module):
             # ----------------------------------------------------------
             # 3b) RAW REFINE / legacy hard-top1 COARSE / historical diagnostics.
             #
-            # These readouts are detached. The RAW branch now uses the V1.9
+            # These readouts are detached. The RAW branch now uses the V1.10.1
             # posterior-guided Refiner; the COARSE branch deliberately keeps
             # the Composer hard top-1 interval as a controlled diagnostic.
             # The official MAIN is the reliability-calibrated branch above.
@@ -1287,7 +1348,7 @@ class Decoder(nn.Module):
             qbound_time=qbound_time,
         )
 
-        # Official answer feature is the V1.9 reliability-calibrated MAIN branch.
+        # Official answer feature is the V1.10.1 reliability-calibrated MAIN branch.
         time_param["grounding_feature"] = video_proj
         time_param["qbound_feature"] = video_proj
         time_param["qbound_grounding_feature"] = (
@@ -1297,7 +1358,7 @@ class Decoder(nn.Module):
             calibrated_qbound_video_proj
         )
 
-        # Explicit V1.9 answer-space branches.
+        # Explicit V1.10.1 answer-space branches.
         time_param["qbound_calibrated_grounding_feature"] = (
             calibrated_qbound_video_proj
         )
@@ -1317,7 +1378,7 @@ class Decoder(nn.Module):
             coarse_qbound_video_proj
         )
 
-        # Compatibility: refined == calibrated MAIN in V1.9.
+        # Compatibility: refined == calibrated MAIN in V1.10.1.
         time_param["qbound_refined_video_proj"] = (
             calibrated_qbound_video_proj
         )
@@ -1506,7 +1567,7 @@ class Decoder(nn.Module):
 
             # ----------------------------------------------------------
             # ----------------------------------------------------------
-            # 9) V1.9 REFINE + POSTERIOR-STABLE RELIABILITY outputs.
+            # 9) V1.10.1 BAPGR REFINE + POSTERIOR-STABLE RELIABILITY outputs.
             # ----------------------------------------------------------
             refiner_keys = [
                 "refiner_enabled",
@@ -1542,10 +1603,13 @@ class Decoder(nn.Module):
                 "base_refiner_confidence",
                 "reliability_gain_factor",
 
-                # V1.9 detached Composer prior / posterior-stable route.
+                # V1.10.1 anchored Composer prior / posterior-stable route.
                 "posterior_guided_refinement_enabled",
+                "boundary_structured_refinement_enabled",
                 "posterior_stable_reliability_enabled",
+                "refine_boundary_anchor_power",
                 "composer_pair_prior",
+                "composer_uniform_pair_prior",
                 "composer_endpoint_pair_prior",
                 "composer_pair_prior_valid_mask",
                 "composer_pair_prior_entropy",
@@ -1553,6 +1617,13 @@ class Decoder(nn.Module):
                 "composer_pair_prior_effective_count",
                 "composer_pair_prior_top1_posterior",
                 "composer_pair_prior_candidate_count",
+                "composer_uniform_pair_prior_entropy",
+                "composer_uniform_pair_prior_entropy_ratio",
+                "composer_uniform_pair_prior_effective_count",
+                "composer_uniform_pair_prior_top1_posterior",
+                "composer_pair_prior_expected_span_length",
+                "composer_uniform_pair_prior_expected_span_length",
+                "composer_pair_prior_length_gain",
                 "composer_pair_soft_support",
                 "composer_expected_start_frame",
                 "composer_expected_end_frame",
@@ -1592,7 +1663,7 @@ class Decoder(nn.Module):
                 "coarse_span_fraction",
                 "coarse_frame_mask",
 
-                # Raw V1.9 posterior-guided hard-refined interval.
+                # Raw V1.10.1 boundary-anchored posterior-guided hard-refined interval.
                 "refined_span_start_frame",
                 "refined_span_end_frame",
                 "refined_frame_mask",
@@ -1607,7 +1678,7 @@ class Decoder(nn.Module):
                 "refine_retained_fraction",
                 "refined_inside_coarse",
 
-                # Official V1.9 calibrated hard interval.
+                # Official V1.10.1 calibrated hard interval.
                 "calibrated_start_frame_float",
                 "calibrated_end_frame_float",
                 "calibrated_expected_span_length",
@@ -1684,7 +1755,7 @@ class Decoder(nn.Module):
                     time_param[f"qbound_{key}"] = qbound_time[key]
 
             # ----------------------------------------------------------
-            # 10b) Explicit V1.9 CALIBRATED MAIN adapter aliases.
+            # 10b) Explicit V1.10.1 CALIBRATED MAIN adapter aliases.
             #
             # `time_param["start"/"end"/"mask"]` are already the official
             # calibrated MAIN interval. These explicit aliases are required
@@ -1717,7 +1788,7 @@ class Decoder(nn.Module):
             time_param["qbound_calibrated_span_key_mass"] = (
                 qbound_time["refined_span_key_mass"]
             )
-            # V1.9 reliability aliases from the core.
+            # V1.10.1 reliability aliases from the core.
             time_param["qbound_calibration_reliability"] = (
                 qbound_aux["calibration_reliability"]
             )
@@ -1730,20 +1801,49 @@ class Decoder(nn.Module):
             time_param["qbound_base_refiner_confidence"] = (
                 qbound_aux["base_refiner_confidence"]
             )
+            time_param["qbound_boundary_structured_refinement_enabled"] = (
+                qbound_aux["boundary_structured_refinement_enabled"]
+            )
+            time_param["qbound_refine_boundary_anchor_power"] = (
+                qbound_aux["refine_boundary_anchor_power"]
+            )
+            time_param["qbound_composer_uniform_pair_prior_entropy"] = (
+                qbound_aux["composer_uniform_pair_prior_entropy"]
+            )
+            time_param["qbound_composer_uniform_pair_prior_entropy_ratio"] = (
+                qbound_aux["composer_uniform_pair_prior_entropy_ratio"]
+            )
+            time_param["qbound_composer_uniform_pair_prior_effective_count"] = (
+                qbound_aux["composer_uniform_pair_prior_effective_count"]
+            )
+            time_param["qbound_composer_uniform_pair_prior_top1_posterior"] = (
+                qbound_aux["composer_uniform_pair_prior_top1_posterior"]
+            )
+            time_param["qbound_composer_pair_prior_expected_span_length"] = (
+                qbound_aux["composer_pair_prior_expected_span_length"]
+            )
+            time_param[
+                "qbound_composer_uniform_pair_prior_expected_span_length"
+            ] = qbound_aux[
+                "composer_uniform_pair_prior_expected_span_length"
+            ]
+            time_param["qbound_composer_pair_prior_length_gain"] = (
+                qbound_aux["composer_pair_prior_length_gain"]
+            )
 
             # Strong contract: the generic official interval must be exactly
             # the same tensors as the explicit calibrated aliases.
             if time_param["qbound_calibrated_start"] is not time_param["start"]:
                 raise RuntimeError(
-                    "V1.9 calibrated start alias does not match MAIN start."
+                    "V1.10.1 calibrated start alias does not match MAIN start."
                 )
             if time_param["qbound_calibrated_end"] is not time_param["end"]:
                 raise RuntimeError(
-                    "V1.9 calibrated end alias does not match MAIN end."
+                    "V1.10.1 calibrated end alias does not match MAIN end."
                 )
             if time_param["qbound_calibrated_mask"] is not time_param["mask"]:
                 raise RuntimeError(
-                    "V1.9 calibrated mask alias does not match MAIN mask."
+                    "V1.10.1 calibrated mask alias does not match MAIN mask."
                 )
 
             # ----------------------------------------------------------
@@ -1775,7 +1875,7 @@ class Decoder(nn.Module):
             )
 
             # ----------------------------------------------------------
-            # 11b) RAW V1.9 posterior-guided REFINE diagnostic branch.
+            # 11b) RAW V1.10.1 boundary-anchored REFINE diagnostic branch.
             # ----------------------------------------------------------
             time_param["qbound_raw_refined_pre_smooth_key"] = (
                 raw_refined_qbound_time["pre_smooth_key"]
@@ -1843,7 +1943,7 @@ class Decoder(nn.Module):
 
             # ----------------------------------------------------------
             # ----------------------------------------------------------
-            # 12) Populate qbound_aux with V1.9 decoder/adaptor interfaces.
+            # 12) Populate qbound_aux with V1.10.1 decoder/adaptor interfaces.
             # ----------------------------------------------------------
             qbound_aux["cra_key"] = cra_key
 
@@ -1914,6 +2014,13 @@ class Decoder(nn.Module):
                 device=calibrated_qbound_key.device,
             )
             qbound_aux[
+                "qbound_boundary_structured_refinement_enabled"
+            ] = torch.as_tensor(
+                1.0,
+                dtype=calibrated_qbound_key.dtype,
+                device=calibrated_qbound_key.device,
+            )
+            qbound_aux[
                 "qbound_posterior_stable_reliability_enabled"
             ] = torch.as_tensor(
                 1.0,
@@ -1929,7 +2036,7 @@ class Decoder(nn.Module):
             )
 
             # ----------------------------------------------------------
-            # V1.9 answer-space representations.
+            # V1.10.1 answer-space representations.
             # ----------------------------------------------------------
             qbound_aux["cra_video_proj"] = cra_video_proj
 
@@ -2008,7 +2115,7 @@ class Decoder(nn.Module):
             )
 
             # ----------------------------------------------------------
-            # Official V1.9 calibrated interval.
+            # Official V1.10.1 calibrated interval.
             # ----------------------------------------------------------
             qbound_aux["qbound_calibrated_start"] = qbound_time["start"]
             qbound_aux["qbound_calibrated_end"] = qbound_time["end"]
@@ -2051,7 +2158,7 @@ class Decoder(nn.Module):
             ]
 
             # ----------------------------------------------------------
-            # RAW V1.9 posterior-guided refined interval.
+            # RAW V1.10.1 boundary-anchored posterior-guided refined interval.
             # ----------------------------------------------------------
             qbound_aux["qbound_raw_refined_start"] = (
                 raw_refined_qbound_time["start"]
