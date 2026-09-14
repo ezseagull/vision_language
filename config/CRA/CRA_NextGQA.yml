@@ -37,12 +37,12 @@ model:
   # Original CRA settings are kept unchanged for controlled
   # comparison with CRA and previous Q-Bound versions.
   #
-  # IMPORTANT V1.10.1:
+  # IMPORTANT V1.10.2:
   #   window_sizes remains [1,3,5] ONLY for:
   #     (1) the original CRA grounding path, and
   #     (2) controlled fixed-window diagnostics.
   #
-  #   The MAIN Q-Bound V1.10.1 interval does NOT come from the
+  #   The MAIN Q-Bound V1.10.2 interval does NOT come from the
   #   fixed-window search. It is produced by boundary-anchored
   #   posterior-guided refinement followed by posterior-stable
   #   reliability calibration.
@@ -62,46 +62,61 @@ model:
   vote: 0
 
   # ============================================================
-  # Q-Bound V1.10.1
+  # Q-Bound V1.10.2
   #
   #   DECOMPOSE -> RELATE -> COMPOSE
   #             -> DETACHED COMPOSER POSTERIOR
-  #             -> BOUNDARY-ANCHORED POSTERIOR-GUIDED REFINE
-  #             -> POSTERIOR-STABLE RELIABILITY CALIBRATION
+  #             -> BOUNDARY-ANCHORED POSTERIOR-GUIDED PRIOR (BAPGR)
+  #             -> PRIOR-PRESERVING BOUNDED REFINEMENT (PPBR)
+  #             -> POSTERIOR-STABLE RELIABILITY CALIBRATION (PSRC)
   #             -> GROUND
   #
-  # Failure diagnosed in V1.9:
-  #   * Composer event-span posterior remained reasonably healthy,
-  #     but its frame-pair prior was highly diffuse.
-  #   * REFINE then sharpened very aggressively and converged to
-  #     answer-discriminative interior micro-spans.
-  #   * RAW hard span collapsed to roughly 1-2 frames and RAW
-  #     expected span to only a few frames.
-  #   * semantic retention collapsed and RAW IoU approached zero.
-  #   * PSRC correctly reduced reliability and preserved MAIN IoU,
-  #     but MAIN then stayed too close to coarse Composer evidence,
-  #     limiting IoP / TIoP@0.5 / Acc&GQA.
+  # Failure diagnosed in V1.10.1:
+  #   * BAPGR successfully changed the Composer pair prior:
+  #       - fewer effective pairs,
+  #       - stronger endpoint preference,
+  #       - longer expected prior span.
+  #   * Extreme V1.9 point-collapse was reduced, but the learned
+  #     Refiner correction still became increasingly dominant.
+  #   * RAW expected support contracted from broad BAPGR evidence
+  #     to a much shorter answer-discriminative region.
+  #   * semantic retention fell sharply while Refiner confidence
+  #     and information gain increased.
+  #   * PSRC correctly reduced reliability, so MAIN stayed close
+  #     to Composer and IoP / Acc&GQA improved little.
   #
-  # V1.10.1 changes ONLY the Composer->Refiner pair geometry:
-  #   * keep the soft multi-candidate Composer posterior;
-  #   * keep the routing posterior detached;
-  #   * keep PSRC unchanged;
-  #   * bias start probability toward the LEFT boundary of each
-  #     candidate's first event;
-  #   * bias end probability toward the RIGHT boundary of each
-  #     candidate's last event;
-  #   * do NOT impose a target span length or minimum duration.
+  # V1.10.2 changes ONLY the learned Refiner update:
   #
-  # Controlled V1.10.1 objective remains:
+  #     delta     = pair_logits / temperature
+  #     delta_hat = c * tanh(delta / c)
+  #     p_refine  propto p_BAPGR * exp(delta_hat)
+  #
+  #   where c = correction_cap.
+  #
+  # This keeps the Refiner differentiable and able to re-rank
+  # legal start/end pairs, but prevents its correction from
+  # overriding the structural prior without bound.
+  #
+  # V1.10.2 preserves:
+  #   * dynamic DECOMPOSE;
+  #   * Q-OEI RELATE;
+  #   * latent contiguous COMPOSE;
+  #   * BAPGR boundary geometry;
+  #   * detached Composer -> Refiner routing;
+  #   * PSRC unchanged;
+  #   * CRA answer machinery and VisualIntervention unchanged;
+  #   * the same training objective and optimizer settings.
+  #
+  # Controlled V1.10.2 objective remains:
   #   L = L_CRA/main + 0.10 L_align + 0.10 L_decomp
   #
-  # CRA answer machinery, VisualIntervention, smoothing, and all
-  # task/loss settings are intentionally unchanged. CRA ablations
-  # start only in later V1.10.x variants.
+  # No temporal GT, target duration, minimum-span constraint,
+  # IoU/IoP loss, minimality loss, entropy loss, or learned
+  # reliability gate is introduced.
   # ============================================================
   qbound:
     enabled: true
-    version: "1.10.1"
+    version: "1.10.2"
 
     # ----------------------------------------------------------
     # Generic Q-Bound interface / capacity
@@ -136,7 +151,7 @@ model:
     # ----------------------------------------------------------
     # DECOMPOSE: dynamic boundary proposals
     # ----------------------------------------------------------
-    # Unchanged to isolate the V1.10.1 Refiner-geometry change.
+    # Unchanged to isolate the V1.10.2 PPBR correction change.
     boundary_temperature: 0.7
     boundary_threshold: 0.5
     boundary_radius: 2
@@ -170,7 +185,7 @@ model:
     # ----------------------------------------------------------
     # Scorer and temperature stay unchanged from V1.9.
     #
-    # V1.10.1 preserves:
+    # V1.10.2 preserves:
     #   * differentiable Composer posterior/support for MAIN;
     #   * hard top-1 Composer readout only as a diagnostic branch;
     #   * detached multi-candidate posterior on the REFINE route.
@@ -182,24 +197,34 @@ model:
     # ----------------------------------------------------------
     # REFINE:
     # Boundary-Anchored Posterior-Guided Refinement (BAPGR)
+    # + Prior-Preserving Bounded Refinement (PPBR)
     # + Posterior-Stable Reliability Calibration (PSRC)
     # ----------------------------------------------------------
     refinement:
       enabled: true
-      type: boundary_anchored_posterior_guided_reliability_refiner
+      type: prior_preserving_bounded_refiner
 
-      # Keep Refiner temperature unchanged for a clean V1.9 ->
-      # V1.10.1 comparison.
+      # Keep Refiner temperature unchanged for a clean
+      # V1.10.1 -> V1.10.2 comparison.
       temperature: 0.30
 
-      # V1.10.1 BAPGR geometry.
+      # BAPGR geometry remains unchanged.
       #
       # power = 1.0 : mild endpoint anchoring
-      # power = 2.0 : controlled first V1.10.1 run
+      # power = 2.0 : controlled V1.10.1/V1.10.2 setting
       # larger      : stronger endpoint anchoring
       #
       # This is a structural prior, NOT a span-length loss.
       boundary_anchor_power: 2.0
+
+      # V1.10.2 PPBR trust-region cap.
+      #
+      # delta_hat = correction_cap * tanh(delta / correction_cap)
+      #
+      # First controlled run: c = 2.0.
+      # This bounds the learned correction; it does NOT impose
+      # a target duration or a minimum temporal span.
+      correction_cap: 2.0
 
       # Routing contract.
       hard_coarse_route: false
@@ -218,7 +243,7 @@ model:
     weak_align_temperature: 0.07
 
     # ----------------------------------------------------------
-    # Deliberately NOT introduced in the first V1.10.1 run
+    # Deliberately NOT introduced in the first V1.10.2 run
     # ----------------------------------------------------------
     # No:
     #   temporal-GT supervision
@@ -239,12 +264,16 @@ model:
     #   differentiable all-span REFINE marginalization
     #
     # First-run goal:
-    #   1) remove V1.9 RAW micro-span collapse;
-    #   2) increase RAW temporal completeness / semantic retention;
-    #   3) allow PSRC reliability to rise naturally only when
-    #      refinement becomes genuinely useful;
-    #   4) improve MAIN IoP / TIoP@0.5 / Acc&GQA while preserving
-    #      the MAIN IoU coverage achieved by V1.9.
+    #   1) prevent the V1.10.1 learned Refiner correction from
+    #      progressively overriding the BAPGR prior;
+    #   2) raise RAW/prior expected-length ratio above the
+    #      V1.10.1 collapse regime while preserving real refinement;
+    #   3) increase semantic retention and RAW IoU without a large
+    #      RAW IoP penalty;
+    #   4) allow PSRC reliability to rise naturally only when RAW
+    #      becomes genuinely useful;
+    #   5) improve MAIN IoP / TIoP@0.5 / Acc&GQA while preserving
+    #      MAIN IoU coverage.
 
 optim:
   pipeline: cra
@@ -252,11 +281,11 @@ optim:
 
   # Original CRA objectives remain unchanged.
   #
-  # CRAPipeline V1.10.1 adds only:
+  # CRAPipeline V1.10.2 adds only:
   #   + weak_align_weight * L_align
   #   + decomposition.loss_weight * L_decomp
   #
-  # No new V1.10.1 routing/reliability/span-length loss.
+  # No new V1.10.2 routing/reliability/span-length loss.
   loss:
     ce:
       vq: 1
@@ -290,13 +319,13 @@ stat:
 
   record_dir: ./output
 
-  # Start V1.10.1 from scratch.
-  # Pair-prior geometry differs from V1.9, so resuming a V1.9
-  # checkpoint would not be a clean controlled experiment.
+  # Start V1.10.2 from scratch.
+  # PPBR changes Refiner training dynamics, so resuming a
+  # V1.10.1 checkpoint would not be a clean controlled experiment.
   resume: null
 
 misc:
-  running_name: CRA/NextGQA/QBound_v1.10.1_seed2024
-  info: "CRA testbed + Q-Bound V1.10.1 | dynamic latent decomposition + ordered event reasoning + latent contiguous event-span composition + boundary-anchored posterior-guided refinement (BAPGR) + posterior-stable reliability calibration (PSRC) + grounding"
+  running_name: CRA/NextGQA/QBound_v1.10.2_seed2024
+  info: "CRA testbed + Q-Bound V1.10.2 | dynamic latent decomposition + ordered event reasoning + latent contiguous event-span composition + BAPGR + prior-preserving bounded refinement (PPBR, cap=2.0) + posterior-stable reliability calibration (PSRC) + grounding"
   cuda: "0"
   seed: 2024

@@ -8,9 +8,10 @@ import torch.nn.functional as F
 
 class QBoundCore(nn.Module):
     """
-    Q-Bound Version 1.10.1 core:
+    Q-Bound Version 1.10.2 core:
         DECOMPOSE -> RELATE -> COMPOSE
         -> DETACHED BOUNDARY-ANCHORED POSTERIOR-GUIDED REFINE
+        -> PRIOR-PRESERVING BOUNDED REFINEMENT
         -> RELIABILITY CALIBRATION -> GROUND
 
     V1.10.1 is a controlled correction of the V1.9 Refiner failure.  The
@@ -81,6 +82,12 @@ class QBoundCore(nn.Module):
         p_main(t) = (1-reliability) * p_coarse(t)
                   + reliability * p_refine(t)
 
+    V1.10.2 diagnosis target:
+      * BAPGR prior should stay broad/structured as in V1.10.1;
+      * RAW/prior expected-length ratio should no longer collapse toward ~0.3;
+      * Refiner-vs-prior KL/JS and correction saturation quantify whether PPBR
+        preserves useful refinement without freezing the Refiner.
+
     Gradient contract:
       * Composer -> MAIN coarse component remains differentiable.
       * Composer posterior -> BAPGR prior is stop-gradient.
@@ -116,11 +123,12 @@ class QBoundCore(nn.Module):
         composer_temperature: float = 0.35,
         refiner_temperature: float = 0.30,
         refiner_boundary_anchor_power: float = 2.0,
+        refiner_correction_cap: float = 2.0,
     ) -> None:
         super().__init__()
 
         if max_events < 2:
-            raise ValueError("Version 1.10.1 requires max_events >= 2.")
+            raise ValueError("Version 1.10.2 requires max_events >= 2.")
         if proposal_candidates < 1:
             raise ValueError("proposal_candidates must be >= 1.")
         if proposal_candidates < max_events - 1:
@@ -154,13 +162,17 @@ class QBoundCore(nn.Module):
             raise ValueError(
                 "refiner_boundary_anchor_power must be positive."
             )
+        if refiner_correction_cap <= 0.0:
+            raise ValueError(
+                "refiner_correction_cap must be positive."
+            )
 
         self.input_dim = int(input_dim)
         self.hidden_dim = int(hidden_dim)
         self.max_events = int(max_events)
         self.max_transitions = self.max_events - 1
         self.proposal_candidates = int(proposal_candidates)
-        self.qbound_version = "1.10.1"
+        self.qbound_version = "1.10.2"
 
         self.use_temporal_prior = bool(use_temporal_prior)
         self.boundary_temperature = float(boundary_temperature)
@@ -175,6 +187,9 @@ class QBoundCore(nn.Module):
         self.refiner_temperature = float(refiner_temperature)
         self.refiner_boundary_anchor_power = float(
             refiner_boundary_anchor_power
+        )
+        self.refiner_correction_cap = float(
+            refiner_correction_cap
         )
 
         # ------------------------------------------------------------------
@@ -424,7 +439,7 @@ class QBoundCore(nn.Module):
         nn.init.zeros_(self.span_composer_score[-1].bias)
 
         # ------------------------------------------------------------------
-        # F. REFINE: boundary scorer + BAPGR + PSRC (V1.10.1)
+        # F. REFINE: boundary scorer + BAPGR + PPBR + PSRC (V1.10.2)
         # ------------------------------------------------------------------
         # The trainable boundary scorer is intentionally unchanged from V1.9.
         # V1.10.1 changes only the detached Composer -> pair geometry: legal
@@ -1811,7 +1826,7 @@ class QBoundCore(nn.Module):
         video_mask: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         """
-        V1.10.1 detached Boundary-Anchored Posterior-Guided Refinement.
+        V1.10.2 Boundary-Anchored + Prior-Preserving Bounded Refinement.
 
         V1.9 already used all valid detached Composer spans, but each candidate
         assigned UNIFORM mass to every legal pair formed by frames in its first
@@ -2235,16 +2250,76 @@ class QBoundCore(nn.Module):
             + end_logits_raw.unsqueeze(-2)
         )
 
-        # Bayesian-style update of the detached Composer prior.
+        # ----------------------------------------------------------
+        # V1.10.2 Prior-Preserving Bounded Refinement (PPBR).
+        #
+        # V1.10.1 used an unbounded learned correction:
+        #   delta = pair_logits_raw / temperature
+        # which could eventually dominate the detached BAPGR prior.
+        # PPBR keeps the correction differentiable but bounds its
+        # magnitude with a fixed trust-region cap c:
+        #   delta_hat = c * tanh(delta / c)
+        # No legal pair is removed and no duration target is added.
+        # ----------------------------------------------------------
+        refiner_raw_correction = (
+            pair_logits_raw / self.refiner_temperature
+        )
+        correction_cap = self.refiner_correction_cap
+        refiner_bounded_correction = (
+            correction_cap
+            * torch.tanh(
+                refiner_raw_correction / correction_cap
+            )
+        )
+
         refiner_pair_logits = (
             torch.log(composer_pair_prior.clamp_min(1e-8))
-            + pair_logits_raw / self.refiner_temperature
+            + refiner_bounded_correction
         )
         selected_pair_posterior = self._masked_softmax(
             refiner_pair_logits.reshape(batch_size, -1),
             composer_pair_valid_mask.reshape(batch_size, -1),
             dim=-1,
         ).reshape(batch_size, time_steps, time_steps)
+
+        pair_valid_f = composer_pair_valid_mask.to(raw_states.dtype)
+        valid_pair_count = pair_valid_f.sum(
+            dim=(-2, -1)
+        ).clamp_min(1.0)
+        refiner_raw_correction_abs = (
+            refiner_raw_correction.abs() * pair_valid_f
+        )
+        refiner_bounded_correction_abs = (
+            refiner_bounded_correction.abs() * pair_valid_f
+        )
+        refiner_raw_correction_abs_mean = (
+            refiner_raw_correction_abs.sum(dim=(-2, -1))
+            / valid_pair_count
+        )
+        refiner_bounded_correction_abs_mean = (
+            refiner_bounded_correction_abs.sum(dim=(-2, -1))
+            / valid_pair_count
+        )
+        neg_large = torch.full_like(
+            refiner_raw_correction, -1e4
+        )
+        refiner_raw_correction_abs_max = torch.where(
+            composer_pair_valid_mask,
+            refiner_raw_correction.abs(),
+            neg_large,
+        ).amax(dim=(-2, -1))
+        refiner_bounded_correction_abs_max = torch.where(
+            composer_pair_valid_mask,
+            refiner_bounded_correction.abs(),
+            neg_large,
+        ).amax(dim=(-2, -1))
+        refiner_correction_saturation_ratio = (
+            (
+                refiner_bounded_correction.abs()
+                >= (0.95 * correction_cap)
+            )
+            & composer_pair_valid_mask
+        ).to(raw_states.dtype).sum(dim=(-2, -1)) / valid_pair_count
 
         # --------------------------------------------------------------
         # Pair-posterior diagnostics.
@@ -2262,6 +2337,31 @@ class QBoundCore(nn.Module):
 
         composer_pair_effective_count = torch.exp(composer_pair_entropy)
         selected_pair_effective_count = torch.exp(selected_pair_entropy)
+
+        prior_safe = composer_pair_prior.clamp_min(1e-8)
+        refined_safe = selected_pair_posterior.clamp_min(1e-8)
+        refiner_vs_prior_kl = torch.sum(
+            selected_pair_posterior
+            * (torch.log(refined_safe) - torch.log(prior_safe)),
+            dim=(-2, -1),
+        )
+        pair_midpoint = 0.5 * (
+            composer_pair_prior + selected_pair_posterior
+        )
+        midpoint_safe = pair_midpoint.clamp_min(1e-8)
+        refiner_vs_prior_js = 0.5 * (
+            torch.sum(
+                selected_pair_posterior
+                * (torch.log(refined_safe) - torch.log(midpoint_safe)),
+                dim=(-2, -1),
+            )
+            + torch.sum(
+                composer_pair_prior
+                * (torch.log(prior_safe) - torch.log(midpoint_safe)),
+                dim=(-2, -1),
+            )
+        )
+
         composer_pair_top1_posterior = composer_pair_prior.reshape(
             batch_size, -1
         ).max(dim=-1).values
@@ -2344,7 +2444,7 @@ class QBoundCore(nn.Module):
         )
 
         # --------------------------------------------------------------
-        # V1.10.1 keeps V1.9 Posterior-Stable Reliability Calibration (PSRC)
+        # V1.10.2 keeps V1.9 Posterior-Stable Reliability Calibration (PSRC)
         # unchanged so the controlled experiment isolates search-prior geometry.
         #
         # information_gain asks whether REFINE actually removed ambiguity
@@ -2465,6 +2565,10 @@ class QBoundCore(nn.Module):
         expected_refined_span_length = torch.sum(
             selected_pair_posterior * pair_length,
             dim=(-2, -1),
+        )
+        raw_vs_prior_expected_length_ratio = (
+            expected_refined_span_length
+            / composer_pair_prior_expected_span_length.clamp_min(1.0)
         )
         start_marginal = selected_pair_posterior.sum(dim=-1)
         end_marginal = selected_pair_posterior.sum(dim=-2)
@@ -2794,6 +2898,9 @@ class QBoundCore(nn.Module):
             "boundary_structured_refinement_enabled": torch.ones(
                 (), dtype=raw_states.dtype, device=raw_states.device
             ),
+            "prior_preserving_bounded_refinement_enabled": torch.ones(
+                (), dtype=raw_states.dtype, device=raw_states.device
+            ),
             "posterior_stable_reliability_enabled": torch.ones(
                 (), dtype=raw_states.dtype, device=raw_states.device
             ),
@@ -2805,6 +2912,11 @@ class QBoundCore(nn.Module):
             ),
             "refine_boundary_anchor_power": torch.as_tensor(
                 self.refiner_boundary_anchor_power,
+                dtype=raw_states.dtype,
+                device=raw_states.device,
+            ),
+            "refine_correction_cap": torch.as_tensor(
+                self.refiner_correction_cap,
                 dtype=raw_states.dtype,
                 device=raw_states.device,
             ),
@@ -2829,7 +2941,18 @@ class QBoundCore(nn.Module):
             "refine_selected_end_candidate_count": selected_end_candidate_count,
             "refine_expected_pair_entropy": selected_pair_entropy,
 
-            # V1.10.1 anchored Composer search-prior diagnostics.
+            # V1.10.2 PPBR diagnostics.
+            "refiner_raw_correction": refiner_raw_correction,
+            "refiner_bounded_correction": refiner_bounded_correction,
+            "refiner_raw_correction_abs_mean": refiner_raw_correction_abs_mean,
+            "refiner_raw_correction_abs_max": refiner_raw_correction_abs_max,
+            "refiner_bounded_correction_abs_mean": refiner_bounded_correction_abs_mean,
+            "refiner_bounded_correction_abs_max": refiner_bounded_correction_abs_max,
+            "refiner_correction_saturation_ratio": refiner_correction_saturation_ratio,
+            "refiner_vs_prior_kl": refiner_vs_prior_kl,
+            "refiner_vs_prior_js": refiner_vs_prior_js,
+
+            # V1.10.1 anchored Composer search-prior diagnostics retained.
             "composer_pair_prior": composer_pair_prior,
             "composer_uniform_pair_prior": composer_uniform_pair_prior,
             "composer_endpoint_pair_prior": composer_endpoint_pair_prior,
@@ -2889,6 +3012,7 @@ class QBoundCore(nn.Module):
 
             # Raw Refiner expected interval statistics.
             "expected_refined_span_length": expected_refined_span_length,
+            "raw_vs_prior_expected_length_ratio": raw_vs_prior_expected_length_ratio,
             "expected_refined_length_ratio": expected_refined_length_ratio,
             "expected_refined_span_fraction": expected_refined_span_fraction,
             "expected_refine_trim_fraction": expected_refine_trim_fraction,
@@ -2973,7 +3097,7 @@ class QBoundCore(nn.Module):
                 f"Expected input_dim={self.input_dim}, got {feature_dim}."
             )
         if time_steps < 2:
-            raise ValueError("Version 1.10.1 requires at least 2 timesteps.")
+            raise ValueError("Version 1.10.2 requires at least 2 timesteps.")
 
         video_mask = self._normalize_mask(
             video_mask,
@@ -3130,7 +3254,7 @@ class QBoundCore(nn.Module):
         )
 
         # --------------------------------------------------------------
-        # D. BOUNDARY-ANCHORED POSTERIOR-GUIDED REFINE + PSRC (V1.10.1)
+        # D. BAPGR + PRIOR-PRESERVING BOUNDED REFINE + PSRC (V1.10.2)
         # --------------------------------------------------------------
         refinement = self._refine_selected_span(
             raw_states=raw_states,
@@ -3409,13 +3533,16 @@ class QBoundCore(nn.Module):
             "selected_span_start": composition["selected_span_start"],
             "selected_span_end": composition["selected_span_end"],
 
-            # V1.10.1 BAPGR REFINE + posterior-stable reliability outputs.
+            # V1.10.2 BAPGR + PPBR REFINE + posterior-stable reliability outputs.
             "refiner_enabled": torch.as_tensor(1.0,dtype=video_tokens.dtype,device=video_tokens.device),
             "stable_refiner_enabled": torch.as_tensor(1.0,dtype=video_tokens.dtype,device=video_tokens.device),
             "uncertainty_calibration_enabled": torch.as_tensor(1.0,dtype=video_tokens.dtype,device=video_tokens.device),
             "posterior_guided_refinement_enabled": refinement["posterior_guided_refinement_enabled"],
             "boundary_structured_refinement_enabled": refinement[
                 "boundary_structured_refinement_enabled"
+            ],
+            "prior_preserving_bounded_refinement_enabled": refinement[
+                "prior_preserving_bounded_refinement_enabled"
             ],
             "posterior_stable_reliability_enabled": refinement["posterior_stable_reliability_enabled"],
             "minimal_sufficient_enabled": torch.as_tensor(0.0,dtype=video_tokens.dtype,device=video_tokens.device),
@@ -3467,6 +3594,15 @@ class QBoundCore(nn.Module):
             "refine_selected_pair_entropy_ratio": refinement[
                 "refine_selected_pair_entropy_ratio"
             ],
+            "refiner_raw_correction": refinement["refiner_raw_correction"],
+            "refiner_bounded_correction": refinement["refiner_bounded_correction"],
+            "refiner_raw_correction_abs_mean": refinement["refiner_raw_correction_abs_mean"],
+            "refiner_raw_correction_abs_max": refinement["refiner_raw_correction_abs_max"],
+            "refiner_bounded_correction_abs_mean": refinement["refiner_bounded_correction_abs_mean"],
+            "refiner_bounded_correction_abs_max": refinement["refiner_bounded_correction_abs_max"],
+            "refiner_correction_saturation_ratio": refinement["refiner_correction_saturation_ratio"],
+            "refiner_vs_prior_kl": refinement["refiner_vs_prior_kl"],
+            "refiner_vs_prior_js": refinement["refiner_vs_prior_js"],
             "calibration_uncertainty": refinement["calibration_uncertainty"],
             "calibration_information": refinement["calibration_information"],
             "calibration_confidence": refinement["calibration_confidence"],
@@ -3528,11 +3664,15 @@ class QBoundCore(nn.Module):
             "refine_boundary_anchor_power": refinement[
                 "refine_boundary_anchor_power"
             ],
+            "refine_correction_cap": refinement["refine_correction_cap"],
             "refine_selected_span_index": refinement[
                 "refine_selected_span_index"
             ],
             "expected_refined_span_length": refinement[
                 "expected_refined_span_length"
+            ],
+            "raw_vs_prior_expected_length_ratio": refinement[
+                "raw_vs_prior_expected_length_ratio"
             ],
             "expected_refined_length_ratio": refinement[
                 "expected_refined_length_ratio"
@@ -3618,7 +3758,7 @@ class QBoundCore(nn.Module):
             "calibrated_inside_coarse": refinement["calibrated_inside_coarse"],
             "refiner_temperature": refinement["refiner_temperature"],
 
-            # Main V1.10.1 temporal output: reliability-calibrated fusion.
+            # Main V1.10.2 temporal output: reliability-calibrated fusion.
             "event_temporal_prob": refinement["calibrated_temporal_prob"],
             "main_temporal_prob": refinement["calibrated_temporal_prob"],
             "main_temporal_logits": refinement["calibrated_temporal_logits"],

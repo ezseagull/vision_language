@@ -473,17 +473,23 @@ class BasePipeline(object):
 
     def _check_qbound_components(self):
         """
-        Structural safety check for controlled Q-Bound V1.8/V1.9/V1.10.1 runs.
+        Structural safety check for controlled
+        Q-Bound V1.8/V1.9/V1.10.1/V1.10.2 runs.
 
-        V1.10.1 intentionally keeps the same trainable stage modules as V1.9:
+        V1.10.2 intentionally keeps the same trainable stage modules as
+        V1.10.1:
 
             DECOMPOSE -> RELATE -> COMPOSE -> REFINE -> GROUND
 
-        The V1.10.1 change is the Composer->Refiner pair geometry:
+        V1.10.2 keeps the V1.10.1 BAPGR pair geometry and changes only the
+        learned Refiner update:
+
           * no hard top-1 Composer route into REFINE;
           * the Composer posterior routed into REFINE remains detached;
           * BAPGR anchors starts toward the first-event left boundary and
             ends toward the last-event right boundary;
+          * PPBR bounds the learned Refiner correction with a fixed
+            ``correction_cap``;
           * posterior-stable reliability calibration remains parameter-free.
 
         Therefore:
@@ -491,10 +497,11 @@ class BasePipeline(object):
           * all trainable Q-Bound tensors remain in the dedicated ``qbound``
             optimizer group and use ``optim.qbound_lr``;
           * shared CRA ``decoder.video_proj`` remains in the base group;
-          * V1.10.1 config must advertise the BAPGR routing contract;
-          * boundary anchoring is a fixed structural prior, not a trainable
-            gate and not a span-length objective;
-          * no trainable calibration/reliability gate may silently appear.
+          * V1.10.2 config must advertise the BAPGR + PPBR contract;
+          * boundary anchoring and the correction cap are fixed structural
+            settings, not trainable gates or span-length objectives;
+          * no trainable calibration/reliability/correction gate may silently
+            appear.
         """
         if not self._qbound_enabled():
             return
@@ -510,10 +517,10 @@ class BasePipeline(object):
             refinement_cfg = {}
 
         # Keep BasePipeline reusable for older/other experimental versions.
-        if version not in {"1.8", "1.9", "1.10.1"}:
+        if version not in {"1.8", "1.9", "1.10.1", "1.10.2"}:
             return
 
-        if version in {"1.9", "1.10.1"}:
+        if version in {"1.9", "1.10.1", "1.10.2"}:
             expected_routing_flags = {
                 "hard_coarse_route": False,
                 "detach_coarse": True,
@@ -521,7 +528,7 @@ class BasePipeline(object):
                 "posterior_stable_reliability": True,
             }
 
-            if version == "1.10.1":
+            if version in {"1.10.1", "1.10.2"}:
                 expected_routing_flags["boundary_structured"] = True
 
             for key, expected in expected_routing_flags.items():
@@ -612,6 +619,150 @@ class BasePipeline(object):
                 raise RuntimeError(
                     "BasePipeline/RefineDecoder Q-Bound version mismatch: "
                     f"config={version!r}, decoder={decoder_version!r}."
+                )
+
+        if version == "1.10.2":
+            expected_refinement_type = (
+                "prior_preserving_bounded_refiner"
+            )
+            actual_refinement_type = str(
+                refinement_cfg.get("type", "")
+            )
+            if actual_refinement_type != expected_refinement_type:
+                raise RuntimeError(
+                    "Q-Bound V1.10.2 refinement.type mismatch: "
+                    f"expected {expected_refinement_type!r}, "
+                    f"got {actual_refinement_type!r}."
+                )
+
+            if "boundary_anchor_power" not in refinement_cfg:
+                raise RuntimeError(
+                    "Q-Bound V1.10.2 config is missing "
+                    "refinement.boundary_anchor_power."
+                )
+            boundary_anchor_power = float(
+                refinement_cfg["boundary_anchor_power"]
+            )
+            if (
+                not math.isfinite(boundary_anchor_power)
+                or boundary_anchor_power <= 0.0
+            ):
+                raise ValueError(
+                    "Q-Bound V1.10.2 refinement.boundary_anchor_power "
+                    "must be finite and > 0; got "
+                    f"{boundary_anchor_power}."
+                )
+
+            if "correction_cap" not in refinement_cfg:
+                raise RuntimeError(
+                    "Q-Bound V1.10.2 config is missing "
+                    "refinement.correction_cap."
+                )
+            correction_cap = float(
+                refinement_cfg["correction_cap"]
+            )
+            if (
+                not math.isfinite(correction_cap)
+                or correction_cap <= 0.0
+            ):
+                raise ValueError(
+                    "Q-Bound V1.10.2 refinement.correction_cap "
+                    "must be finite and > 0; got "
+                    f"{correction_cap}."
+                )
+
+            if not math.isclose(
+                boundary_anchor_power,
+                2.0,
+                rel_tol=1e-9,
+                abs_tol=0.0,
+            ):
+                raise RuntimeError(
+                    "Controlled Q-Bound V1.10.2 expects "
+                    "refinement.boundary_anchor_power=2.0; got "
+                    f"{boundary_anchor_power}."
+                )
+            if not math.isclose(
+                correction_cap,
+                2.0,
+                rel_tol=1e-9,
+                abs_tol=0.0,
+            ):
+                raise RuntimeError(
+                    "Controlled Q-Bound V1.10.2 expects "
+                    "refinement.correction_cap=2.0; got "
+                    f"{correction_cap}."
+                )
+
+            model_core = (
+                self.model.module
+                if hasattr(self.model, "module")
+                else self.model
+            )
+            model_version = str(
+                getattr(model_core, "qbound_version", "")
+            )
+            if model_version != version:
+                raise RuntimeError(
+                    "BasePipeline/model Q-Bound version mismatch: "
+                    f"config={version!r}, model={model_version!r}."
+                )
+
+            decoder = getattr(model_core, "decoder", None)
+            decoder_version = str(
+                getattr(decoder, "qbound_version", "")
+            )
+            if decoder_version != version:
+                raise RuntimeError(
+                    "BasePipeline/RefineDecoder Q-Bound version mismatch: "
+                    f"config={version!r}, decoder={decoder_version!r}."
+                )
+
+            qbound_core = getattr(decoder, "qbound", None)
+            qbound_core_version = str(
+                getattr(qbound_core, "qbound_version", "")
+            )
+            if qbound_core_version != version:
+                raise RuntimeError(
+                    "BasePipeline/QBoundCore version mismatch: "
+                    f"config={version!r}, core={qbound_core_version!r}."
+                )
+
+            actual_core_cap = float(
+                getattr(
+                    qbound_core,
+                    "refiner_correction_cap",
+                    float("nan"),
+                )
+            )
+            if not math.isclose(
+                actual_core_cap,
+                correction_cap,
+                rel_tol=1e-9,
+                abs_tol=0.0,
+            ):
+                raise RuntimeError(
+                    "BasePipeline/QBoundCore correction-cap mismatch: "
+                    f"config={correction_cap}, core={actual_core_cap}."
+                )
+
+            actual_core_anchor_power = float(
+                getattr(
+                    qbound_core,
+                    "refiner_boundary_anchor_power",
+                    float("nan"),
+                )
+            )
+            if not math.isclose(
+                actual_core_anchor_power,
+                boundary_anchor_power,
+                rel_tol=1e-9,
+                abs_tol=0.0,
+            ):
+                raise RuntimeError(
+                    "BasePipeline/QBoundCore boundary-anchor mismatch: "
+                    f"config={boundary_anchor_power}, "
+                    f"core={actual_core_anchor_power}."
                 )
 
         required_component_tokens = {
@@ -721,13 +872,22 @@ class BasePipeline(object):
             "posterior_score",
         )
 
-        if version == "1.10.1":
+        if version in {"1.10.1", "1.10.2"}:
             # BAPGR's boundary anchor is intentionally a fixed structural
             # prior. A trainable "boundary_anchor*" tensor would silently
-            # turn V1.10.1 into a different experiment.
+            # turn the controlled experiment into a different model.
             forbidden_trainable_tokens = (
                 *forbidden_trainable_tokens,
                 "boundary_anchor",
+            )
+
+        if version == "1.10.2":
+            # PPBR's cap is a fixed structural trust-region setting.
+            forbidden_trainable_tokens = (
+                *forbidden_trainable_tokens,
+                "correction_cap",
+                "correction_gate",
+                "correction_score",
             )
         unexpected_routing_parameters = [
             name
@@ -789,6 +949,20 @@ class BasePipeline(object):
             print(
                 "  boundary_anchor_power: "
                 f"{float(refinement_cfg['boundary_anchor_power'])}"
+            )
+            print("  posterior-stable reliability config: YES")
+
+        if version == "1.10.2":
+            print("  detached posterior-guided refinement config: YES")
+            print("  boundary-structured BAPGR config: YES")
+            print(
+                "  boundary_anchor_power: "
+                f"{float(refinement_cfg['boundary_anchor_power'])}"
+            )
+            print("  prior-preserving bounded refinement (PPBR): YES")
+            print(
+                "  correction_cap: "
+                f"{float(refinement_cfg['correction_cap'])}"
             )
             print("  posterior-stable reliability config: YES")
 
