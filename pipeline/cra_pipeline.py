@@ -22,84 +22,60 @@ from utils.misc.misc import (
 
 class CRAPipeline(BasePipeline):
     """
-    CRA training pipeline with Q-Bound Version 1.10.2.
+    CRA training/evaluation pipeline with Q-Bound Version 1.11.
 
-    Architecture:
+    V1.11 changes the Q-Bound INPUT contract while retaining the successful
+    temporal mechanisms from V1.10.2:
 
-        DECOMPOSE -> RELATE -> COMPOSE
-                   -> BOUNDARY-ANCHORED POSTERIOR-GUIDED REFINE
-                   -> PRIOR-PRESERVING BOUNDED REFINEMENT
-                   -> POSTERIOR-STABLE RELIABILITY CALIBRATION
-                   -> GROUND
+        raw/generic CLIP-L tokens
+            -> Q-Bound-owned input adapter
+            -> DECOMPOSE -> RELATE -> COMPOSE
+            -> BAPGR -> PPBR -> PSRC -> temporal support
 
-    V1.10.2 is a controlled mechanism change motivated by the V1.10.1
-    diagnostics rather than an additional supervision change. The training
-    objective is intentionally kept identical to the controlled V1.10.1 run:
+    CRA remains only the downstream VideoQA consumer/testbed.  The CRA branch
+    still uses its own VideoEmbedding/refinement representation for answer
+    scoring, while Q-Bound receives the pre-CRA generic visual tokens through
+    an explicit, separately validated route.
 
-        L =
-            L_CRA/main_reliability_calibrated_task
+    Controlled V1.11-A objective:
+
+        L = L_CRA/main
             + lambda_align * L_weak_align
             + lambda_decomp * L_decomp
 
-    The V1.10.1 failure addressed here is:
+    The CREDiT-inspired counterfactual evidence interface is propagated and
+    diagnosed in this pipeline, but no counterfactual answer loss is added in
+    V1.11-A.  This keeps the generic-input ablation controlled.  A later
+    V1.11-B run can add answer-level sufficiency/necessity supervision after a
+    dedicated generic/downstream counterfactual projection is introduced.
 
-      1) BAPGR successfully improved the Composer->Refiner pair geometry and
-         prevented the extreme V1.9 point-collapse, but the learned Refiner
-         correction remained unbounded. Over training, Refiner logits became
-         increasingly confident, RAW support still contracted strongly,
-         semantic retention fell, and PSRC correctly reduced Refiner trust.
-
-    V1.10.2 keeps BAPGR, the detached multi-candidate Composer posterior, and
-    the V1.9 posterior-stable reliability safety net. It changes only the
-    Refiner update by introducing Prior-Preserving Bounded Refinement (PPBR):
-
-        delta      = pair_logits / temperature
-        delta_hat  = correction_cap * tanh(delta / correction_cap)
-        p_refine   propto p_prior * exp(delta_hat)
-
-    The correction remains differentiable but cannot dominate the BAPGR prior
-    without bound. No temporal GT, duration target, or minimum-span constraint
-    is introduced. The V1.6 differentiable all-span feedback loop remains
-    disabled.
-
-    The MAIN temporal probability remains a coarse/fine mixture:
-
-        p_main(t)
-            = (1 - reliability) * p_coarse(t)
-            + reliability * p_refine(t)
-
-    where the detached V1.10.2 reliability keeps the V1.9 PSRC formulation:
-
-        base_confidence   = exp(- normalized_refiner_entropy)
-        information_gain = relative entropy reduction beyond the Composer prior
-        semantic_retention = coarse semantic evidence retained by REFINE
-
-        reliability = base_confidence
-                    * semantic_retention
-                    * 0.5 * (1 + information_gain)
-
-    The bootstrap-safe gain factor keeps Refiner gradients alive near uniform
-    initialization while preventing posterior sharpness alone from receiving
-    high trust.
-
-    No temporal GT, IoU/IoP loss, target duration, trim/minimality loss,
-    Composer/Refiner entropy loss, event-count forcing, CRA->Q-Bound handover,
-    or direct event-token answer residual is introduced. CRA answer machinery,
-    VisualIntervention, smoothing, and all loss weights are intentionally kept
-    unchanged in V1.10.2 so the PPBR correction change is isolated.
-
-    Evaluation keeps three same-checkpoint branches:
-
-        reliability-calibrated MAIN
-        BAPGR + PPBR RAW REFINE diagnostic
-        hard-top1 COMPOSE coarse diagnostic
-
-    The hard top-1 Composer branch is retained only as a controlled diagnostic;
-    it is no longer the route into REFINE.
+    No temporal GT, IoU/IoP training loss, duration/minimality target,
+    event-count forcing, CRA temporal handover, or direct event-token answer
+    residual is introduced.
     """
 
     def __init__(self, cfgs) -> None:
         super().__init__(cfgs)
+
+        self.qbound_version = "1.11"
+        if self._qbound_enabled():
+            model_cfg = self.cfgs.get("model", {})
+            qbound_cfg = model_cfg.get("qbound", {})
+            if not isinstance(qbound_cfg, dict):
+                raise TypeError("model.qbound must be a mapping/dict.")
+
+            configured_version = str(
+                qbound_cfg.get(
+                    "version",
+                    model_cfg.get("qbound_version", ""),
+                )
+            )
+            if configured_version != self.qbound_version:
+                raise ValueError(
+                    "CRAPipeline/Q-Bound version mismatch: expected "
+                    f"model.qbound.version={self.qbound_version!r}, got "
+                    f"{configured_version!r}."
+                )
 
     # ------------------------------------------------------------------
     # General helpers
@@ -130,9 +106,9 @@ class CRAPipeline(BasePipeline):
         """
         return 1.0, 0
 
-    def _qbound_v1102_loss_settings(self):
+    def _qbound_v111_loss_settings(self):
         """
-        Read the controlled V1.10.2 objective settings.
+        Read the controlled V1.11-A objective settings.
 
         Preferred YAML:
 
@@ -143,8 +119,9 @@ class CRAPipeline(BasePipeline):
                 decomposition:
                   loss_weight: 0.10
 
-        V1.10.2 deliberately keeps the V1.10.1/V1.9 loss unchanged: no coarse-answer
-        auxiliary loss and no minimal-sufficient/span-length/reliability loss.
+        V1.11-A keeps the V1.10.3 task/alignment/decomposition objective unchanged
+        so generic-input decoupling is isolated. No coarse-answer auxiliary,
+        minimal-sufficient/span-length, or reliability loss is added.
         """
         model_cfg = self.cfgs.get("model", {})
         qbound_cfg = model_cfg.get("qbound", {})
@@ -210,7 +187,7 @@ class CRAPipeline(BasePipeline):
         """
         if evidence_visual_token is None or question_state is None:
             raise ValueError(
-                "Q-Bound V1.10.2 weak alignment requires evidence_visual_token "
+                "Q-Bound V1.11 weak alignment requires evidence_visual_token "
                 "and qa_state."
             )
         if evidence_visual_token.ndim != 2 or question_state.ndim != 2:
@@ -269,14 +246,14 @@ class CRAPipeline(BasePipeline):
         decomp_loss = qbound_aux.get("decomp_loss")
         if not torch.is_tensor(decomp_loss):
             raise KeyError(
-                "Q-Bound V1.10.2 decomposition requires qbound_aux['decomp_loss']."
+                "Q-Bound V1.11 decomposition requires qbound_aux['decomp_loss']."
             )
 
         value = decomp_loss.mean()
 
         if not torch.isfinite(value):
             raise FloatingPointError(
-                "Q-Bound V1.10.2 decomposition loss is NaN/Inf."
+                "Q-Bound V1.11 decomposition loss is NaN/Inf."
             )
 
         return value
@@ -301,7 +278,7 @@ class CRAPipeline(BasePipeline):
         return 1.0 if self._qbound_enabled() else 0.0
 
     def _get_qbound_aux(self, gqa_output):
-        """Safely extract Q-Bound V1.10.2 outputs from a CRA VQA forward."""
+        """Safely extract Q-Bound V1.11 outputs from a CRA VQA forward."""
         if not self._qbound_enabled():
             return None
 
@@ -501,7 +478,7 @@ class CRAPipeline(BasePipeline):
         return 0.5 * (first_kl + second_kl)
 
     # ------------------------------------------------------------------
-    # Q-Bound V1.10.2 diagnostics
+    # Q-Bound V1.11 diagnostics
     # ------------------------------------------------------------------
     @staticmethod
     def _distribution_entropy(
@@ -525,7 +502,7 @@ class CRAPipeline(BasePipeline):
             dim=-1,
         )
 
-    def _compute_qbound_v1102_diagnostics(
+    def _compute_qbound_v111_diagnostics(
         self,
         gqa_output,
         answer_proj,
@@ -537,7 +514,7 @@ class CRAPipeline(BasePipeline):
         """
         Diagnostics only; nothing returned here is added to total_loss.
 
-        V1.10.2 separates three same-checkpoint branches:
+        V1.11 retains the three same-checkpoint temporal branches:
 
             MAIN        = posterior-stable reliability-calibrated support
             RAW REFINE  = BAPGR + PPBR bounded fine proposal
@@ -556,6 +533,23 @@ class CRAPipeline(BasePipeline):
             return {}
 
         required_keys = {
+            # V1.11 generic-input / counterfactual interface.
+            "qbound_version",
+            "generic_input_adapter_enabled",
+            "generic_input_position_enabled",
+            "generic_input_context_reuse",
+            "generic_input_raw_rms",
+            "generic_input_adapted_rms",
+            "generic_input_token_cosine",
+            "generic_input_delta_ratio",
+            "counterfactual_evidence_interface_enabled",
+            "counterfactual_keep_support",
+            "counterfactual_remove_support",
+            "counterfactual_keep_fraction",
+            "counterfactual_remove_fraction",
+            "qbound_input_is_generic",
+            "qbound_input_uses_cra_embedding",
+
             "cra_video_proj",
             "main_video_proj",
             "qbound_calibrated_video_proj",
@@ -575,7 +569,7 @@ class CRAPipeline(BasePipeline):
             "calibration_confidence",
             "calibration_confidence_detached",
 
-            # V1.10.2 BAPGR + PPBR routing / reliability.
+            # V1.11 BAPGR + PPBR routing / reliability.
             "posterior_guided_refinement_enabled",
             "boundary_structured_refinement_enabled",
             "prior_preserving_bounded_refinement_enabled",
@@ -637,7 +631,7 @@ class CRAPipeline(BasePipeline):
         missing = sorted(required_keys.difference(qbound_aux))
         if missing:
             raise KeyError(
-                "Missing Q-Bound V1.10.2 diagnostic outputs: "
+                "Missing Q-Bound V1.11 diagnostic outputs: "
                 + ", ".join(missing)
             )
 
@@ -652,6 +646,71 @@ class CRAPipeline(BasePipeline):
             )
 
         with torch.no_grad():
+            if str(qbound_aux["qbound_version"]) != self.qbound_version:
+                raise RuntimeError(
+                    "Pipeline/Core Q-Bound version mismatch: "
+                    f"pipeline={self.qbound_version!r}, "
+                    f"core={qbound_aux['qbound_version']!r}."
+                )
+
+            generic_input_adapter_enabled = qbound_aux[
+                "generic_input_adapter_enabled"
+            ].detach().float()
+            generic_input_position_enabled = qbound_aux[
+                "generic_input_position_enabled"
+            ].detach().float()
+            generic_input_context_reuse = qbound_aux[
+                "generic_input_context_reuse"
+            ].detach().float()
+            generic_input_raw_rms = qbound_aux[
+                "generic_input_raw_rms"
+            ].detach().float()
+            generic_input_adapted_rms = qbound_aux[
+                "generic_input_adapted_rms"
+            ].detach().float()
+            generic_input_token_cosine = qbound_aux[
+                "generic_input_token_cosine"
+            ].detach().float()
+            generic_input_delta_ratio = qbound_aux[
+                "generic_input_delta_ratio"
+            ].detach().float()
+
+            input_is_generic = qbound_aux[
+                "qbound_input_is_generic"
+            ].detach().float()
+            input_uses_cra_embedding = qbound_aux[
+                "qbound_input_uses_cra_embedding"
+            ].detach().float()
+
+            counterfactual_interface_enabled = qbound_aux[
+                "counterfactual_evidence_interface_enabled"
+            ].detach().float()
+            counterfactual_keep_support = qbound_aux[
+                "counterfactual_keep_support"
+            ].detach().float()
+            counterfactual_remove_support = qbound_aux[
+                "counterfactual_remove_support"
+            ].detach().float()
+            counterfactual_keep_fraction = qbound_aux[
+                "counterfactual_keep_fraction"
+            ].detach().float()
+            counterfactual_remove_fraction = qbound_aux[
+                "counterfactual_remove_fraction"
+            ].detach().float()
+
+            # Core contract: keep/remove are complementary on valid frames and
+            # both are zero outside the valid temporal mask.  Infer validity
+            # from their sum so the pipeline does not duplicate dataset logic.
+            cf_sum = counterfactual_keep_support + counterfactual_remove_support
+            cf_valid = (cf_sum > 0.5).to(cf_sum.dtype)
+            counterfactual_complement_error = (
+                cf_sum - cf_valid
+            ).abs().mean()
+            counterfactual_overlap = (
+                counterfactual_keep_support
+                * counterfactual_remove_support
+            ).mean()
+
             calibrated_logits = main_logits.detach()
 
             if raw_refined_logits is None:
@@ -764,28 +823,28 @@ class CRAPipeline(BasePipeline):
             ).abs().mean()
 
             v15_key_raw = qbound_aux.get("v15_diagnostic_key")
-            v1102_v15_js = None
-            v1102_v15_l1 = None
+            v111_v15_js = None
+            v111_v15_l1 = None
             if torch.is_tensor(v15_key_raw):
                 v15_key = self._normalize_distribution(v15_key_raw)
-                v1102_v15_js = self._js_divergence(
+                v111_v15_js = self._js_divergence(
                     calibrated_key,
                     v15_key,
                 ).mean()
-                v1102_v15_l1 = (
+                v111_v15_l1 = (
                     calibrated_key - v15_key
                 ).abs().mean()
 
             v14_key_raw = qbound_aux.get("v14_diagnostic_key")
-            v1102_v14_js = None
-            v1102_v14_l1 = None
+            v111_v14_js = None
+            v111_v14_l1 = None
             if torch.is_tensor(v14_key_raw):
                 v14_key = self._normalize_distribution(v14_key_raw)
-                v1102_v14_js = self._js_divergence(
+                v111_v14_js = self._js_divergence(
                     calibrated_key,
                     v14_key,
                 ).mean()
-                v1102_v14_l1 = (
+                v111_v14_l1 = (
                     calibrated_key - v14_key
                 ).abs().mean()
 
@@ -1005,6 +1064,56 @@ class CRAPipeline(BasePipeline):
             )
 
         diagnostics = {
+            # V1.11 generic-input independence contract.
+            "qbound_input_is_generic": input_is_generic.mean().item(),
+            "qbound_input_uses_cra_embedding": (
+                input_uses_cra_embedding.mean().item()
+            ),
+            "qbound_generic_input_adapter_enabled": (
+                generic_input_adapter_enabled.mean().item()
+            ),
+            "qbound_generic_input_position_enabled": (
+                generic_input_position_enabled.mean().item()
+            ),
+            "qbound_generic_input_context_reuse": (
+                generic_input_context_reuse.mean().item()
+            ),
+            "qbound_generic_input_raw_rms": (
+                generic_input_raw_rms.mean().item()
+            ),
+            "qbound_generic_input_adapted_rms": (
+                generic_input_adapted_rms.mean().item()
+            ),
+            "qbound_generic_input_adapted_to_raw_rms_ratio": (
+                (
+                    generic_input_adapted_rms
+                    / generic_input_raw_rms.clamp_min(1e-8)
+                ).mean().item()
+            ),
+            "qbound_generic_input_token_cosine": (
+                generic_input_token_cosine.mean().item()
+            ),
+            "qbound_generic_input_delta_ratio": (
+                generic_input_delta_ratio.mean().item()
+            ),
+
+            # Counterfactual evidence interface diagnostics only in V1.11-A.
+            "qbound_counterfactual_evidence_interface_enabled": (
+                counterfactual_interface_enabled.mean().item()
+            ),
+            "qbound_counterfactual_keep_fraction": (
+                counterfactual_keep_fraction.mean().item()
+            ),
+            "qbound_counterfactual_remove_fraction": (
+                counterfactual_remove_fraction.mean().item()
+            ),
+            "qbound_counterfactual_support_complement_error": (
+                counterfactual_complement_error.item()
+            ),
+            "qbound_counterfactual_keep_remove_overlap": (
+                counterfactual_overlap.item()
+            ),
+
             # Answer behavior.
             "qbound_main_acc": (
                 (calibrated_pred == labels).float().mean().item()
@@ -1349,15 +1458,15 @@ class CRAPipeline(BasePipeline):
             ),
         }
 
-        if v1102_v15_js is not None:
-            diagnostics["qbound_v1102_v15_key_js"] = v1102_v15_js.item()
-        if v1102_v15_l1 is not None:
-            diagnostics["qbound_v1102_v15_key_l1"] = v1102_v15_l1.item()
+        if v111_v15_js is not None:
+            diagnostics["qbound_v111_v15_key_js"] = v111_v15_js.item()
+        if v111_v15_l1 is not None:
+            diagnostics["qbound_v111_v15_key_l1"] = v111_v15_l1.item()
 
-        if v1102_v14_js is not None:
-            diagnostics["qbound_v1102_v14_key_js"] = v1102_v14_js.item()
-        if v1102_v14_l1 is not None:
-            diagnostics["qbound_v1102_v14_key_l1"] = v1102_v14_l1.item()
+        if v111_v14_js is not None:
+            diagnostics["qbound_v111_v14_key_js"] = v111_v14_js.item()
+        if v111_v14_l1 is not None:
+            diagnostics["qbound_v111_v14_key_l1"] = v111_v14_l1.item()
 
         return diagnostics
 
@@ -1397,7 +1506,56 @@ class CRAPipeline(BasePipeline):
             return stats
 
         # ----------------------------------------------------------
-        # V1.10.2 BAPGR + PPBR reliability / routing statistics.
+        # V1.11 generic-input / counterfactual interface statistics.
+        # ----------------------------------------------------------
+        v111_interface_scalar_keys = [
+            "generic_input_adapter_enabled",
+            "generic_input_position_enabled",
+            "generic_input_context_reuse",
+            "generic_input_raw_rms",
+            "generic_input_adapted_rms",
+            "generic_input_token_cosine",
+            "generic_input_delta_ratio",
+            "counterfactual_evidence_interface_enabled",
+            "counterfactual_keep_fraction",
+            "counterfactual_remove_fraction",
+            "qbound_input_is_generic",
+            "qbound_input_uses_cra_embedding",
+        ]
+        for key in v111_interface_scalar_keys:
+            scalar = self._scalar_mean(qbound_aux.get(key))
+            if scalar is not None:
+                if key.startswith("qbound_"):
+                    stats[key] = scalar
+                else:
+                    stats[f"qbound_{key}"] = scalar
+
+        cf_keep = qbound_aux.get("counterfactual_keep_support")
+        cf_remove = qbound_aux.get("counterfactual_remove_support")
+        if (
+            torch.is_tensor(cf_keep)
+            and torch.is_tensor(cf_remove)
+            and cf_keep.shape == cf_remove.shape
+        ):
+            keep = cf_keep.detach().float()
+            remove = cf_remove.detach().float()
+            support_sum = keep + remove
+            support_valid = (support_sum > 0.5).to(support_sum.dtype)
+            stats["qbound_counterfactual_support_complement_error"] = (
+                (support_sum - support_valid).abs().mean().item()
+            )
+            stats["qbound_counterfactual_keep_remove_overlap"] = (
+                (keep * remove).mean().item()
+            )
+            stats["qbound_counterfactual_keep_support_mean"] = (
+                keep.mean().item()
+            )
+            stats["qbound_counterfactual_keep_support_max"] = (
+                keep.max(dim=-1).values.mean().item()
+            )
+
+        # ----------------------------------------------------------
+        # V1.11 BAPGR + PPBR reliability / routing statistics retained.
         # ----------------------------------------------------------
         v1102_scalar_keys = [
             "stable_refiner_enabled",
@@ -1412,7 +1570,7 @@ class CRAPipeline(BasePipeline):
             "calibration_confidence",
             "calibration_confidence_detached",
 
-            # V1.10.2 BAPGR + PPBR + reliability decomposition.
+            # V1.11 BAPGR + PPBR + reliability decomposition.
             "posterior_guided_refinement_enabled",
             "boundary_structured_refinement_enabled",
             "prior_preserving_bounded_refinement_enabled",
@@ -1716,7 +1874,7 @@ class CRAPipeline(BasePipeline):
             )
 
         # ----------------------------------------------------------
-        # V1.10.2 BAPGR + PPBR REFINE + reliability-calibrated boundary diagnostics.
+        # V1.11 BAPGR + PPBR REFINE + reliability-calibrated boundary diagnostics.
         # ----------------------------------------------------------
         refiner_scalar_keys = [
             "refine_expected_pair_entropy",
@@ -1735,7 +1893,7 @@ class CRAPipeline(BasePipeline):
             "refine_retained_fraction",
             "refined_inside_coarse",
 
-            # V1.10.2 reliability-calibrated interval.
+            # V1.11 reliability-calibrated interval.
             "calibrated_expected_span_length",
             "calibrated_expected_length_ratio",
             "calibrated_span_frame_length",
@@ -2296,7 +2454,7 @@ class CRAPipeline(BasePipeline):
 
     def _qbound_component_grad_norms(self):
         """
-        Diagnostic gradient norms for V1.10.2.
+        Diagnostic gradient norms for V1.11.
 
         ``composer`` checks span_composer_score. It should receive the MAIN
         calibrated VQA signal through the differentiable coarse component.
@@ -2308,10 +2466,12 @@ class CRAPipeline(BasePipeline):
         """
         if not self._qbound_enabled():
             return {
+                "qbound_input_adapter_grad_norm": 0.0,
                 "qbound_composer_grad_norm": 0.0,
                 "qbound_refiner_grad_norm": 0.0,
             }
 
+        input_adapter_sq = 0.0
         composer_sq = 0.0
         refiner_sq = 0.0
 
@@ -2328,6 +2488,12 @@ class CRAPipeline(BasePipeline):
             grad = parameter.grad.detach().float()
             grad_sq = grad.pow(2).sum().item()
 
+            if (
+                "generic_input_proj" in name
+                or "generic_input_norm" in name
+            ):
+                input_adapter_sq += grad_sq
+
             if "span_composer_score" in name:
                 composer_sq += grad_sq
 
@@ -2335,6 +2501,9 @@ class CRAPipeline(BasePipeline):
                 refiner_sq += grad_sq
 
         return {
+            "qbound_input_adapter_grad_norm": float(
+                input_adapter_sq ** 0.5
+            ),
             "qbound_composer_grad_norm": float(composer_sq ** 0.5),
             "qbound_refiner_grad_norm": float(refiner_sq ** 0.5),
         }
@@ -2344,6 +2513,26 @@ class CRAPipeline(BasePipeline):
     def _qbound_monitor_keys():
         return [
                 "qbound_grad_norm",
+                "qbound_input_adapter_grad_norm",
+                "qbound_input_is_generic",
+                "qbound_input_uses_cra_embedding",
+                "qbound_generic_input_adapter_enabled",
+                "qbound_generic_input_position_enabled",
+                "qbound_generic_input_context_reuse",
+                "qbound_generic_input_raw_rms",
+                "qbound_generic_input_adapted_rms",
+                "qbound_generic_input_adapted_to_raw_rms_ratio",
+                "qbound_generic_input_token_cosine",
+                "qbound_generic_input_delta_ratio",
+                "qbound_counterfactual_evidence_interface_enabled",
+                "qbound_counterfactual_training_enabled",
+                "qbound_counterfactual_loss_weight",
+                "qbound_counterfactual_keep_fraction",
+                "qbound_counterfactual_remove_fraction",
+                "qbound_counterfactual_support_complement_error",
+                "qbound_counterfactual_keep_remove_overlap",
+                "qbound_counterfactual_keep_support_mean",
+                "qbound_counterfactual_keep_support_max",
                 "qbound_weak_align_weight",
                 "qbound_decomp_weight",
                 "qbound_weak_align_retrieval_acc",
@@ -2632,10 +2821,10 @@ class CRAPipeline(BasePipeline):
                 "qbound_raw_refined_key_entropy_ratio",
                 "qbound_calibrated_key_max",
                 "qbound_raw_refined_key_max",
-                "qbound_v1102_v15_key_js",
-                "qbound_v1102_v15_key_l1",
-                "qbound_v1102_v14_key_js",
-                "qbound_v1102_v14_key_l1",
+                "qbound_v111_v15_key_js",
+                "qbound_v111_v15_key_l1",
+                "qbound_v111_v14_key_js",
+                "qbound_v111_v14_key_l1",
         ]
 
         # ------------------------------------------------------------------
@@ -2647,7 +2836,7 @@ class CRAPipeline(BasePipeline):
         qbound_mix=1.0,
     ):
         """
-        Controlled V1.10.2 objective:
+        Controlled V1.11-A objective:
 
             L =
                 L_CRA/main_reliability_calibrated_task
@@ -2744,7 +2933,7 @@ class CRAPipeline(BasePipeline):
             )
 
         # ----------------------------------------------------------
-        # MAIN VQA: V1.10.2 BAPGR + PPBR + posterior-stable reliability-calibrated branch.
+        # MAIN VQA: V1.11 BAPGR + PPBR + posterior-stable reliability-calibrated branch.
         # ----------------------------------------------------------
         gqa_output = self.model(
             video_frames,
@@ -2794,7 +2983,7 @@ class CRAPipeline(BasePipeline):
                 align_weight,
                 align_temperature,
                 decomp_weight,
-            ) = self._qbound_v1102_loss_settings()
+            ) = self._qbound_v111_loss_settings()
 
             # Fail fast if a V1.7 objective/routing mechanism is accidentally on.
             minimality_flag = qbound_aux.get(
@@ -2803,7 +2992,7 @@ class CRAPipeline(BasePipeline):
             if torch.is_tensor(minimality_flag):
                 if float(minimality_flag.detach().item()) != 0.0:
                     raise RuntimeError(
-                        "Q-Bound V1.10.2 must keep minimal-sufficient routing disabled."
+                        "Q-Bound V1.11 must keep minimal-sufficient routing disabled."
                     )
 
             uncertainty_flag = qbound_aux.get(
@@ -2812,21 +3001,57 @@ class CRAPipeline(BasePipeline):
             if torch.is_tensor(uncertainty_flag):
                 if float(uncertainty_flag.detach().item()) != 1.0:
                     raise RuntimeError(
-                        "Q-Bound V1.10.2 requires calibrated coarse/fine fusion."
+                        "Q-Bound V1.11 requires calibrated coarse/fine fusion."
                     )
 
             def _require_scalar_flag(name, expected):
                 value = qbound_aux.get(name)
                 if not torch.is_tensor(value):
                     raise KeyError(
-                        f"Q-Bound V1.10.2 requires scalar flag {name!r}."
+                        f"Q-Bound V1.11 requires scalar flag {name!r}."
                     )
                 actual = float(value.detach().item())
                 if actual != float(expected):
                     raise RuntimeError(
-                        f"Q-Bound V1.10.2 flag {name!r} must be {float(expected):.1f}; "
+                        f"Q-Bound V1.11 flag {name!r} must be {float(expected):.1f}; "
                         f"got {actual:.1f}."
                     )
+
+            # V1.11 input-independence contract.
+            if str(qbound_aux.get("qbound_version")) != self.qbound_version:
+                raise RuntimeError(
+                    "Q-Bound V1.11 version mismatch in training: "
+                    f"pipeline={self.qbound_version!r}, "
+                    f"core={qbound_aux.get('qbound_version')!r}."
+                )
+            _require_scalar_flag("qbound_input_is_generic", 1.0)
+            _require_scalar_flag("qbound_input_uses_cra_embedding", 0.0)
+            _require_scalar_flag("generic_input_context_reuse", 1.0)
+
+            qbound_cfg = self.cfgs.get("model", {}).get("qbound", {})
+            if not isinstance(qbound_cfg, dict):
+                raise TypeError("model.qbound must be a mapping/dict.")
+
+            expected_adapter = float(
+                bool(qbound_cfg.get("use_generic_input_adapter", True))
+            )
+            _require_scalar_flag(
+                "generic_input_adapter_enabled",
+                expected_adapter,
+            )
+
+            expected_cf_interface = float(
+                bool(
+                    qbound_cfg.get(
+                        "counterfactual_evidence_interface",
+                        False,
+                    )
+                )
+            )
+            _require_scalar_flag(
+                "counterfactual_evidence_interface_enabled",
+                expected_cf_interface,
+            )
 
             _require_scalar_flag(
                 "posterior_guided_refinement_enabled", 1.0
@@ -2862,7 +3087,7 @@ class CRAPipeline(BasePipeline):
             )
             if not torch.is_tensor(actual_anchor_power):
                 raise KeyError(
-                    "Q-Bound V1.10.2 requires "
+                    "Q-Bound V1.11 requires "
                     "qbound_aux['refine_boundary_anchor_power']."
                 )
             actual_anchor_power = float(
@@ -2875,7 +3100,7 @@ class CRAPipeline(BasePipeline):
                 abs_tol=1e-6,
             ):
                 raise RuntimeError(
-                    "Q-Bound V1.10.2 boundary_anchor_power mismatch: "
+                    "Q-Bound V1.11 boundary_anchor_power mismatch: "
                     f"config={expected_anchor_power}, "
                     f"core={actual_anchor_power}."
                 )
@@ -2888,7 +3113,7 @@ class CRAPipeline(BasePipeline):
                 or expected_correction_cap <= 0.0
             ):
                 raise ValueError(
-                    "Q-Bound V1.10.2 refinement.correction_cap "
+                    "Q-Bound V1.11 refinement.correction_cap "
                     "must be finite and > 0."
                 )
 
@@ -2897,7 +3122,7 @@ class CRAPipeline(BasePipeline):
             )
             if not torch.is_tensor(actual_correction_cap):
                 raise KeyError(
-                    "Q-Bound V1.10.2 requires "
+                    "Q-Bound V1.11 requires "
                     "qbound_aux['refine_correction_cap']."
                 )
             actual_correction_cap = float(
@@ -2910,7 +3135,7 @@ class CRAPipeline(BasePipeline):
                 abs_tol=1e-6,
             ):
                 raise RuntimeError(
-                    "Q-Bound V1.10.2 correction_cap mismatch: "
+                    "Q-Bound V1.11 correction_cap mismatch: "
                     f"config={expected_correction_cap}, "
                     f"core={actual_correction_cap}."
                 )
@@ -2977,7 +3202,7 @@ class CRAPipeline(BasePipeline):
                     detach_answer=True,
                 )
 
-        qbound_logs = self._compute_qbound_v1102_diagnostics(
+        qbound_logs = self._compute_qbound_v111_diagnostics(
             gqa_output=gqa_output,
             answer_proj=answer_proj,
             answer_id=answer_id,
@@ -2987,6 +3212,12 @@ class CRAPipeline(BasePipeline):
         )
 
         if self._qbound_enabled():
+            # V1.11-A is the controlled generic-input ablation.  The
+            # counterfactual interface is logged but contributes no answer
+            # objective yet.
+            qbound_logs["qbound_counterfactual_training_enabled"] = 0.0
+            qbound_logs["qbound_counterfactual_loss_weight"] = 0.0
+
             qbound_logs["qbound_weak_align_weight"] = float(
                 align_weight
             )
@@ -3212,7 +3443,7 @@ class CRAPipeline(BasePipeline):
 
         def _print_readouts(split_prefix):
             display_names = [
-                ("pre-hoc", "V1.10.2 BAPGR + PPBR reliability-calibrated MAIN"),
+                ("pre-hoc", "V1.11 generic-input + BAPGR/PPBR/PSRC MAIN"),
                 (
                     "raw-refined",
                     "BAPGR + PPBR RAW REFINE diagnostic",
@@ -3556,7 +3787,7 @@ class CRAPipeline(BasePipeline):
                     ),
                 )
 
-                # Official V1.10.2 reliability-calibrated MAIN.
+                # Official V1.11 reliability-calibrated MAIN.
                 calibrated_logits = self._score_answer_candidates(
                     answer_proj=answer_proj,
                     representation=fusion_proj,
@@ -3629,7 +3860,7 @@ class CRAPipeline(BasePipeline):
                         ).sum().item()
                         coarse_count += batch_size
 
-                    diagnostic_logs = self._compute_qbound_v1102_diagnostics(
+                    diagnostic_logs = self._compute_qbound_v111_diagnostics(
                         gqa_output=eval_wrapper,
                         answer_proj=answer_proj,
                         answer_id=answer_id,
@@ -3663,7 +3894,7 @@ class CRAPipeline(BasePipeline):
                     video_attention = video_attention[None, :]
 
                 if time_param is not None:
-                    # Official V1.10.2 reliability-calibrated hard interval.
+                    # Official V1.11 reliability-calibrated hard interval.
                     start_time = (
                         time_param["start"]
                         .detach().cpu().numpy()
@@ -4054,7 +4285,7 @@ class CRAPipeline(BasePipeline):
         if qbound_keyframe:
             if not hasattr(self.metric, "temporal_key_metrics"):
                 raise AttributeError(
-                    "Q-Bound V1.10.2 requires "
+                    "Q-Bound V1.11 requires "
                     "Metric.temporal_key_metrics()."
                 )
             score.update(

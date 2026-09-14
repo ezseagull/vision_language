@@ -8,99 +8,81 @@ import torch.nn.functional as F
 
 class QBoundCore(nn.Module):
     """
-    Q-Bound Version 1.10.2 core:
+    Q-Bound Version 1.11 core.
+
+    V1.11 keeps the validated temporal reasoning stack from V1.10.3:
+
         DECOMPOSE -> RELATE -> COMPOSE
-        -> DETACHED BOUNDARY-ANCHORED POSTERIOR-GUIDED REFINE
-        -> PRIOR-PRESERVING BOUNDED REFINEMENT
-        -> RELIABILITY CALIBRATION -> GROUND
+        -> detached BAPGR prior
+        -> PPBR Refiner
+        -> posterior-stable reliability calibration
+        -> MAIN temporal support
 
-    V1.10.1 is a controlled correction of the V1.9 Refiner failure.  The
-    V1.9 training diagnostics showed a characteristic mismatch:
+    and makes the first architecture-level step toward a CRA-independent
+    Q-Bound interface.
 
-      * Composer/coarse support stayed broad and useful (about 20 frames);
-      * the Composer span posterior became reasonably selective;
-      * the Composer -> pair conversion remained very diffuse;
-      * the Refiner became increasingly sharp/confident while collapsing to
-        approximately 1--3 frame RAW intervals;
-      * RAW IoU collapsed, semantic retention approached zero, and PSRC had to
-        reduce Refiner reliability to almost zero to preserve MAIN IoU.
+    Principal V1.11 change #1: Generic Q-Bound-owned visual input adapter
+    --------------------------------------------------------------------
+    Q-Bound no longer assumes that its ``video_tokens`` have already passed
+    through CRA's ``VideoEmbedding``.  The intended input is a generic frozen
+    visual sequence, e.g. uniformly sampled CLIP-L features [B,T,768].
 
-    Inspecting the V1.9 code shows that it did NOT allow arbitrary start/end
-    frames from every interior event of a multi-event chain.  It already
-    restricted start candidates to the first event and end candidates to the
-    last event.  The remaining structural weakness was subtler: every frame
-    inside those boundary events was treated uniformly.  For a one-event
-    candidate, this makes every ordered pair inside the event legal with equal
-    prior mass, including tiny interior intervals.  For longer chains, it also
-    discards the semantic meaning that the first event contributes the left
-    boundary and the last event contributes the right boundary.
+    The core owns a lightweight frame-wise adapter:
 
-    V1.10.1 keeps the successful parts of V1.9:
-      * soft multi-span Composer uncertainty;
-      * stop-gradient Composer -> Refiner routing;
-      * one Refiner update rather than differentiable all-span marginalization;
-      * posterior-stable reliability calibration (PSRC);
-      * no temporal GT, IoU/IoP loss, target span length, minimality loss,
-        event-count forcing, or direct event-token answer residual.
+        generic visual token
+          -> Linear(input_dim,input_dim)
+          -> GELU
+          -> LayerNorm
+          -> fixed sinusoidal temporal position
+          -> Dropout
 
-    The only principal mechanism change is Boundary-Anchored Posterior-Guided
-    Refinement (BAPGR).  For each Composer candidate span k=[E_i,...,E_j]:
+    The adapter has no temporal self-attention and therefore does not replace
+    DECOMPOSE/RELATE.  Its projection is identity-initialized when square so
+    the first V1.11 run starts from the original visual channel geometry rather
+    than from a randomly rotated feature space.  The adapter parameters belong
+    to Q-Bound and are not shared with CRA.
 
-      * start candidates remain inside E_i;
-      * end candidates remain inside E_j;
-      * start prior mass decays smoothly away from the LEFT edge of E_i;
-      * end prior mass decays smoothly away from the RIGHT edge of E_j.
+    Principal V1.11 change #2: Counterfactual evidence interface
+    -------------------------------------------------------------
+    The core exposes differentiable soft keep/remove supports derived from the
+    reliability-calibrated MAIN support:
 
-    A normalized boundary-anchor distribution q_B(s,e|span_k) replaces the
-    V1.9 uniform pair distribution:
+        keep_support(t)   = MAIN soft temporal support in [0,1]
+        remove_support(t) = 1 - keep_support(t) on valid frames
 
-        q_B(s,e|span_k)
-            propto a_start(s|E_i) * a_end(e|E_j) * 1[s <= e]
+    This is only an interface.  The core does NOT compute answer logits or add
+    a counterfactual loss.  A downstream consumer can later construct, e.g.:
 
-        q_C(s,e)
-            = sum_k stopgrad(pi_k) q_B(s,e|span_k)
+        X_suff = keep*X + remove*X_perm
+        X_nec  = remove*X + keep*X_perm
 
-    with a configurable positive anchor power.  This is a structural prior,
-    not a span-length target: all legal boundary-event frames remain reachable,
-    but micro-spans in event interiors no longer receive the same prior mass as
-    semantically meaningful event boundaries.
+    and apply answer-level sufficiency/necessity objectives.  Keeping that loss
+    outside the temporal core prevents Q-Bound from becoming tied to CRA's
+    answer head and lets V1.11-A (generic input only) and V1.11-B
+    (generic input + counterfactual evidence training) share one core.
 
-    REFINE still performs the same Bayesian-style update:
+    Controlled-mechanism contract
+    -----------------------------
+    V1.11 intentionally does NOT change BAPGR, PPBR, PSRC, Composer
+    temperature, Refiner temperature, correction cap, duration behavior, or
+    event topology.  It introduces no temporal GT, IoU/IoP loss, span-length
+    target, minimality/sparsity loss, event-count forcing, CRA temporal prior,
+    or direct reasoned-event residual into the answer representation.
 
-        p_R(s,e) propto q_C(s,e) * exp((l_s + l_e) / tau_R)
-
-    and PSRC remains unchanged:
-
-        information_gain = clip((H(q_C) - H(p_R)) / H(q_C), 0, 1)
-        semantic_retention = sum_t p_coarse(t) * support_R(t)
-        base_confidence = exp(-normalized_entropy(p_R))
-        gain_factor = 0.5 * (1 + information_gain)
-        reliability = base_confidence * semantic_retention * gain_factor
-
-    MAIN temporal evidence remains:
-
-        p_main(t) = (1-reliability) * p_coarse(t)
-                  + reliability * p_refine(t)
-
-    V1.10.2 diagnosis target:
-      * BAPGR prior should stay broad/structured as in V1.10.1;
-      * RAW/prior expected-length ratio should no longer collapse toward ~0.3;
-      * Refiner-vs-prior KL/JS and correction saturation quantify whether PPBR
-        preserves useful refinement without freezing the Refiner.
-
-    Gradient contract:
+    Gradient contract
+    -----------------
+      * Generic input-adapter parameters are trainable Q-Bound parameters.
+      * External visual/question encoders may still be detached by the caller.
       * Composer -> MAIN coarse component remains differentiable.
-      * Composer posterior -> BAPGR prior is stop-gradient.
+      * Composer posterior -> BAPGR prior remains stop-gradient.
       * Refiner -> MAIN fine component remains differentiable.
-      * Reliability is detached, preventing reliability gaming.
-      * Boundary anchoring is parameter-free apart from its fixed/configured
-        geometric power and introduces no auxiliary optimization loss.
+      * Reliability remains detached before coarse/fine fusion.
+      * Counterfactual keep/remove support remains differentiable when a
+        downstream V1.11-B consumer elects to use it.
 
-    Legacy V1.9 output names are retained so downstream files can be migrated
-    incrementally.  V1.10.1 additionally exposes the counterfactual V1.9
-    uniform pair prior and boundary-anchor diagnostics, making it possible to
-    verify that the new routing prior reduces pair dilution without hiding a
-    new tiny-span shortcut.
+    V1.10.x diagnostic/output names are retained wherever possible so the
+    migration of refine.py, CRA wrapper, pipeline, and logging can be performed
+    incrementally and compared directly with V1.10.3.
     """
 
     def __init__(
@@ -124,11 +106,15 @@ class QBoundCore(nn.Module):
         refiner_temperature: float = 0.30,
         refiner_boundary_anchor_power: float = 2.0,
         refiner_correction_cap: float = 2.0,
+        use_generic_input_adapter: bool = True,
+        input_adapter_dropout: Optional[float] = None,
+        input_adapter_use_position: bool = True,
+        counterfactual_evidence_interface: bool = False,
     ) -> None:
         super().__init__()
 
         if max_events < 2:
-            raise ValueError("Version 1.10.2 requires max_events >= 2.")
+            raise ValueError("Version 1.11 requires max_events >= 2.")
         if proposal_candidates < 1:
             raise ValueError("proposal_candidates must be >= 1.")
         if proposal_candidates < max_events - 1:
@@ -167,12 +153,24 @@ class QBoundCore(nn.Module):
                 "refiner_correction_cap must be positive."
             )
 
+        if input_adapter_dropout is None:
+            input_adapter_dropout = dropout
+        if not 0.0 <= float(input_adapter_dropout) < 1.0:
+            raise ValueError("input_adapter_dropout must be in [0, 1).")
+
         self.input_dim = int(input_dim)
         self.hidden_dim = int(hidden_dim)
         self.max_events = int(max_events)
         self.max_transitions = self.max_events - 1
         self.proposal_candidates = int(proposal_candidates)
-        self.qbound_version = "1.10.2"
+        self.qbound_version = "1.11"
+
+        self.use_generic_input_adapter = bool(use_generic_input_adapter)
+        self.input_adapter_use_position = bool(input_adapter_use_position)
+        self.input_adapter_dropout_p = float(input_adapter_dropout)
+        self.counterfactual_evidence_interface = bool(
+            counterfactual_evidence_interface
+        )
 
         self.use_temporal_prior = bool(use_temporal_prior)
         self.boundary_temperature = float(boundary_temperature)
@@ -191,6 +189,26 @@ class QBoundCore(nn.Module):
         self.refiner_correction_cap = float(
             refiner_correction_cap
         )
+
+        # ------------------------------------------------------------------
+        # 0. V1.11 GENERIC VISUAL INPUT ADAPTER
+        # ------------------------------------------------------------------
+        # Q-Bound owns this adapter.  It intentionally mirrors only the
+        # lightweight per-frame preprocessing that is useful for raw frozen
+        # features; it does not reuse CRA VideoEmbedding parameters.
+        self.generic_input_proj = nn.Linear(input_dim, input_dim)
+        self.generic_input_gelu = nn.GELU()
+        self.generic_input_norm = nn.LayerNorm(input_dim, eps=1e-12)
+        self.generic_input_dropout = nn.Dropout(self.input_adapter_dropout_p)
+
+        # Identity initialization makes the visual channel mapping controlled
+        # at the start of V1.11.  GELU/LN/position still provide the intended
+        # adapter normalization without importing CRA-trained weights.
+        if self.generic_input_proj.weight.shape[0] == self.generic_input_proj.weight.shape[1]:
+            nn.init.eye_(self.generic_input_proj.weight)
+        else:
+            nn.init.xavier_uniform_(self.generic_input_proj.weight)
+        nn.init.zeros_(self.generic_input_proj.bias)
 
         # ------------------------------------------------------------------
         # A. TOPOLOGY / DECOMPOSITION BRANCH
@@ -439,7 +457,7 @@ class QBoundCore(nn.Module):
         nn.init.zeros_(self.span_composer_score[-1].bias)
 
         # ------------------------------------------------------------------
-        # F. REFINE: boundary scorer + BAPGR + PPBR + PSRC (V1.10.2)
+        # F. REFINE: V1.10.2 BAPGR + PPBR + PSRC retained in V1.11
         # ------------------------------------------------------------------
         # The trainable boundary scorer is intentionally unchanged from V1.9.
         # V1.10.1 changes only the detached Composer -> pair geometry: legal
@@ -471,6 +489,114 @@ class QBoundCore(nn.Module):
     # ----------------------------------------------------------------------
     # Generic helpers
     # ----------------------------------------------------------------------
+    @staticmethod
+    def _sinusoidal_position_encoding(
+        time_steps: int,
+        feature_dim: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Return deterministic [1,T,D] sinusoidal temporal positions."""
+        position = torch.arange(
+            time_steps,
+            device=device,
+            dtype=torch.float32,
+        ).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(
+                0,
+                feature_dim,
+                2,
+                device=device,
+                dtype=torch.float32,
+            )
+            * (-torch.log(torch.tensor(10000.0, device=device)) / feature_dim)
+        )
+
+        pe = torch.zeros(
+            time_steps,
+            feature_dim,
+            device=device,
+            dtype=torch.float32,
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)
+        if feature_dim > 1:
+            pe[:, 1::2] = torch.cos(
+                position * div_term[: pe[:, 1::2].shape[1]]
+            )
+        return pe.unsqueeze(0).to(dtype=dtype)
+
+    def _adapt_generic_video_tokens(
+        self,
+        video_tokens: torch.Tensor,
+        video_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Adapt generic frozen visual tokens into Q-Bound's private input space.
+
+        This adapter is deliberately frame-wise.  Temporal reasoning remains
+        the responsibility of DECOMPOSE/RELATE rather than a hidden CRA-style
+        encoder in front of Q-Bound.
+        """
+        mask_f = video_mask.to(video_tokens.dtype).unsqueeze(-1)
+        raw_masked = video_tokens * mask_f
+
+        if self.use_generic_input_adapter:
+            adapted = self.generic_input_proj(video_tokens)
+            adapted = self.generic_input_gelu(adapted)
+            adapted = self.generic_input_norm(adapted)
+
+            if self.input_adapter_use_position:
+                position = self._sinusoidal_position_encoding(
+                    time_steps=video_tokens.size(1),
+                    feature_dim=video_tokens.size(2),
+                    device=video_tokens.device,
+                    dtype=video_tokens.dtype,
+                )
+                adapted = adapted + position
+
+            adapted = self.generic_input_dropout(adapted)
+        else:
+            adapted = video_tokens
+
+        adapted = adapted * mask_f
+
+        valid_count = video_mask.sum(dim=-1).to(video_tokens.dtype).clamp_min(1.0)
+        raw_rms = torch.sqrt(
+            raw_masked.pow(2).sum(dim=(1, 2))
+            / (valid_count * float(video_tokens.size(-1))).clamp_min(1.0)
+            + 1e-8
+        )
+        adapted_rms = torch.sqrt(
+            adapted.pow(2).sum(dim=(1, 2))
+            / (valid_count * float(adapted.size(-1))).clamp_min(1.0)
+            + 1e-8
+        )
+
+        raw_unit = F.normalize(raw_masked, p=2, dim=-1)
+        adapted_unit = F.normalize(adapted, p=2, dim=-1)
+        token_cos = (raw_unit * adapted_unit).sum(dim=-1)
+        token_cos = (
+            token_cos * video_mask.to(token_cos.dtype)
+        ).sum(dim=-1) / valid_count
+
+        delta = (adapted - raw_masked) * mask_f
+        delta_norm = torch.linalg.vector_norm(delta, dim=-1)
+        raw_norm = torch.linalg.vector_norm(raw_masked, dim=-1)
+        delta_ratio = (
+            delta_norm * video_mask.to(delta_norm.dtype)
+        ).sum(dim=-1) / (
+            (raw_norm * video_mask.to(raw_norm.dtype)).sum(dim=-1).clamp_min(1e-6)
+        )
+
+        diagnostics = {
+            "generic_input_raw_rms": raw_rms,
+            "generic_input_adapted_rms": adapted_rms,
+            "generic_input_token_cosine": token_cos,
+            "generic_input_delta_ratio": delta_ratio,
+        }
+        return adapted, diagnostics
+
     def _summarize_qa(self, qa_features: torch.Tensor) -> torch.Tensor:
         """Compatibility helper. Q-Bound receives question-only [B,D]."""
         if qa_features.ndim < 2:
@@ -3084,12 +3210,12 @@ class QBoundCore(nn.Module):
         if video_tokens.ndim != 3:
             raise ValueError("video_tokens must be [B,T,D].")
 
-        if contextual_tokens is None:
-            contextual_tokens = video_tokens
-        if contextual_tokens.shape != video_tokens.shape:
-            raise ValueError(
-                "video_tokens and contextual_tokens must have the same shape."
-            )
+        external_contextual_tokens = contextual_tokens
+        if external_contextual_tokens is not None:
+            if external_contextual_tokens.shape != video_tokens.shape:
+                raise ValueError(
+                    "video_tokens and contextual_tokens must have the same shape."
+                )
 
         batch_size, time_steps, feature_dim = video_tokens.shape
         if feature_dim != self.input_dim:
@@ -3097,7 +3223,7 @@ class QBoundCore(nn.Module):
                 f"Expected input_dim={self.input_dim}, got {feature_dim}."
             )
         if time_steps < 2:
-            raise ValueError("Version 1.10.2 requires at least 2 timesteps.")
+            raise ValueError("Version 1.11 requires at least 2 timesteps.")
 
         video_mask = self._normalize_mask(
             video_mask,
@@ -3105,6 +3231,42 @@ class QBoundCore(nn.Module):
             time_steps,
             video_tokens.device,
         )
+
+        # --------------------------------------------------------------
+        # V1.11 generic visual input contract.  ``video_tokens`` is intended
+        # to be the raw/frozen feature sequence (e.g. CLIP-L), not CRA's
+        # VideoEmbedding output.  The caller may detach the external encoder;
+        # this private adapter remains trainable inside Q-Bound.
+        # --------------------------------------------------------------
+        raw_external_video_tokens = video_tokens
+        video_tokens, input_adapter_diag = self._adapt_generic_video_tokens(
+            raw_external_video_tokens,
+            video_mask,
+        )
+
+        # When no distinct contextual stream is provided (the controlled
+        # V1.11 path), reuse the exact same adapted tensor and dropout draw.
+        # A truly separate generic contextual stream is still supported.
+        context_reuses_raw = (
+            external_contextual_tokens is None
+            or external_contextual_tokens is raw_external_video_tokens
+            or (
+                torch.is_tensor(external_contextual_tokens)
+                and external_contextual_tokens.data_ptr()
+                == raw_external_video_tokens.data_ptr()
+            )
+        )
+        if context_reuses_raw:
+            contextual_tokens = video_tokens
+            contextual_adapter_diag = input_adapter_diag
+        else:
+            contextual_tokens, contextual_adapter_diag = (
+                self._adapt_generic_video_tokens(
+                    external_contextual_tokens,
+                    video_mask,
+                )
+            )
+
         boundary_mask = video_mask[:, :-1] & video_mask[:, 1:]
 
         temporal_prior_used = self._prepare_temporal_prior(
@@ -3254,7 +3416,7 @@ class QBoundCore(nn.Module):
         )
 
         # --------------------------------------------------------------
-        # D. BAPGR + PRIOR-PRESERVING BOUNDED REFINE + PSRC (V1.10.2)
+        # D. BAPGR + PRIOR-PRESERVING BOUNDED REFINE + PSRC (retained in V1.11)
         # --------------------------------------------------------------
         refinement = self._refine_selected_span(
             raw_states=raw_states,
@@ -3265,6 +3427,35 @@ class QBoundCore(nn.Module):
             local_temporal_logits=grounding["event_temporal_logits"],
             composition=composition,
             video_mask=video_mask,
+        )
+
+        # --------------------------------------------------------------
+        # E. V1.11 COUNTERFACTUAL EVIDENCE INTERFACE (no loss in core).
+        # --------------------------------------------------------------
+        # Use soft interval-membership support, not a unit-sum temporal
+        # probability, as the feature-level keep/remove gate.  This preserves
+        # the semantics of "inside relevant evidence" without imposing a
+        # sparsity/minimality objective.
+        counterfactual_keep_support = refinement[
+            "calibrated_soft_support"
+        ].clamp(0.0, 1.0)
+        counterfactual_keep_support = (
+            counterfactual_keep_support
+            * video_mask.to(counterfactual_keep_support.dtype)
+        )
+        counterfactual_remove_support = (
+            video_mask.to(counterfactual_keep_support.dtype)
+            - counterfactual_keep_support
+        ).clamp(0.0, 1.0)
+
+        cf_valid_length = video_mask.sum(dim=-1).to(
+            counterfactual_keep_support.dtype
+        ).clamp_min(1.0)
+        counterfactual_keep_fraction = (
+            counterfactual_keep_support.sum(dim=-1) / cf_valid_length
+        )
+        counterfactual_remove_fraction = (
+            counterfactual_remove_support.sum(dim=-1) / cf_valid_length
         )
 
         boundary_hard = decomposition["hard_boundary"]
@@ -3298,6 +3489,55 @@ class QBoundCore(nn.Module):
         event_evidence_gates = grounding["event_evidence_gates"]
 
         return {
+            # ----------------------------------------------------------
+            # V1.11 generic-input / counterfactual interface contract.
+            # ----------------------------------------------------------
+            "qbound_version": self.qbound_version,
+            "generic_input_adapter_enabled": torch.as_tensor(
+                float(self.use_generic_input_adapter),
+                dtype=video_tokens.dtype,
+                device=video_tokens.device,
+            ),
+            "generic_input_position_enabled": torch.as_tensor(
+                float(self.input_adapter_use_position),
+                dtype=video_tokens.dtype,
+                device=video_tokens.device,
+            ),
+            "generic_input_context_reuse": torch.as_tensor(
+                float(context_reuses_raw),
+                dtype=video_tokens.dtype,
+                device=video_tokens.device,
+            ),
+            "generic_input_raw_rms": input_adapter_diag[
+                "generic_input_raw_rms"
+            ],
+            "generic_input_adapted_rms": input_adapter_diag[
+                "generic_input_adapted_rms"
+            ],
+            "generic_input_token_cosine": input_adapter_diag[
+                "generic_input_token_cosine"
+            ],
+            "generic_input_delta_ratio": input_adapter_diag[
+                "generic_input_delta_ratio"
+            ],
+            "generic_context_raw_rms": contextual_adapter_diag[
+                "generic_input_raw_rms"
+            ],
+            "generic_context_adapted_rms": contextual_adapter_diag[
+                "generic_input_adapted_rms"
+            ],
+            "counterfactual_evidence_interface_enabled": torch.as_tensor(
+                float(self.counterfactual_evidence_interface),
+                dtype=video_tokens.dtype,
+                device=video_tokens.device,
+            ),
+            # Differentiable interface.  Downstream code decides whether the
+            # flag above is active for a V1.11-B answer-level objective.
+            "counterfactual_keep_support": counterfactual_keep_support,
+            "counterfactual_remove_support": counterfactual_remove_support,
+            "counterfactual_keep_fraction": counterfactual_keep_fraction,
+            "counterfactual_remove_fraction": counterfactual_remove_fraction,
+
             # Core states.
             "qa_state": qa_state,
             "topology_qa_state": topology_qa,
@@ -3758,7 +3998,7 @@ class QBoundCore(nn.Module):
             "calibrated_inside_coarse": refinement["calibrated_inside_coarse"],
             "refiner_temperature": refinement["refiner_temperature"],
 
-            # Main V1.10.2 temporal output: reliability-calibrated fusion.
+            # Main V1.11 temporal output: V1.10.2 reliability-calibrated fusion retained.
             "event_temporal_prob": refinement["calibrated_temporal_prob"],
             "main_temporal_prob": refinement["calibrated_temporal_prob"],
             "main_temporal_logits": refinement["calibrated_temporal_logits"],

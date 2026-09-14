@@ -13,9 +13,9 @@ from modules.m_cra.causal_module import LinguisticInterventionGraph
 
 class CRA(nn.Module):
     """
-    CRA wrapper with Q-Bound Version 1.10.2.
+    CRA wrapper with Q-Bound Version 1.11.
 
-    Q-Bound V1.10.2:
+    Q-Bound V1.11:
 
         DECOMPOSE -> RELATE -> COMPOSE
                     |
@@ -27,12 +27,19 @@ class CRA(nn.Module):
                                                        -> GROUND
 
     CRA remains only the downstream VideoQA testbed. The official returned
-    ``video_proj`` is the reliability-calibrated V1.10.2 MAIN representation.
+    ``video_proj`` is the reliability-calibrated V1.11 MAIN representation.
+
+    V1.11 input decoupling:
+      * ``video`` is the raw/generic sampled visual stream (CLIP-L in NextGQA);
+      * ``video_f = CRA.VideoEmbedding(video)`` remains CRA-side only;
+      * the raw ``video`` tensor is passed separately as ``qbound_video_tokens``;
+      * RefineDecoder/QBoundCore fail fast if Q-Bound falls back to CRA-embedded
+        visual tokens.
 
     Three answer-space branches are exposed:
 
         qbound_calibrated_video_proj
-            Official V1.10.2 MAIN branch.
+            Official V1.11 MAIN branch.
 
         qbound_raw_refined_video_proj
             Boundary-anchored posterior-guided fine REFINE branch, diagnostics/ablation only.
@@ -100,17 +107,17 @@ class CRA(nn.Module):
                 "version",
                 model_cfg.get(
                     "qbound_version",
-                    model_cfg.get("gpeb_version", "1.10.2"),
+                    model_cfg.get("gpeb_version", "1.11"),
                 ),
             )
         )
 
-        # This wrapper is the controlled V1.10.2 contract. Fail early instead of
-        # silently pairing the V1.10.2 decoder with an older core/config.
-        if self.qbound_enabled and self.qbound_version != "1.10.2":
+        # This wrapper is the controlled V1.11 contract. Fail early instead of
+        # silently pairing the V1.11 decoder with an older core/config.
+        if self.qbound_enabled and self.qbound_version != "1.11":
             raise ValueError(
                 "Q-Bound is enabled, but this CRA wrapper expects "
-                f"model.qbound.version='1.10.2'; got {self.qbound_version!r}."
+                f"model.qbound.version='1.11'; got {self.qbound_version!r}."
             )
         self.qbound_require_question_only = bool(
             qbound_cfg.get(
@@ -335,13 +342,13 @@ class CRA(nn.Module):
         qbound_mix=1.0,
     ):
         """
-        Refined CRA/Q-Bound V1.10.2 forward.
+        Refined CRA/Q-Bound V1.11 forward.
 
         The returned ``video_proj`` is the official posterior-stable,
-        reliability-calibrated V1.10.2 MAIN representation. The raw BAPGR + PPBR
+        reliability-calibrated V1.11 MAIN representation. The raw BAPGR + PPBR
         Refiner and hard-top1 Composer representations are diagnostics only.
 
-        ``qbound_mix`` is compatibility-only; V1.10.2 has no CRA/Q-Bound handover.
+        ``qbound_mix`` is compatibility-only; V1.11 has no CRA/Q-Bound handover.
         """
         mode = mode.upper()
 
@@ -397,7 +404,7 @@ class CRA(nn.Module):
             if question is None:
                 if self.qbound_require_question_only:
                     raise ValueError(
-                        "Q-Bound V1.10.2 requires question-only token ids. "
+                        "Q-Bound V1.11 requires question-only token ids. "
                         "Pass them through CRA.forward(..., question=...). "
                         "Do not reuse candidate-answer features."
                     )
@@ -424,6 +431,9 @@ class CRA(nn.Module):
             ),
             use_qbound=use_qbound,
             question_feature=question_g,
+            qbound_video_tokens=(
+                video if use_qbound else None
+            ),
             qbound_mix=(
                 qbound_mix
                 if use_qbound
@@ -441,10 +451,28 @@ class CRA(nn.Module):
         )
 
         # --------------------------------------------------------------
-        # Validate V1.10.2 decoder/core contract.
+        # Validate V1.11 decoder/core contract.
         # --------------------------------------------------------------
         if use_qbound:
             required_time_keys = {
+                # V1.11 generic-input / counterfactual interface.
+                "qbound_generic_input_adapter_enabled",
+                "qbound_generic_input_position_enabled",
+                "qbound_generic_input_context_reuse",
+                "qbound_generic_input_raw_rms",
+                "qbound_generic_input_adapted_rms",
+                "qbound_generic_input_token_cosine",
+                "qbound_generic_input_delta_ratio",
+                "qbound_generic_context_raw_rms",
+                "qbound_generic_context_adapted_rms",
+                "qbound_counterfactual_evidence_interface_enabled",
+                "qbound_counterfactual_keep_support",
+                "qbound_counterfactual_remove_support",
+                "qbound_counterfactual_keep_fraction",
+                "qbound_counterfactual_remove_fraction",
+                "qbound_input_is_generic",
+                "qbound_input_uses_cra_embedding",
+
                 # Official calibrated MAIN.
                 "qbound_grounding_feature",
                 "qbound_temporal_main_feature",
@@ -599,17 +627,36 @@ class CRA(nn.Module):
             )
             if missing_time_keys:
                 raise KeyError(
-                    "RefineDecoder/Q-Bound V1.10.2 time_param output is missing: "
+                    "RefineDecoder/Q-Bound V1.11 time_param output is missing: "
                     + ", ".join(missing_time_keys)
                 )
 
             if qbound_aux is None:
                 raise KeyError(
-                    "RefineDecoder/Q-Bound V1.10.2 must expose "
+                    "RefineDecoder/Q-Bound V1.11 must expose "
                     "time_param['qbound_aux']."
                 )
 
             required_aux_keys = {
+                # V1.11 generic-input / counterfactual interface.
+                "qbound_version",
+                "generic_input_adapter_enabled",
+                "generic_input_position_enabled",
+                "generic_input_context_reuse",
+                "generic_input_raw_rms",
+                "generic_input_adapted_rms",
+                "generic_input_token_cosine",
+                "generic_input_delta_ratio",
+                "generic_context_raw_rms",
+                "generic_context_adapted_rms",
+                "counterfactual_evidence_interface_enabled",
+                "counterfactual_keep_support",
+                "counterfactual_remove_support",
+                "counterfactual_keep_fraction",
+                "counterfactual_remove_fraction",
+                "qbound_input_is_generic",
+                "qbound_input_uses_cra_embedding",
+
                 # Answer representations.
                 "main_video_proj",
                 "qbound_video_proj",
@@ -753,7 +800,7 @@ class CRA(nn.Module):
             )
             if missing_aux_keys:
                 raise KeyError(
-                    "Q-Bound V1.10.2 auxiliary output is missing: "
+                    "Q-Bound V1.11 auxiliary output is missing: "
                     + ", ".join(missing_aux_keys)
                 )
 
@@ -765,31 +812,74 @@ class CRA(nn.Module):
                     )
                 return float(value.detach().item())
 
+            # ----------------------------------------------------------
+            # V1.11 generic-input contract. Q-Bound must consume the raw /
+            # generic feature stream passed beside CRA.VideoEmbedding output.
+            # There is intentionally no fallback to the CRA-embedded stream.
+            # ----------------------------------------------------------
+            if str(qbound_aux["qbound_version"]) != self.qbound_version:
+                raise RuntimeError(
+                    "CRA/RefineDecoder/QBoundCore version mismatch: "
+                    f"CRA={self.qbound_version!r}, "
+                    f"core={qbound_aux['qbound_version']!r}."
+                )
+
+            if _scalar_flag("qbound_input_is_generic") != 1.0:
+                raise RuntimeError(
+                    "Q-Bound V1.11 must consume the explicit generic visual "
+                    "stream rather than CRA.VideoEmbedding output."
+                )
+            if _scalar_flag("qbound_input_uses_cra_embedding") != 0.0:
+                raise RuntimeError(
+                    "Q-Bound V1.11 unexpectedly reports CRA-embedded input."
+                )
+            if _scalar_flag("generic_input_context_reuse") != 1.0:
+                raise RuntimeError(
+                    "Q-Bound V1.11 requires the adapted generic stream to be "
+                    "reused as contextual input in the controlled first run."
+                )
+
+            expected_generic_adapter = bool(
+                self.cfgs["model"].get("qbound", {}).get(
+                    "use_generic_input_adapter",
+                    True,
+                )
+            )
+            actual_generic_adapter = bool(
+                round(_scalar_flag("generic_input_adapter_enabled"))
+            )
+            if actual_generic_adapter != expected_generic_adapter:
+                raise RuntimeError(
+                    "Q-Bound V1.11 generic input adapter flag mismatch: "
+                    f"config={expected_generic_adapter}, "
+                    f"core={actual_generic_adapter}."
+                )
+
             if _scalar_flag("uncertainty_calibration_enabled") != 1.0:
                 raise RuntimeError(
-                    "Q-Bound V1.10.2 requires calibrated coarse/fine fusion."
+                    "Q-Bound V1.11 retains calibrated coarse/fine fusion from V1.10.2."
                 )
 
             if _scalar_flag("posterior_guided_refinement_enabled") != 1.0:
                 raise RuntimeError(
-                    "Q-Bound V1.10.2 requires detached posterior-guided REFINE."
+                    "Q-Bound V1.11 retains detached posterior-guided REFINE from V1.10.2."
                 )
 
             if _scalar_flag("boundary_structured_refinement_enabled") != 1.0:
                 raise RuntimeError(
-                    "Q-Bound V1.10.2 requires boundary-anchored "
+                    "Q-Bound V1.11 retains boundary-anchored "
                     "posterior-guided refinement."
                 )
 
             if _scalar_flag("qbound_boundary_structured_refinement_enabled") != 1.0:
                 raise RuntimeError(
-                    "RefineDecoder must expose the active V1.10.2 "
+                    "RefineDecoder must expose the active V1.11 "
                     "boundary-structured refinement contract."
                 )
 
             if _scalar_flag("prior_preserving_bounded_refinement_enabled") != 1.0:
                 raise RuntimeError(
-                    "Q-Bound V1.10.2 requires prior-preserving "
+                    "Q-Bound V1.11 retains prior-preserving "
                     "bounded refinement (PPBR)."
                 )
 
@@ -797,13 +887,13 @@ class CRA(nn.Module):
                 "qbound_prior_preserving_bounded_refinement_enabled"
             ) != 1.0:
                 raise RuntimeError(
-                    "RefineDecoder must expose the active V1.10.2 "
+                    "RefineDecoder must expose the active V1.11 "
                     "PPBR contract."
                 )
 
             if _scalar_flag("posterior_stable_reliability_enabled") != 1.0:
                 raise RuntimeError(
-                    "Q-Bound V1.10.2 requires posterior-stable reliability calibration."
+                    "Q-Bound V1.11 retains posterior-stable reliability calibration."
                 )
 
             refinement_cfg = self.cfgs["model"]["qbound"].get(
@@ -835,7 +925,7 @@ class CRA(nn.Module):
                 abs_tol=1e-6,
             ):
                 raise RuntimeError(
-                    "Q-Bound V1.10.2 boundary anchor power mismatch: "
+                    "Q-Bound V1.11 boundary anchor power mismatch: "
                     f"config={expected_anchor_power}, "
                     f"core={actual_anchor_power}."
                 )
@@ -861,38 +951,38 @@ class CRA(nn.Module):
                 abs_tol=1e-6,
             ):
                 raise RuntimeError(
-                    "Q-Bound V1.10.2 correction cap mismatch: "
+                    "Q-Bound V1.11 correction cap mismatch: "
                     f"config={expected_correction_cap}, "
                     f"core={actual_correction_cap}."
                 )
 
             if _scalar_flag("minimal_sufficient_enabled") != 0.0:
                 raise RuntimeError(
-                    "Q-Bound V1.10.2 requires V1.7 minimal-sufficient routing "
+                    "Q-Bound V1.11 requires V1.7 minimal-sufficient routing "
                     "to remain disabled."
                 )
 
             if _scalar_flag("all_span_refine_marginal_enabled") != 0.0:
                 raise RuntimeError(
-                    "Q-Bound V1.10.2 requires V1.6 differentiable all-span REFINE "
+                    "Q-Bound V1.11 requires V1.6 differentiable all-span REFINE "
                     "marginalization to remain disabled."
                 )
 
             if _scalar_flag("refine_coarse_detached") != 1.0:
                 raise RuntimeError(
-                    "Q-Bound V1.10.2 requires the Composer posterior routed into "
+                    "Q-Bound V1.11 requires the Composer posterior routed into "
                     "REFINE to remain detached."
                 )
 
             if _scalar_flag("refine_hard_coarse_route") != 0.0:
                 raise RuntimeError(
-                    "Q-Bound V1.10.2 must not restrict REFINE to the V1.8 hard "
+                    "Q-Bound V1.11 must not restrict REFINE to the V1.8 hard "
                     "top-1 Composer chain."
                 )
 
             if _scalar_flag("calibration_confidence_detached") != 1.0:
                 raise RuntimeError(
-                    "Q-Bound V1.10.2 requires detached reliability calibration."
+                    "Q-Bound V1.11 requires detached reliability calibration."
                 )
 
         # --------------------------------------------------------------
@@ -1006,6 +1096,24 @@ class CRA(nn.Module):
             outs[name] = _tp(name)
 
         qbound_output_names = [
+            # V1.11 generic-input / counterfactual interface.
+            "qbound_generic_input_adapter_enabled",
+            "qbound_generic_input_position_enabled",
+            "qbound_generic_input_context_reuse",
+            "qbound_generic_input_raw_rms",
+            "qbound_generic_input_adapted_rms",
+            "qbound_generic_input_token_cosine",
+            "qbound_generic_input_delta_ratio",
+            "qbound_generic_context_raw_rms",
+            "qbound_generic_context_adapted_rms",
+            "qbound_counterfactual_evidence_interface_enabled",
+            "qbound_counterfactual_keep_support",
+            "qbound_counterfactual_remove_support",
+            "qbound_counterfactual_keep_fraction",
+            "qbound_counterfactual_remove_fraction",
+            "qbound_input_is_generic",
+            "qbound_input_uses_cra_embedding",
+
             # COMPOSE.
             "qbound_span_candidate_event_mask",
             "qbound_span_candidate_start_event",
@@ -1278,9 +1386,53 @@ class CRA(nn.Module):
             outs[name] = _tp(name)
 
         # --------------------------------------------------------------
-        # Explicit V1.10.2 answer/key interfaces.
+        # Explicit V1.11 answer/key interfaces.
         # --------------------------------------------------------------
         if isinstance(qbound_aux, dict):
+            # V1.11 generic-input / counterfactual interface.
+            outs["qbound_input_is_generic"] = qbound_aux.get(
+                "qbound_input_is_generic"
+            )
+            outs["qbound_input_uses_cra_embedding"] = qbound_aux.get(
+                "qbound_input_uses_cra_embedding"
+            )
+            outs["qbound_generic_input_adapter_enabled"] = qbound_aux.get(
+                "generic_input_adapter_enabled"
+            )
+            outs["qbound_generic_input_position_enabled"] = qbound_aux.get(
+                "generic_input_position_enabled"
+            )
+            outs["qbound_generic_input_context_reuse"] = qbound_aux.get(
+                "generic_input_context_reuse"
+            )
+            outs["qbound_generic_input_raw_rms"] = qbound_aux.get(
+                "generic_input_raw_rms"
+            )
+            outs["qbound_generic_input_adapted_rms"] = qbound_aux.get(
+                "generic_input_adapted_rms"
+            )
+            outs["qbound_generic_input_token_cosine"] = qbound_aux.get(
+                "generic_input_token_cosine"
+            )
+            outs["qbound_generic_input_delta_ratio"] = qbound_aux.get(
+                "generic_input_delta_ratio"
+            )
+            outs["qbound_counterfactual_evidence_interface_enabled"] = (
+                qbound_aux.get("counterfactual_evidence_interface_enabled")
+            )
+            outs["qbound_counterfactual_keep_support"] = qbound_aux.get(
+                "counterfactual_keep_support"
+            )
+            outs["qbound_counterfactual_remove_support"] = qbound_aux.get(
+                "counterfactual_remove_support"
+            )
+            outs["qbound_counterfactual_keep_fraction"] = qbound_aux.get(
+                "counterfactual_keep_fraction"
+            )
+            outs["qbound_counterfactual_remove_fraction"] = qbound_aux.get(
+                "counterfactual_remove_fraction"
+            )
+
             # Official MAIN.
             outs["qbound_calibrated_video_proj"] = qbound_aux.get(
                 "qbound_calibrated_video_proj"
@@ -1448,7 +1600,7 @@ class CRA(nn.Module):
                 "expected_refine_trim_fraction"
             )
 
-            # Official V1.10.2 calibrated interval.
+            # Official V1.11 calibrated interval.
             outs["qbound_calibrated_start"] = qbound_aux.get(
                 "qbound_calibrated_start"
             )
@@ -1492,6 +1644,20 @@ class CRA(nn.Module):
 
         else:
             for name in (
+                "qbound_input_is_generic",
+                "qbound_input_uses_cra_embedding",
+                "qbound_generic_input_adapter_enabled",
+                "qbound_generic_input_position_enabled",
+                "qbound_generic_input_context_reuse",
+                "qbound_generic_input_raw_rms",
+                "qbound_generic_input_adapted_rms",
+                "qbound_generic_input_token_cosine",
+                "qbound_generic_input_delta_ratio",
+                "qbound_counterfactual_evidence_interface_enabled",
+                "qbound_counterfactual_keep_support",
+                "qbound_counterfactual_remove_support",
+                "qbound_counterfactual_keep_fraction",
+                "qbound_counterfactual_remove_fraction",
                 "qbound_calibrated_video_proj",
                 "qbound_calibrated_key",
                 "qbound_refined_video_proj",

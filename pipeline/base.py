@@ -474,7 +474,7 @@ class BasePipeline(object):
     def _check_qbound_components(self):
         """
         Structural safety check for controlled
-        Q-Bound V1.8/V1.9/V1.10.1/V1.10.2 runs.
+        Q-Bound V1.8/V1.9/V1.10.1/V1.10.2/V1.11 runs.
 
         V1.10.2 intentionally keeps the same trainable stage modules as
         V1.10.1:
@@ -517,10 +517,10 @@ class BasePipeline(object):
             refinement_cfg = {}
 
         # Keep BasePipeline reusable for older/other experimental versions.
-        if version not in {"1.8", "1.9", "1.10.1", "1.10.2"}:
+        if version not in {"1.8", "1.9", "1.10.1", "1.10.2", "1.11"}:
             return
 
-        if version in {"1.9", "1.10.1", "1.10.2"}:
+        if version in {"1.9", "1.10.1", "1.10.2", "1.11"}:
             expected_routing_flags = {
                 "hard_coarse_route": False,
                 "detach_coarse": True,
@@ -528,7 +528,7 @@ class BasePipeline(object):
                 "posterior_stable_reliability": True,
             }
 
-            if version in {"1.10.1", "1.10.2"}:
+            if version in {"1.10.1", "1.10.2", "1.11"}:
                 expected_routing_flags["boundary_structured"] = True
 
             for key, expected in expected_routing_flags.items():
@@ -765,6 +765,204 @@ class BasePipeline(object):
                     f"core={actual_core_anchor_power}."
                 )
 
+        if version == "1.11":
+            expected_refinement_type = "prior_preserving_bounded_refiner"
+            actual_refinement_type = str(
+                refinement_cfg.get("type", "")
+            )
+            if actual_refinement_type != expected_refinement_type:
+                raise RuntimeError(
+                    "Q-Bound V1.11 refinement.type mismatch: "
+                    f"expected {expected_refinement_type!r}, "
+                    f"got {actual_refinement_type!r}."
+                )
+
+            if "boundary_anchor_power" not in refinement_cfg:
+                raise RuntimeError(
+                    "Q-Bound V1.11 config is missing "
+                    "refinement.boundary_anchor_power."
+                )
+            boundary_anchor_power = float(
+                refinement_cfg["boundary_anchor_power"]
+            )
+            if (
+                not math.isfinite(boundary_anchor_power)
+                or boundary_anchor_power <= 0.0
+            ):
+                raise ValueError(
+                    "Q-Bound V1.11 refinement.boundary_anchor_power "
+                    "must be finite and > 0; got "
+                    f"{boundary_anchor_power}."
+                )
+
+            if "correction_cap" not in refinement_cfg:
+                raise RuntimeError(
+                    "Q-Bound V1.11 config is missing "
+                    "refinement.correction_cap."
+                )
+            correction_cap = float(
+                refinement_cfg["correction_cap"]
+            )
+            if (
+                not math.isfinite(correction_cap)
+                or correction_cap <= 0.0
+            ):
+                raise ValueError(
+                    "Q-Bound V1.11 refinement.correction_cap "
+                    "must be finite and > 0; got "
+                    f"{correction_cap}."
+                )
+
+            if not math.isclose(
+                boundary_anchor_power,
+                2.0,
+                rel_tol=1e-9,
+                abs_tol=0.0,
+            ):
+                raise RuntimeError(
+                    "Controlled Q-Bound V1.11-A expects "
+                    "refinement.boundary_anchor_power=2.0; got "
+                    f"{boundary_anchor_power}."
+                )
+            if not math.isclose(
+                correction_cap,
+                2.0,
+                rel_tol=1e-9,
+                abs_tol=0.0,
+            ):
+                raise RuntimeError(
+                    "Controlled Q-Bound V1.11-A expects "
+                    "refinement.correction_cap=2.0; got "
+                    f"{correction_cap}."
+                )
+
+            if not bool(qbound_cfg.get("use_generic_input_adapter", False)):
+                raise RuntimeError(
+                    "Q-Bound V1.11 requires "
+                    "model.qbound.use_generic_input_adapter=true."
+                )
+            if not bool(qbound_cfg.get("input_adapter_use_position", True)):
+                raise RuntimeError(
+                    "Controlled Q-Bound V1.11-A expects "
+                    "model.qbound.input_adapter_use_position=true."
+                )
+
+            model_core = (
+                self.model.module
+                if hasattr(self.model, "module")
+                else self.model
+            )
+            model_version = str(
+                getattr(model_core, "qbound_version", "")
+            )
+            if model_version != version:
+                raise RuntimeError(
+                    "BasePipeline/model Q-Bound version mismatch: "
+                    f"config={version!r}, model={model_version!r}."
+                )
+
+            decoder = getattr(model_core, "decoder", None)
+            decoder_version = str(
+                getattr(decoder, "qbound_version", "")
+            )
+            if decoder_version != version:
+                raise RuntimeError(
+                    "BasePipeline/RefineDecoder Q-Bound version mismatch: "
+                    f"config={version!r}, decoder={decoder_version!r}."
+                )
+
+            qbound_core = getattr(decoder, "qbound", None)
+            qbound_core_version = str(
+                getattr(qbound_core, "qbound_version", "")
+            )
+            if qbound_core_version != version:
+                raise RuntimeError(
+                    "BasePipeline/QBoundCore version mismatch: "
+                    f"config={version!r}, core={qbound_core_version!r}."
+                )
+
+            actual_core_cap = float(
+                getattr(
+                    qbound_core,
+                    "refiner_correction_cap",
+                    float("nan"),
+                )
+            )
+            if not math.isclose(
+                actual_core_cap,
+                correction_cap,
+                rel_tol=1e-9,
+                abs_tol=0.0,
+            ):
+                raise RuntimeError(
+                    "BasePipeline/QBoundCore correction-cap mismatch: "
+                    f"config={correction_cap}, core={actual_core_cap}."
+                )
+
+            actual_core_anchor_power = float(
+                getattr(
+                    qbound_core,
+                    "refiner_boundary_anchor_power",
+                    float("nan"),
+                )
+            )
+            if not math.isclose(
+                actual_core_anchor_power,
+                boundary_anchor_power,
+                rel_tol=1e-9,
+                abs_tol=0.0,
+            ):
+                raise RuntimeError(
+                    "BasePipeline/QBoundCore boundary-anchor mismatch: "
+                    f"config={boundary_anchor_power}, "
+                    f"core={actual_core_anchor_power}."
+                )
+
+            if not bool(
+                getattr(
+                    qbound_core,
+                    "use_generic_input_adapter",
+                    False,
+                )
+            ):
+                raise RuntimeError(
+                    "QBoundCore V1.11 generic input adapter is not active."
+                )
+
+            actual_position_setting = bool(
+                getattr(
+                    qbound_core,
+                    "input_adapter_use_position",
+                    False,
+                )
+            )
+            if actual_position_setting != bool(
+                qbound_cfg.get("input_adapter_use_position", True)
+            ):
+                raise RuntimeError(
+                    "QBoundCore V1.11 positional-input setting does not "
+                    "match the YAML configuration."
+                )
+
+            configured_cf_interface = bool(
+                qbound_cfg.get(
+                    "counterfactual_evidence_interface",
+                    False,
+                )
+            )
+            actual_cf_interface = bool(
+                getattr(
+                    qbound_core,
+                    "counterfactual_evidence_interface",
+                    False,
+                )
+            )
+            if actual_cf_interface != configured_cf_interface:
+                raise RuntimeError(
+                    "QBoundCore V1.11 counterfactual interface setting "
+                    "does not match the YAML configuration."
+                )
+
         required_component_tokens = {
             "DECOMPOSE": ("boundary_classifier",),
             "RELATE": ("ordered_relation_score",),
@@ -777,6 +975,12 @@ class BasePipeline(object):
                 "boundary_refine_encoder",
                 "boundary_start_score",
                 "boundary_end_score",
+            )
+
+        if version == "1.11":
+            required_component_tokens["GENERIC_INPUT"] = (
+                "generic_input_proj",
+                "generic_input_norm",
             )
 
         trainable_named_parameters = [
@@ -872,7 +1076,7 @@ class BasePipeline(object):
             "posterior_score",
         )
 
-        if version in {"1.10.1", "1.10.2"}:
+        if version in {"1.10.1", "1.10.2", "1.11"}:
             # BAPGR's boundary anchor is intentionally a fixed structural
             # prior. A trainable "boundary_anchor*" tensor would silently
             # turn the controlled experiment into a different model.
@@ -881,7 +1085,7 @@ class BasePipeline(object):
                 "boundary_anchor",
             )
 
-        if version == "1.10.2":
+        if version in {"1.10.2", "1.11"}:
             # PPBR's cap is a fixed structural trust-region setting.
             forbidden_trainable_tokens = (
                 *forbidden_trainable_tokens,
@@ -953,6 +1157,29 @@ class BasePipeline(object):
             print("  posterior-stable reliability config: YES")
 
         if version == "1.10.2":
+            print("  detached posterior-guided refinement config: YES")
+            print("  boundary-structured BAPGR config: YES")
+            print(
+                "  boundary_anchor_power: "
+                f"{float(refinement_cfg['boundary_anchor_power'])}"
+            )
+            print("  prior-preserving bounded refinement (PPBR): YES")
+            print(
+                "  correction_cap: "
+                f"{float(refinement_cfg['correction_cap'])}"
+            )
+            print("  posterior-stable reliability config: YES")
+
+        if version == "1.11":
+            print("  generic Q-Bound input adapter: YES")
+            print(
+                "  input_adapter_use_position: "
+                f"{bool(qbound_cfg.get('input_adapter_use_position', True))}"
+            )
+            print(
+                "  counterfactual_evidence_interface: "
+                f"{bool(qbound_cfg.get('counterfactual_evidence_interface', False))}"
+            )
             print("  detached posterior-guided refinement config: YES")
             print("  boundary-structured BAPGR config: YES")
             print(

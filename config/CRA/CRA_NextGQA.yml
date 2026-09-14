@@ -34,22 +34,18 @@ model:
   prop_num: 1
 
   # ------------------------------------------------------------
-  # Original CRA settings are kept unchanged for controlled
-  # comparison with CRA and previous Q-Bound versions.
+  # CRA remains only the downstream VideoQA testbed/consumer.
   #
-  # IMPORTANT V1.10.2:
-  #   window_sizes remains [1,3,5] ONLY for:
-  #     (1) the original CRA grounding path, and
-  #     (2) controlled fixed-window diagnostics.
+  # V1.11-A controlled change:
+  #   * VisualIntervention remains OFF, following the V1.10.3 ablation.
+  #   * CRA still keeps its own VideoEmbedding and downstream x_bar.
+  #   * Q-Bound no longer consumes CRA.VideoEmbedding output.
+  #   * Q-Bound receives the sampled raw CLIP-L feature tensor directly
+  #     and applies its own trainable generic input adapter.
   #
-  #   The MAIN Q-Bound V1.10.2 interval does NOT come from the
-  #   fixed-window search. It is produced by boundary-anchored
-  #   posterior-guided refinement followed by posterior-stable
-  #   reliability calibration.
-  #
-  # causal_feature_path + do:true still belong to the downstream
-  # CRA testbed. They are not inputs to Q-Bound DECOMPOSE,
-  # RELATE, COMPOSE, REFINE, or reliability calibration.
+  # window_sizes remains [1,3,5] only for the original CRA path and
+  # controlled grounding/readout diagnostics. The official Q-Bound MAIN
+  # interval is still produced by COMPOSE + BAPGR + PPBR + PSRC.
   # ------------------------------------------------------------
   sigma: 3.0
   gamma: 1
@@ -57,91 +53,115 @@ model:
   window_sizes: [1, 3, 5]
   time_penalty: null
 
-  do: true
+  # V1.10.3 showed no material loss from disabling CRA VisualIntervention
+  # and healthier Q-Bound internal dynamics, so keep it OFF in V1.11.
+  do: false
+
   vg_loss: 1
   vote: 0
 
   # ============================================================
-  # Q-Bound V1.10.2
+  # Q-Bound V1.11-A — GENERIC INPUT DECOUPLING
   #
-  #   DECOMPOSE -> RELATE -> COMPOSE
-  #             -> DETACHED COMPOSER POSTERIOR
-  #             -> BOUNDARY-ANCHORED POSTERIOR-GUIDED PRIOR (BAPGR)
-  #             -> PRIOR-PRESERVING BOUNDED REFINEMENT (PPBR)
-  #             -> POSTERIOR-STABLE RELIABILITY CALIBRATION (PSRC)
-  #             -> GROUND
+  # Data route:
   #
-  # Failure diagnosed in V1.10.1:
-  #   * BAPGR successfully changed the Composer pair prior:
-  #       - fewer effective pairs,
-  #       - stronger endpoint preference,
-  #       - longer expected prior span.
-  #   * Extreme V1.9 point-collapse was reduced, but the learned
-  #     Refiner correction still became increasingly dominant.
-  #   * RAW expected support contracted from broad BAPGR evidence
-  #     to a much shorter answer-discriminative region.
-  #   * semantic retention fell sharply while Refiner confidence
-  #     and information gain increased.
-  #   * PSRC correctly reduced reliability, so MAIN stayed close
-  #     to Composer and IoP / Acc&GQA improved little.
+  #   sampled raw CLIP-L [B,T,768]
+  #          |                         |
+  #          |                         +--> CRA.VideoEmbedding --> CRA consumer
+  #          |
+  #          +--> Q-Bound-owned generic input adapter
+  #                    |
+  #                    v
+  #              DECOMPOSE -> RELATE -> COMPOSE
+  #                    -> detached Composer posterior
+  #                    -> BAPGR
+  #                    -> PPBR
+  #                    -> PSRC
+  #                    -> GROUND
   #
-  # V1.10.2 changes ONLY the learned Refiner update:
+  # The principal V1.11-A mechanism change is ONLY the input contract:
   #
-  #     delta     = pair_logits / temperature
-  #     delta_hat = c * tanh(delta / c)
-  #     p_refine  propto p_BAPGR * exp(delta_hat)
+  #   V1.10.3:
+  #     raw CLIP-L -> CRA.VideoEmbedding -> Q-Bound
   #
-  #   where c = correction_cap.
+  #   V1.11-A:
+  #     raw CLIP-L -> Q-Bound-owned generic adapter -> Q-Bound
   #
-  # This keeps the Refiner differentiable and able to re-rank
-  # legal start/end pairs, but prevents its correction from
-  # overriding the structural prior without bound.
+  # CRA remains the downstream answer consumer for this version so that
+  # the effect of input decoupling can be measured without simultaneously
+  # replacing the answer head/output adapter.
   #
-  # V1.10.2 preserves:
-  #   * dynamic DECOMPOSE;
-  #   * Q-OEI RELATE;
-  #   * latent contiguous COMPOSE;
-  #   * BAPGR boundary geometry;
-  #   * detached Composer -> Refiner routing;
-  #   * PSRC unchanged;
-  #   * CRA answer machinery and VisualIntervention unchanged;
-  #   * the same training objective and optimizer settings.
+  # The generic adapter is owned by QBoundCore and is initialized close
+  # to the raw feature geometry (identity-initialized projection), then:
   #
-  # Controlled V1.10.2 objective remains:
+  #     Linear(768->768)
+  #       -> GELU
+  #       -> LayerNorm
+  #       -> fixed sinusoidal positional encoding
+  #       -> Dropout
+  #
+  # V1.11-A preserves V1.10.3 temporal mechanisms unchanged:
+  #   * dynamic DECOMPOSE
+  #   * Q-OEI RELATE
+  #   * latent contiguous COMPOSE
+  #   * BAPGR boundary geometry
+  #   * detached Composer -> Refiner routing
+  #   * PPBR cap = 2.0
+  #   * PSRC reliability calibration
+  #   * no CRA temporal prior/handover
+  #   * no direct event-token answer residual
+  #
+  # Training objective remains:
+  #
   #   L = L_CRA/main + 0.10 L_align + 0.10 L_decomp
   #
-  # No temporal GT, target duration, minimum-span constraint,
-  # IoU/IoP loss, minimality loss, entropy loss, or learned
-  # reliability gate is introduced.
+  # CREDiT-inspired counterfactual evidence training is deliberately OFF
+  # in V1.11-A. The first run isolates generic-input decoupling. A later
+  # V1.11-B can enable the counterfactual interface/loss as a separate
+  # ablation.
+  #
+  # No temporal GT, IoU/IoP loss, duration target, minimum-span rule,
+  # minimality/sparsity loss, event-count forcing, or learned reliability
+  # gate is introduced.
   # ============================================================
   qbound:
     enabled: true
-    version: "1.10.2"
+    version: "1.11"
 
     # ----------------------------------------------------------
     # Generic Q-Bound interface / capacity
     # ----------------------------------------------------------
     hidden_dim: 256
 
-    # Computational upper bound only.
-    # Actual event count remains dynamically selected:
-    #   1 <= M <= max_events
+    # Computational upper bound only; event count remains dynamic.
     max_events: 4
 
-    # Q-Bound temporal reasoning uses question-only semantics.
-    # Candidate-answer semantics must not define topology,
-    # event chains, or fine boundaries.
+    # Q-Bound topology/reasoning uses question-only semantics.
     require_question_only: true
 
     # CRA temporal key/prior is not consumed by Q-Bound.
     use_temporal_prior: false
 
-    # Controlled setting retained from V1.9.
-    # Q-Bound learns its own parameters while raw video/question
-    # inputs are detached from the upstream backbone via this path.
+    # Raw CLIP-L/question features are detached from external encoders via
+    # this route; Q-Bound's own adapter/core parameters remain trainable.
     detach_backbone_inputs: true
 
     dropout: 0.3
+
+    # ----------------------------------------------------------
+    # V1.11-A: Q-Bound-owned generic visual input adapter
+    # ----------------------------------------------------------
+    use_generic_input_adapter: true
+
+    # Keep equal to Q-Bound dropout for the first controlled run.
+    input_adapter_dropout: 0.3
+
+    # Preserve explicit temporal order without using CRA.VideoEmbedding.
+    input_adapter_use_position: true
+
+    # OFF in V1.11-A. Enable only in the separate V1.11-B
+    # counterfactual-evidence experiment.
+    counterfactual_evidence_interface: false
 
     # ----------------------------------------------------------
     # Question-conditioned temporal geometry
@@ -151,7 +171,6 @@ model:
     # ----------------------------------------------------------
     # DECOMPOSE: dynamic boundary proposals
     # ----------------------------------------------------------
-    # Unchanged to isolate the V1.10.2 PPBR correction change.
     boundary_temperature: 0.7
     boundary_threshold: 0.5
     boundary_radius: 2
@@ -164,11 +183,7 @@ model:
     # ----------------------------------------------------------
     decomposition:
       enabled: true
-
-      # total_loss += loss_weight * L_decomp
       loss_weight: 0.10
-
-      # Internal partition-energy terms remain unchanged.
       complexity_weight: 1.25
       boundary_weight: 0.50
       temperature: 0.20
@@ -183,12 +198,6 @@ model:
     # ----------------------------------------------------------
     # COMPOSE: Latent Contiguous Event-Span Composer
     # ----------------------------------------------------------
-    # Scorer and temperature stay unchanged from V1.9.
-    #
-    # V1.10.2 preserves:
-    #   * differentiable Composer posterior/support for MAIN;
-    #   * hard top-1 Composer readout only as a diagnostic branch;
-    #   * detached multi-candidate posterior on the REFINE route.
     composer:
       enabled: true
       type: latent_contiguous_event_span
@@ -196,34 +205,15 @@ model:
 
     # ----------------------------------------------------------
     # REFINE:
-    # Boundary-Anchored Posterior-Guided Refinement (BAPGR)
-    # + Prior-Preserving Bounded Refinement (PPBR)
-    # + Posterior-Stable Reliability Calibration (PSRC)
+    # BAPGR + PPBR + PSRC
     # ----------------------------------------------------------
     refinement:
       enabled: true
       type: prior_preserving_bounded_refiner
 
-      # Keep Refiner temperature unchanged for a clean
-      # V1.10.1 -> V1.10.2 comparison.
+      # Unchanged from V1.10.2/V1.10.3.
       temperature: 0.30
-
-      # BAPGR geometry remains unchanged.
-      #
-      # power = 1.0 : mild endpoint anchoring
-      # power = 2.0 : controlled V1.10.1/V1.10.2 setting
-      # larger      : stronger endpoint anchoring
-      #
-      # This is a structural prior, NOT a span-length loss.
       boundary_anchor_power: 2.0
-
-      # V1.10.2 PPBR trust-region cap.
-      #
-      # delta_hat = correction_cap * tanh(delta / correction_cap)
-      #
-      # First controlled run: c = 2.0.
-      # This bounds the learned correction; it does NOT impose
-      # a target duration or a minimum temporal span.
       correction_cap: 2.0
 
       # Routing contract.
@@ -233,59 +223,50 @@ model:
       posterior_stable_reliability: true
       boundary_structured: true
 
-      # No V1.7/V1.8 auxiliary routing losses or learned gate.
-      # Reliability remains parameter-free and detached.
-
     # ----------------------------------------------------------
-    # Weak semantic alignment inherited from V1.2+
+    # Weak question/event semantic alignment
     # ----------------------------------------------------------
     weak_align_weight: 0.10
     weak_align_temperature: 0.07
 
     # ----------------------------------------------------------
-    # Deliberately NOT introduced in the first V1.10.2 run
+    # V1.11-A controlled exclusions
     # ----------------------------------------------------------
     # No:
+    #   counterfactual answer loss (reserved for V1.11-B)
     #   temporal-GT supervision
     #   supervised start/end loss
     #   direct span-length target
     #   minimum-span constraint
-    #   minimal-sufficient loss
+    #   minimal-sufficient / sparsity loss
     #   coarse-answer auxiliary loss
     #   trim target
     #   IoU / IoP optimization loss
     #   Refiner entropy loss
-    #   Composer entropy loss
-    #   Composer length/diversity/balance loss
+    #   Composer entropy/diversity/balance loss
     #   event-count forcing
-    #   CRA -> Q-Bound handover
+    #   CRA -> Q-Bound temporal handover
     #   direct reasoned-event -> answer residual
     #   CRA consistency loss
     #   differentiable all-span REFINE marginalization
     #
-    # First-run goal:
-    #   1) prevent the V1.10.1 learned Refiner correction from
-    #      progressively overriding the BAPGR prior;
-    #   2) raise RAW/prior expected-length ratio above the
-    #      V1.10.1 collapse regime while preserving real refinement;
-    #   3) increase semantic retention and RAW IoU without a large
-    #      RAW IoP penalty;
-    #   4) allow PSRC reliability to rise naturally only when RAW
-    #      becomes genuinely useful;
-    #   5) improve MAIN IoP / TIoP@0.5 / Acc&GQA while preserving
-    #      MAIN IoU coverage.
+    # First-run goals:
+    #   1) verify Q-Bound can learn from raw sampled CLIP-L features without
+    #      consuming CRA.VideoEmbedding representations;
+    #   2) preserve or improve mIoP / mIoU / TIoP@0.5 / Acc&GQA relative
+    #      to V1.10.3;
+    #   3) verify the generic adapter receives gradients and does not destroy
+    #      CLIP geometry (token cosine / delta-ratio diagnostics);
+    #   4) keep BAPGR/PPBR/PSRC dynamics healthy while reducing CRA-specific
+    #      representation dependence;
+    #   5) establish a clean baseline before V1.11-B counterfactual evidence
+    #      training and V1.12 generic output/event adapter.
 
 optim:
   pipeline: cra
   optimizer: Adam
 
-  # Original CRA objectives remain unchanged.
-  #
-  # CRAPipeline V1.10.2 adds only:
-  #   + weak_align_weight * L_align
-  #   + decomposition.loss_weight * L_decomp
-  #
-  # No new V1.10.2 routing/reliability/span-length loss.
+  # Same controlled task objective as V1.10.3.
   loss:
     ce:
       vq: 1
@@ -298,11 +279,10 @@ optim:
   weight_decay: 0
   amsgrad: true
 
-  # All decoder.qbound.* parameters, including Composer and REFINE,
-  # use the dedicated Q-Bound optimizer group.
+  # All decoder.qbound.* parameters, including the new generic input adapter,
+  # Composer and Refiner, should use this dedicated Q-Bound optimizer group.
   qbound_lr: 5.e-5
 
-  # Same budget as V1.9 for a controlled comparison.
   epochs: 15
   save_period: 1
 
@@ -319,13 +299,12 @@ stat:
 
   record_dir: ./output
 
-  # Start V1.10.2 from scratch.
-  # PPBR changes Refiner training dynamics, so resuming a
-  # V1.10.1 checkpoint would not be a clean controlled experiment.
+  # Start V1.11-A from scratch. The Q-Bound input distribution/adapter has
+  # changed, so resuming a V1.10.x checkpoint would confound the ablation.
   resume: null
 
 misc:
-  running_name: CRA/NextGQA/QBound_v1.10.2_seed2024
-  info: "CRA testbed + Q-Bound V1.10.2 | dynamic latent decomposition + ordered event reasoning + latent contiguous event-span composition + BAPGR + prior-preserving bounded refinement (PPBR, cap=2.0) + posterior-stable reliability calibration (PSRC) + grounding"
+  running_name: CRA/NextGQA/QBound_v1.11A_generic_input_seed2024
+  info: "CRA downstream testbed + Q-Bound V1.11-A | raw CLIP-L -> Q-Bound-owned generic input adapter | VisualIntervention OFF | dynamic DECOMPOSE + Q-OEI + COMPOSE + BAPGR + PPBR(cap=2.0) + PSRC | counterfactual evidence training OFF"
   cuda: "0"
   seed: 2024

@@ -110,11 +110,13 @@ class DecoderLayer(nn.Module):
 
 class Decoder(nn.Module):
     """
-    CRA refinement decoder with Q-Bound Version 1.10.2.
+    CRA refinement decoder with Q-Bound Version 1.11.
 
-    V1.10.2 follows:
+    V1.11 preserves the V1.10.2 temporal mechanism and adds an independent
+    generic visual-input contract:
 
-        DECOMPOSE -> RELATE -> COMPOSE
+        raw/frozen visual tokens -> Q-Bound-owned input adapter
+                                 -> DECOMPOSE -> RELATE -> COMPOSE
                            -> BOUNDARY-ANCHORED POSTERIOR-GUIDED REFINE
                            -> PRIOR-PRESERVING BOUNDED REFINEMENT
                            -> POSTERIOR-STABLE RELIABILITY CALIBRATION
@@ -151,6 +153,15 @@ class Decoder(nn.Module):
     Therefore V1.10.2 does NOT restore the V1.6 differentiable all-span
     Composer x Refiner marginalization. REFINE cannot train Composer through
     its search prior. PPBR is parameter-free apart from a fixed correction cap.
+
+    V1.11 input contract:
+      * CRA-side ``x`` remains the downstream testbed representation.
+      * ``qbound_video_tokens`` must be passed explicitly and must contain the
+        pre-CRA generic feature sequence (e.g. sampled CLIP-L [B,T,768]).
+      * Q-Bound owns the trainable generic input adapter; no CRA temporal key
+        or CRA VideoEmbedding output is used as its visual input.
+      * the calibrated temporal output is still consumed by CRA ``x_bar`` in
+        this version so input decoupling is isolated from output-adapter work.
 
     The official answer-space representations are:
 
@@ -193,7 +204,7 @@ class Decoder(nn.Module):
 
         self.embed_dim = embed_dim
         self.cfgs = cfgs
-        self.qbound_version = "1.10.2"
+        self.qbound_version = "1.11"
 
         self.layers = clones(
             DecoderLayer(
@@ -256,7 +267,7 @@ class Decoder(nn.Module):
         self.do = VisualIntervention(self.cfgs)
 
         # --------------------------------------------------------------
-        # Q-Bound V1.10.2
+        # Q-Bound V1.11
         # --------------------------------------------------------------
         self.qbound_enabled = bool(
             qbound_cfg.get(
@@ -397,6 +408,32 @@ class Decoder(nn.Module):
                         refinement_cfg.get("correction_cap", 2.0),
                     )
                 ),
+                # V1.11: Q-Bound owns its generic visual input adapter.
+                # The caller passes raw/frozen visual features directly; these
+                # parameters are not shared with CRA.VideoEmbedding.
+                use_generic_input_adapter=bool(
+                    qbound_cfg.get("use_generic_input_adapter", True)
+                ),
+                input_adapter_dropout=float(
+                    qbound_cfg.get(
+                        "input_adapter_dropout",
+                        qbound_cfg.get(
+                            "dropout",
+                            model_cfg.get("qbound_dropout", dropout),
+                        ),
+                    )
+                ),
+                input_adapter_use_position=bool(
+                    qbound_cfg.get("input_adapter_use_position", True)
+                ),
+                # V1.11-A keeps this disabled. V1.11-B may enable the
+                # counterfactual evidence interface without changing the core.
+                counterfactual_evidence_interface=bool(
+                    qbound_cfg.get(
+                        "counterfactual_evidence_interface",
+                        False,
+                    )
+                ),
             )
 
             if str(getattr(self.qbound, "qbound_version", "")) != self.qbound_version:
@@ -406,7 +443,7 @@ class Decoder(nn.Module):
                     f"core={getattr(self.qbound, 'qbound_version', None)!r}."
                 )
 
-            # Controlled first V1.10.2 experiment: Q-Bound learns its own
+            # V1.11 keeps external visual/language encoders detached while Q-Bound learns its own
             # parameters without changing the upstream video/language
             # representation through the Q-Bound input path.
             self.qbound_detach_backbone_inputs = bool(
@@ -723,6 +760,7 @@ class Decoder(nn.Module):
         window_sizes=(1, 3, 5),
         use_qbound=False,
         question_feature=None,
+        qbound_video_tokens=None,
         qbound_mix=1.0,
         use_gpeb=None,
     ):
@@ -732,8 +770,12 @@ class Decoder(nn.Module):
         if use_gpeb is not None:
             use_qbound = bool(use_qbound or use_gpeb)
 
-        # Raw pre-CRA-refinement video tokens are the generic Q-Bound input.
-        x_raw = x
+        # V1.11 contract:
+        #   x                   = CRA-side VideoEmbedding output used only by
+        #                         the downstream CRA testbed/consumer.
+        #   qbound_video_tokens = raw/generic visual features (e.g. CLIP-L)
+        #                         routed independently into Q-Bound.
+        # Q-Bound must no longer silently fall back to CRA-embedded tokens.
 
         # CRA refinement remains the downstream testbed representation.
         for layer in self.layers:
@@ -841,7 +883,7 @@ class Decoder(nn.Module):
                 and self.qbound_require_question_only
             ):
                 raise ValueError(
-                    "Q-Bound V1.10.2 requires question_feature=[B,D]. "
+                    "Q-Bound V1.11 requires question_feature=[B,D]. "
                     "Pass question-only features through CRA.forward(...)."
                 )
 
@@ -851,23 +893,77 @@ class Decoder(nn.Module):
                 else qa
             )
 
+            if qbound_video_tokens is None:
+                raise ValueError(
+                    "Q-Bound V1.11 requires qbound_video_tokens=[B,T,D] "
+                    "containing the raw/generic visual feature sequence. "
+                    "Do not reuse CRA VideoEmbedding output as an implicit "
+                    "fallback; pass the pre-CRA feature tensor explicitly."
+                )
+            if qbound_video_tokens.ndim != 3:
+                raise ValueError(
+                    "qbound_video_tokens must be [B,T,D], got "
+                    f"{tuple(qbound_video_tokens.shape)}."
+                )
+            if qbound_video_tokens.size(0) != batch_size:
+                raise ValueError(
+                    "qbound_video_tokens batch mismatch: expected "
+                    f"{batch_size}, got {qbound_video_tokens.size(0)}."
+                )
+            if qbound_video_tokens.size(1) != time_steps:
+                raise ValueError(
+                    "qbound_video_tokens temporal length must match CRA "
+                    f"tokens/mask: expected {time_steps}, got "
+                    f"{qbound_video_tokens.size(1)}."
+                )
+            if qbound_video_tokens.size(-1) != self.embed_dim:
+                raise ValueError(
+                    "Controlled V1.11 currently expects generic visual "
+                    f"dimension {self.embed_dim}; got "
+                    f"{qbound_video_tokens.size(-1)}."
+                )
+            qbound_video_tokens = qbound_video_tokens.to(
+                device=x_bar.device,
+                dtype=x_bar.dtype,
+            )
+
             if self.qbound_detach_backbone_inputs:
-                video_for_qbound = x_raw.detach()
+                video_for_qbound = qbound_video_tokens.detach()
                 language_for_qbound = qbound_language.detach()
             else:
-                video_for_qbound = x_raw
+                video_for_qbound = qbound_video_tokens
                 language_for_qbound = qbound_language
 
             qbound_aux = self.qbound(
                 video_tokens=video_for_qbound,
                 question_features=language_for_qbound,
                 video_mask=valid_mask,
-                contextual_tokens=video_for_qbound,
+                # None tells V1.11 core to reuse the exact adapted generic
+                # stream for context, avoiding a second independent dropout
+                # realization and any hidden CRA representation dependency.
+                contextual_tokens=None,
                 temporal_prior=None,
             )
 
             required_keys = {
-                # Official V1.10.2 MAIN.
+                # V1.11 generic-input / counterfactual interface.
+                "qbound_version",
+                "generic_input_adapter_enabled",
+                "generic_input_position_enabled",
+                "generic_input_context_reuse",
+                "generic_input_raw_rms",
+                "generic_input_adapted_rms",
+                "generic_input_token_cosine",
+                "generic_input_delta_ratio",
+                "generic_context_raw_rms",
+                "generic_context_adapted_rms",
+                "counterfactual_evidence_interface_enabled",
+                "counterfactual_keep_support",
+                "counterfactual_remove_support",
+                "counterfactual_keep_fraction",
+                "counterfactual_remove_fraction",
+
+                # Official V1.11 MAIN (BAPGR/PPBR/PSRC retained).
                 "event_temporal_prob",
                 "main_temporal_prob",
                 "main_temporal_logits",
@@ -1080,8 +1176,35 @@ class Decoder(nn.Module):
             missing = sorted(required_keys.difference(qbound_aux))
             if missing:
                 raise KeyError(
-                    "Q-Bound V1.10.2 output is missing: "
+                    "Q-Bound V1.11 output is missing: "
                     + ", ".join(missing)
+                )
+
+            if str(qbound_aux["qbound_version"]) != self.qbound_version:
+                raise RuntimeError(
+                    "RefineDecoder/QBoundCore V1.11 runtime version mismatch: "
+                    f"decoder={self.qbound_version!r}, "
+                    f"core={qbound_aux['qbound_version']!r}."
+                )
+            if float(
+                qbound_aux["generic_input_adapter_enabled"].detach().item()
+            ) != float(
+                bool(
+                    self.cfgs.get("model", {})
+                    .get("qbound", {})
+                    .get("use_generic_input_adapter", True)
+                )
+            ):
+                raise RuntimeError(
+                    "Q-Bound V1.11 generic input adapter flag does not "
+                    "match model.qbound.use_generic_input_adapter."
+                )
+            if float(
+                qbound_aux["generic_input_context_reuse"].detach().item()
+            ) != 1.0:
+                raise RuntimeError(
+                    "Controlled V1.11 expects Q-Bound to reuse one adapted "
+                    "generic visual stream for raw/context states."
                 )
 
             # Fail early if a V1.8/V1.6 routing contract is accidentally loaded.
@@ -1496,7 +1619,51 @@ class Decoder(nn.Module):
 
         if qbound_aux is not None:
             # ----------------------------------------------------------
-            # 5) Generic event / weak-alignment outputs.
+            # 5) V1.11 generic-input / counterfactual evidence interface.
+            # These diagnostics establish that Q-Bound consumes the explicit
+            # pre-CRA feature stream. Counterfactual supports are exposed only
+            # as an interface here; answer-level intervention/loss belongs to
+            # the downstream consumer, not to QBoundCore/RefineDecoder.
+            # ----------------------------------------------------------
+            v111_interface_keys = [
+                "generic_input_adapter_enabled",
+                "generic_input_position_enabled",
+                "generic_input_context_reuse",
+                "generic_input_raw_rms",
+                "generic_input_adapted_rms",
+                "generic_input_token_cosine",
+                "generic_input_delta_ratio",
+                "generic_context_raw_rms",
+                "generic_context_adapted_rms",
+                "counterfactual_evidence_interface_enabled",
+                "counterfactual_keep_support",
+                "counterfactual_remove_support",
+                "counterfactual_keep_fraction",
+                "counterfactual_remove_fraction",
+            ]
+            for key in v111_interface_keys:
+                time_param[f"qbound_{key}"] = qbound_aux[key]
+
+            time_param["qbound_input_is_generic"] = torch.as_tensor(
+                1.0,
+                dtype=video_proj.dtype,
+                device=video_proj.device,
+            )
+            time_param["qbound_input_uses_cra_embedding"] = torch.as_tensor(
+                0.0,
+                dtype=video_proj.dtype,
+                device=video_proj.device,
+            )
+
+            qbound_aux["qbound_input_is_generic"] = time_param[
+                "qbound_input_is_generic"
+            ]
+            qbound_aux["qbound_input_uses_cra_embedding"] = time_param[
+                "qbound_input_uses_cra_embedding"
+            ]
+
+            # ----------------------------------------------------------
+            # 6) Generic event / weak-alignment outputs.
             # ----------------------------------------------------------
             time_param["qbound_event_visual_tokens"] = (
                 qbound_aux["event_visual_tokens"]
@@ -1542,7 +1709,7 @@ class Decoder(nn.Module):
             )
 
             # ----------------------------------------------------------
-            # 6) RELATE / Q-OEI outputs.
+            # 7) RELATE / Q-OEI outputs.
             # ----------------------------------------------------------
             time_param["qbound_event_tokens"] = (
                 qbound_aux["event_tokens"]
@@ -1567,7 +1734,7 @@ class Decoder(nn.Module):
             )
 
             # ----------------------------------------------------------
-            # 7) DECOMPOSE outputs.
+            # 8) DECOMPOSE outputs.
             # ----------------------------------------------------------
             decompose_direct = [
                 "event_assignment",
@@ -1602,7 +1769,7 @@ class Decoder(nn.Module):
                     time_param[f"qbound_{key}"] = qbound_aux[key]
 
             # ----------------------------------------------------------
-            # 8) COMPOSE outputs.
+            # 9) COMPOSE outputs.
             # ----------------------------------------------------------
             composer_keys = [
                 "span_candidate_event_mask",
@@ -1656,7 +1823,7 @@ class Decoder(nn.Module):
 
             # ----------------------------------------------------------
             # ----------------------------------------------------------
-            # 9) V1.10.2 BAPGR + PPBR REFINE + POSTERIOR-STABLE RELIABILITY outputs.
+            # 10) V1.11 BAPGR + PPBR REFINE + POSTERIOR-STABLE RELIABILITY outputs.
             # ----------------------------------------------------------
             refiner_keys = [
                 "refiner_enabled",
@@ -2443,6 +2610,7 @@ class Decoder(nn.Module):
                 dtype=video_proj.dtype,
                 device=video_proj.device,
             )
+            qbound_aux["qbound_version"] = self.qbound_version
 
             # Old counterfactual/merge interfaces remain disabled.
             qbound_aux["merge_reasoning_counterfactual"] = torch.as_tensor(
