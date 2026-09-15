@@ -45,7 +45,8 @@ class QBoundCore(nn.Module):
     temporal ground truth.  The downstream training pipeline may use the GT
     answer to construct a stop-gradient functional KEEP-vs-MERGE target for
     each valid adjacent pair.  To support that training objective, the core
-    exposes detached source visual states for left/right/merged adjacent units.
+    exposes the learned cut field; the downstream CRA consumer provides the
+    detached answer-space KEEP/MERGE consequence signal.
 
     Temporal GT remains evaluation-only.
 
@@ -68,8 +69,8 @@ class QBoundCore(nn.Module):
     ----------
     Composition decisions are only made between adjacent temporal tokens, so
     the cut field is O(T).  Long-range reasoning uses a small constant number
-    of query anchors, giving O(T * R) rather than O(T^2) event interactions.
-    The final factorized span decoder is O(T).
+    of adjacent temporal states, giving O(T) temporal reasoning rather
+    than O(T^2) event interactions. The final factorized span decoder is O(T).
     """
 
     def __init__(
@@ -83,7 +84,6 @@ class QBoundCore(nn.Module):
         cut_temperature: float = 1.0,
         cut_threshold: float = 0.5,
         question_residual_scale: float = 1.0,
-        num_anchor_heads: int = 4,
         num_local_reasoning_layers: int = 2,
     ) -> None:
         super().__init__()
@@ -102,8 +102,6 @@ class QBoundCore(nn.Module):
             raise ValueError("cut_threshold must be in (0, 1).")
         if question_residual_scale <= 0.0:
             raise ValueError("question_residual_scale must be positive.")
-        if num_anchor_heads < 1:
-            raise ValueError("num_anchor_heads must be >= 1.")
         if num_local_reasoning_layers < 1:
             raise ValueError("num_local_reasoning_layers must be >= 1.")
 
@@ -117,7 +115,6 @@ class QBoundCore(nn.Module):
         self.cut_temperature = float(cut_temperature)
         self.cut_threshold = float(cut_threshold)
         self.question_residual_scale = float(question_residual_scale)
-        self.num_anchor_heads = int(num_anchor_heads)
         self.num_local_reasoning_layers = int(num_local_reasoning_layers)
 
         # ------------------------------------------------------------------
@@ -253,29 +250,11 @@ class QBoundCore(nn.Module):
         )
 
         # ------------------------------------------------------------------
-        # 5. Linear-cost sparse global reasoning through a constant number of
-        #    query anchors.  R is a compute budget, NOT an event-count cap.
+        # 5. Final normalization after boundary-gated local reasoning.
         # ------------------------------------------------------------------
-        self.anchor_score = nn.Sequential(
-            nn.Linear(hidden_dim * 3, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, self.num_anchor_heads),
-        )
-        self.anchor_query_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.anchor_key_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.anchor_value_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.anchor_update = nn.Sequential(
-            nn.Linear(hidden_dim * 4, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-        self.anchor_update_gate = nn.Sequential(
-            nn.Linear(hidden_dim * 3, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 1),
-        )
+        # V2.0.0 deliberately has NO global video-attention/anchor bypass here.
+        # Every temporal interaction before grounding must cross the learned
+        # merge gates, otherwise the model could ignore functional composition.
         self.reasoning_norm = nn.LayerNorm(hidden_dim)
 
         # ------------------------------------------------------------------
@@ -772,70 +751,19 @@ class QBoundCore(nn.Module):
         )
         local_states = local_states * video_mask.to(local_states.dtype).unsqueeze(-1)
 
-        # Constant-size query anchors provide non-local interaction without an
-        # all-pairs event graph.
-        anchor_logits = self.anchor_score(
-            torch.cat(
-                [local_states, q_frames, local_states * q_frames], dim=-1
-            )
-        )
-        anchor_mask = video_mask.unsqueeze(-1).expand_as(anchor_logits)
-        anchor_weights = self._masked_softmax(
-            anchor_logits, anchor_mask, dim=1
-        )
-        anchor_tokens = torch.einsum(
-            "btr,bth->brh", anchor_weights, local_states
-        )
-
-        query = self.anchor_query_proj(local_states)
-        key = self.anchor_key_proj(anchor_tokens)
-        value = self.anchor_value_proj(anchor_tokens)
-        anchor_attention_logits = torch.einsum(
-            "bth,brh->btr", query, key
-        ) / float(max(self.hidden_dim, 1)) ** 0.5
-        anchor_attention = torch.softmax(anchor_attention_logits, dim=-1)
-        anchor_context = torch.einsum(
-            "btr,brh->bth", anchor_attention, value
-        )
-
-        update = self.anchor_update(
-            torch.cat(
-                [
-                    local_states,
-                    anchor_context,
-                    local_states * anchor_context,
-                    q_frames,
-                ],
-                dim=-1,
-            )
-        )
-        update_gate = torch.sigmoid(
-            self.anchor_update_gate(
-                torch.cat([local_states, anchor_context, q_frames], dim=-1)
-            ).squeeze(-1)
-        )
-        reasoned_states = self.reasoning_norm(
-            local_states + update_gate.unsqueeze(-1) * update
-        )
+        # No global anchor branch: such a branch would allow information to
+        # cross strong cuts and become a bypass around composition.  The
+        # bidirectional O(T) gated scans above are the complete temporal
+        # interaction path in V2.0.0.
+        reasoned_states = self.reasoning_norm(local_states)
         reasoned_states = (
             reasoned_states * video_mask.to(reasoned_states.dtype).unsqueeze(-1)
         )
-
-        anchor_entropy = self._entropy_from_distribution(
-            anchor_weights.transpose(1, 2), dim=-1
-        )
-        anchor_effective_count = torch.exp(anchor_entropy)
 
         return {
             "forward_reasoned_states": forward_states,
             "backward_reasoned_states": backward_states,
             "local_reasoned_states": local_states,
-            "anchor_logits": anchor_logits,
-            "anchor_weights": anchor_weights,
-            "anchor_tokens": anchor_tokens,
-            "anchor_attention": anchor_attention,
-            "anchor_update_gate": update_gate,
-            "anchor_effective_token_count": anchor_effective_count,
             "reasoned_states": reasoned_states,
         }
 
@@ -1049,6 +977,22 @@ class QBoundCore(nn.Module):
         )
         selected_mask = equilibrium["selected_span_frame_mask"]
 
+        # Score H*/trim/expand with the SAME frame-evidence weighting rule used
+        # by the factual main branch.  Uniform span averaging would make the
+        # verifier measure a different consumer from the one being trained.
+        view_specs = (
+            ("selected_span_frame_mask", "selected_span_frame_weights"),
+            ("trim_left_frame_mask", "trim_left_frame_weights"),
+            ("trim_right_frame_mask", "trim_right_frame_weights"),
+            ("expand_left_frame_mask", "expand_left_frame_weights"),
+            ("expand_right_frame_mask", "expand_right_frame_weights"),
+        )
+        for mask_name, weight_name in view_specs:
+            view_mask = equilibrium[mask_name]
+            equilibrium[weight_name] = self._masked_softmax(
+                frame_evidence_logits, view_mask, dim=-1
+            ).detach()
+
         main_temporal_prob = self._masked_softmax(
             frame_evidence_logits, selected_mask, dim=-1
         )
@@ -1128,8 +1072,6 @@ class QBoundCore(nn.Module):
 
         # Keep the external source tokens for a downstream stop-gradient
         # functional KEEP/MERGE target.  The core itself never sees answers.
-        source_video_tokens = video_tokens.detach()
-
         reasoning_tokens, content_tokens, adapter_diag = (
             self._adapt_generic_video_tokens(video_tokens, video_mask)
         )
@@ -1157,15 +1099,6 @@ class QBoundCore(nn.Module):
             cut_prob=composition["functional_cut_prob"],
             delta_magnitude=dynamics["delta_magnitude"],
             video_mask=video_mask,
-        )
-
-        # Adjacent source views for downstream functional supervision.  They are
-        # detached by construction so a KEEP/MERGE target cannot be gamed by
-        # modifying the target representation in the same backward pass.
-        functional_left_source = source_video_tokens[:, :-1]
-        functional_right_source = source_video_tokens[:, 1:]
-        functional_merge_source = 0.5 * (
-            functional_left_source + functional_right_source
         )
 
         return {
@@ -1225,9 +1158,6 @@ class QBoundCore(nn.Module):
 
             # Functional KEEP/MERGE supervision interface.
             "functional_pair_valid_mask": composition["boundary_mask"],
-            "functional_left_source": functional_left_source,
-            "functional_right_source": functional_right_source,
-            "functional_merge_source": functional_merge_source,
 
             # Direct frame-exact grounding + equilibrium views.
             **grounding,

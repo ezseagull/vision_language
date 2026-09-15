@@ -631,6 +631,7 @@ class CRA(nn.Module):
                 "functional_merge_answer_logits",
                 "functional_left_answer_logits",
                 "functional_right_answer_logits",
+                "functional_full_video_answer_logits",
                 "functional_pair_valid_mask",
                 "functional_verifier_stop_gradient",
                 "teacher_distribution_used",
@@ -669,6 +670,7 @@ class CRA(nn.Module):
                 "functional_merge_answer_logits",
                 "functional_left_answer_logits",
                 "functional_right_answer_logits",
+                "functional_full_video_answer_logits",
             ):
                 functional[key] = self._aggregate_prop_logits(functional[key])
 
@@ -702,6 +704,12 @@ class CRA(nn.Module):
                     )
 
             expected_view_shape = (batch_size, num_candidates)
+            if functional["functional_full_video_answer_logits"].shape != expected_view_shape:
+                raise ValueError(
+                    "functional_full_video_answer_logits must be "
+                    f"{expected_view_shape}, got "
+                    f"{tuple(functional['functional_full_video_answer_logits'].shape)}."
+                )
             for key in (
                 "equilibrium_selected_answer_logits",
                 "equilibrium_trim_left_answer_logits",
@@ -846,6 +854,7 @@ class CRA(nn.Module):
                 "functional_merge_answer_logits",
                 "functional_left_answer_logits",
                 "functional_right_answer_logits",
+                "functional_full_video_answer_logits",
                 "functional_verifier_stop_gradient",
                 # Boundary-equilibrium verifier logits.
                 "equilibrium_selected_answer_logits",

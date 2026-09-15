@@ -265,9 +265,6 @@ class Decoder(nn.Module):
                 question_residual_scale=float(
                     qbound_cfg.get("question_residual_scale", 1.0)
                 ),
-                num_anchor_heads=int(
-                    qbound_cfg.get("num_anchor_heads", 4)
-                ),
                 num_local_reasoning_layers=int(
                     qbound_cfg.get("num_local_reasoning_layers", 2)
                 ),
@@ -459,14 +456,15 @@ class Decoder(nn.Module):
         """
         Local KEEP-vs-MERGE answer evidence for each adjacent temporal pair.
 
-        KEEP preserves the two local states and aggregates their answer logits
-        with log-mean-exp.  MERGE averages the two states before answer scoring.
-        Since the downstream projection is linear, MERGE is the arithmetic mean
-        of the two frame logits; KEEP remains sensitive to a strong answer cue
-        existing on only one side of the boundary.
+        LEFT/RIGHT preserve access to the two local states separately, while
+        MERGE averages them before answer scoring.  The pipeline defines the
+        functional KEEP utility as max(M_left, M_right), not from the auxiliary
+        log-mean-exp tensor.  This directly tests whether keeping the temporal
+        distinction preserves a stronger GT-answer cue than merging it away.
 
-        All returned logits are stop-gradient.  The training pipeline should use
-        the GT-answer margin difference to construct a detached cut target.
+        All returned logits are stop-gradient.  The full-video logits are a
+        detached reliability reference used to suppress weak labels on samples
+        that the current answer consumer cannot solve.
         """
         frame_answer_logits, video_mask = self._detached_frame_answer_logits(
             answer_proj, qbound_aux
@@ -485,12 +483,24 @@ class Decoder(nn.Module):
         keep_logits = torch.logsumexp(stacked, dim=2) - math.log(2.0)
         merge_logits = 0.5 * (left_logits + right_logits)
 
+        # Reliability reference for the weak functional labels.  The verifier
+        # is trusted only on samples where the detached full-video consumer can
+        # already identify the GT answer.
+        full_weights = video_mask.to(frame_answer_logits.dtype)
+        full_weights = full_weights / full_weights.sum(
+            dim=-1, keepdim=True
+        ).clamp_min(1.0)
+        full_video_logits = self._score_detached_temporal_view(
+            frame_answer_logits, full_weights
+        )
+
         mask_f = pair_valid.unsqueeze(-1).to(keep_logits.dtype)
         return {
             "functional_keep_answer_logits": keep_logits * mask_f,
             "functional_merge_answer_logits": merge_logits * mask_f,
             "functional_left_answer_logits": left_logits * mask_f,
             "functional_right_answer_logits": right_logits * mask_f,
+            "functional_full_video_answer_logits": full_video_logits,
             "functional_pair_valid_mask": pair_valid,
             "functional_verifier_stop_gradient": torch.ones(
                 (), dtype=keep_logits.dtype, device=keep_logits.device
