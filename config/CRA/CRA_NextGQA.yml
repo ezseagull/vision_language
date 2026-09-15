@@ -68,8 +68,8 @@ model:
   #                    ↓
   #        functional soft cut field c_t^Q
   #                    ↓
-  #        boundary-gated local reasoning O(T)
-  #          + sparse query anchors O(T*R)
+  #        boundary-gated bidirectional reasoning O(T)
+  #        (no global attention bypass around cuts)
   #                    ↓
   #          factorized start/end heads
   #                    ↓
@@ -124,9 +124,8 @@ model:
     # ----------------------------------------------------------
     # Boundary-gated temporal reasoning
     # ----------------------------------------------------------
-    # num_anchor_heads is a compute budget for sparse global reasoning,
-    # NOT a cap on the number of latent events.
-    num_anchor_heads: 4
+    # All temporal interaction before grounding passes through the learned
+    # boundary gates; there is no global attention bypass in V2.0.0.
     num_local_reasoning_layers: 2
 
     # ----------------------------------------------------------
@@ -211,6 +210,6 @@ stat:
 
 misc:
   running_name: CRA/NextGQA/QBound_v2.0.0_functional_composition_seed2024
-  info: "CRA downstream testbed + Q-Bound V2.0.0 | raw CLIP-L -> temporal dynamics -> video-only boundary prior + bounded question residual -> dynamic functional cut field | no event-count cap | boundary-gated O(T) local reasoning + 4 query anchors | direct start/end grounding | GT-answer KEEP-vs-MERGE functional supervision lambda_comp=0.10 | trim/expand boundary-equilibrium lambda_eq=0.10 | no temporal GT | no 528 hypotheses | no teacher distillation | answer-free grounding inference"
+  info: "CRA downstream testbed + Q-Bound V2.0.0 | raw CLIP-L -> temporal dynamics -> video-only boundary prior + bounded question residual -> dynamic functional cut field | no event-count cap | boundary-gated bidirectional O(T) reasoning with no global bypass | direct start/end grounding | GT-answer KEEP-vs-MERGE functional supervision lambda_comp=0.10 | trim/expand boundary-equilibrium lambda_eq=0.10 | no temporal GT | no 528 hypotheses | no teacher distillation | answer-free grounding inference"
   cuda: "0"
   seed: 2024

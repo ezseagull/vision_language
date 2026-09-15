@@ -129,7 +129,7 @@ class BasePipeline(object):
         Q-Bound learning rate. In V2.0.0 this includes the generic input
         adapter, temporal-dynamics encoder, video-only boundary prior,
         query-adaptive functional composer, boundary-gated reasoner, sparse
-        query-anchor reasoner, and direct start/end grounding heads.
+        boundary-gated temporal reasoner, and direct start/end grounding heads.
         """
         if not self._qbound_enabled():
             return
@@ -485,7 +485,7 @@ class BasePipeline(object):
                 -> video-only boundary prior
                 -> bounded question-conditioned residual
                 -> query-specific soft cut field
-                -> boundary-gated local reasoning + sparse query anchors
+                -> boundary-gated bidirectional O(T) reasoning
                 -> direct start/end grounding
                 -> local boundary-equilibrium supervision
 
@@ -563,6 +563,7 @@ class BasePipeline(object):
             "refinement",
             "counterfactual",
             "counterfactual_evidence_interface",
+            "num_anchor_heads",
         )
         stale_keys = [
             key for key in forbidden_config_keys
@@ -584,7 +585,6 @@ class BasePipeline(object):
         question_residual_scale = float(
             qbound_cfg.get("question_residual_scale", 1.0)
         )
-        num_anchor_heads = int(qbound_cfg.get("num_anchor_heads", 4))
         num_local_reasoning_layers = int(
             qbound_cfg.get("num_local_reasoning_layers", 2)
         )
@@ -614,10 +614,6 @@ class BasePipeline(object):
                 "Controlled Q-Bound V2.0.0 requires "
                 "0 < question_residual_scale <= 1 so the question can "
                 "adjust, but not arbitrarily dominate, the video prior."
-            )
-        if num_anchor_heads < 1:
-            raise ValueError(
-                "Q-Bound V2.0.0 num_anchor_heads must be >= 1."
             )
         if num_local_reasoning_layers < 1:
             raise ValueError(
@@ -729,7 +725,6 @@ class BasePipeline(object):
             "cut_temperature": cut_temperature,
             "cut_threshold": cut_threshold,
             "question_residual_scale": question_residual_scale,
-            "num_anchor_heads": num_anchor_heads,
             "num_local_reasoning_layers": num_local_reasoning_layers,
         }
         for attribute_name, expected_value in expected_core_settings.items():
@@ -780,6 +775,12 @@ class BasePipeline(object):
             "hypothesis_score",
             "ordered_relation_score",
             "event_encoder",
+            "anchor_score",
+            "anchor_query_proj",
+            "anchor_key_proj",
+            "anchor_value_proj",
+            "anchor_update",
+            "anchor_update_gate",
         )
         surviving_attributes = [
             name for name in forbidden_core_attributes
@@ -851,14 +852,6 @@ class BasePipeline(object):
                 "backward_scan_updates",
                 "backward_scan_gates",
                 "local_reasoning_fuse",
-            ),
-            "SPARSE_QUERY_ANCHORS": (
-                "anchor_score",
-                "anchor_query_proj",
-                "anchor_key_proj",
-                "anchor_value_proj",
-                "anchor_update",
-                "anchor_update_gate",
                 "reasoning_norm",
             ),
             "DIRECT_GROUNDING": (
@@ -1029,8 +1022,8 @@ class BasePipeline(object):
             "  boundary-equilibrium verifier: YES (parameter-free, stop-gradient)"
         )
         print(
-            "  local composition complexity: O(T); sparse global reasoning: "
-            f"O(T*R), R={num_anchor_heads}"
+            "  temporal composition/reasoning complexity: O(T); "
+            "no global attention bypass"
         )
         if max_feats > 0:
             print(
