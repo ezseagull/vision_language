@@ -61,7 +61,7 @@ model:
   vote: 0
 
   # ============================================================
-  # Q-Bound V1.11-A — GENERIC INPUT DECOUPLING
+  # Q-Bound V1.11-B — GENERIC INPUT + COUNTERFACTUAL EVIDENCE VALIDATION
   #
   # Data route:
   #
@@ -79,17 +79,22 @@ model:
   #                    -> PSRC
   #                    -> GROUND
   #
-  # The principal V1.11-A mechanism change is ONLY the input contract:
+  # V1.11-B keeps the V1.11-A generic-input route unchanged:
   #
-  #   V1.10.3:
-  #     raw CLIP-L -> CRA.VideoEmbedding -> Q-Bound
+  #   raw CLIP-L -> Q-Bound-owned generic adapter -> Q-Bound
   #
-  #   V1.11-A:
-  #     raw CLIP-L -> Q-Bound-owned generic adapter -> Q-Bound
+  # and adds counterfactual evidence validation on the calibrated MAIN
+  # temporal support:
   #
-  # CRA remains the downstream answer consumer for this version so that
-  # the effect of input decoupling can be measured without simultaneously
-  # replacing the answer head/output adapter.
+  #   X_suff = keep * X + remove * X_donor
+  #   X_nec  = remove * X + keep * X_donor
+  #
+  # where the donor is a deterministic in-batch cyclic sample.
+  #
+  # CRA remains the downstream answer consumer/testbed. The CF path uses
+  # detached CRA features, detached MAIN pooling weights, frozen CRA
+  # projection weights, and detached answer candidates so the added loss
+  # supervises Q-Bound temporal evidence rather than adapting the consumer.
   #
   # The generic adapter is owned by QBoundCore and is initialized close
   # to the raw feature geometry (identity-initialized projection), then:
@@ -111,14 +116,22 @@ model:
   #   * no CRA temporal prior/handover
   #   * no direct event-token answer residual
   #
-  # Training objective remains:
+  # Training objective becomes:
   #
-  #   L = L_CRA/main + 0.10 L_align + 0.10 L_decomp
+  #   L = L_CRA/main
+  #       + 0.10 L_align
+  #       + 0.10 L_decomp
+  #       + 0.05 L_sufficiency
+  #       + 0.05 L_necessity
   #
-  # CREDiT-inspired counterfactual evidence training is deliberately OFF
-  # in V1.11-A. The first run isolates generic-input decoupling. A later
-  # V1.11-B can enable the counterfactual interface/loss as a separate
-  # ablation.
+  # Sufficiency requires the evidence-preserved branch to retain the correct
+  # answer. Necessity requires removing selected evidence to reduce the
+  # correct-answer logit by a margin of 0.20. Necessity is applied only to
+  # samples whose factual MAIN prediction is already correct.
+  #
+  # The V1.11-B counterfactual support uses a mass-preserving gradient view:
+  # forward support is identical to V1.11-A, while the CF loss cannot win by
+  # globally expanding the support toward the full video.
   #
   # No temporal GT, IoU/IoP loss, duration target, minimum-span rule,
   # minimality/sparsity loss, event-count forcing, or learned reliability
@@ -149,7 +162,7 @@ model:
     dropout: 0.3
 
     # ----------------------------------------------------------
-    # V1.11-A: Q-Bound-owned generic visual input adapter
+    # V1.11-B: Q-Bound-owned generic visual input adapter
     # ----------------------------------------------------------
     use_generic_input_adapter: true
 
@@ -159,9 +172,28 @@ model:
     # Preserve explicit temporal order without using CRA.VideoEmbedding.
     input_adapter_use_position: true
 
-    # OFF in V1.11-A. Enable only in the separate V1.11-B
-    # counterfactual-evidence experiment.
-    counterfactual_evidence_interface: false
+    # ON in V1.11-B. QBoundCore exposes a mass-preserving differentiable
+    # MAIN keep/remove support for answer-level counterfactual supervision.
+    counterfactual_evidence_interface: true
+
+    # ----------------------------------------------------------
+    # V1.11-B: counterfactual evidence validation
+    # ----------------------------------------------------------
+    counterfactual:
+      training_enabled: true
+
+      # First controlled run: keep both terms intentionally small so the
+      # factual VQA/alignment/decomposition objectives remain dominant.
+      sufficiency_weight: 0.05
+      necessity_weight: 0.05
+
+      # Require the factual correct-answer logit to exceed the
+      # evidence-removed correct-answer logit by at least this margin.
+      necessity_margin: 0.20
+
+      # Avoid reinforcing evidence for an already-wrong factual answer,
+      # especially in early epochs.
+      necessity_correct_only: true
 
     # ----------------------------------------------------------
     # Question-conditioned temporal geometry
@@ -230,10 +262,9 @@ model:
     weak_align_temperature: 0.07
 
     # ----------------------------------------------------------
-    # V1.11-A controlled exclusions
+    # V1.11-B controlled exclusions
     # ----------------------------------------------------------
     # No:
-    #   counterfactual answer loss (reserved for V1.11-B)
     #   temporal-GT supervision
     #   supervised start/end loss
     #   direct span-length target
@@ -251,22 +282,23 @@ model:
     #   differentiable all-span REFINE marginalization
     #
     # First-run goals:
-    #   1) verify Q-Bound can learn from raw sampled CLIP-L features without
-    #      consuming CRA.VideoEmbedding representations;
-    #   2) preserve or improve mIoP / mIoU / TIoP@0.5 / Acc&GQA relative
-    #      to V1.10.3;
-    #   3) verify the generic adapter receives gradients and does not destroy
-    #      CLIP geometry (token cosine / delta-ratio diagnostics);
-    #   4) keep BAPGR/PPBR/PSRC dynamics healthy while reducing CRA-specific
-    #      representation dependence;
-    #   5) establish a clean baseline before V1.11-B counterfactual evidence
-    #      training and V1.12 generic output/event adapter.
+    #   1) preserve the V1.11-A generic-input independence result;
+    #   2) make selected temporal evidence answer-faithful rather than merely
+    #      confident, using sufficiency + necessity supervision;
+    #   3) improve/retain mIoP, mIoU, TIoP@0.5 and Acc&GQA without introducing
+    #      span-length/minimality supervision;
+    #   4) verify sufficiency confidence stays close to factual confidence
+    #      while evidence-removed confidence decreases;
+    #   5) check that semantic retention/reliability improve without restoring
+    #      Refiner over-trimming or full-video support expansion;
+    #   6) keep the experiment controlled before V1.12 generic output/event
+    #      adapter work.
 
 optim:
   pipeline: cra
   optimizer: Adam
 
-  # Same controlled task objective as V1.10.3.
+  # Preserve the V1.11-A factual objective; V1.11-B adds CF terms in pipeline.
   loss:
     ce:
       vq: 1
@@ -299,12 +331,13 @@ stat:
 
   record_dir: ./output
 
-  # Start V1.11-A from scratch. The Q-Bound input distribution/adapter has
-  # changed, so resuming a V1.10.x checkpoint would confound the ablation.
+  # Start the first V1.11-B run from scratch for the cleanest A->B
+  # comparison. Do not resume from V1.11-A unless intentionally running a
+  # separate fine-tuning ablation.
   resume: null
 
 misc:
-  running_name: CRA/NextGQA/QBound_v1.11A_generic_input_seed2024
-  info: "CRA downstream testbed + Q-Bound V1.11-A | raw CLIP-L -> Q-Bound-owned generic input adapter | VisualIntervention OFF | dynamic DECOMPOSE + Q-OEI + COMPOSE + BAPGR + PPBR(cap=2.0) + PSRC | counterfactual evidence training OFF"
+  running_name: CRA/NextGQA/QBound_v1.11B_counterfactual_evidence_seed2024
+  info: "CRA downstream testbed + Q-Bound V1.11-B | raw CLIP-L -> Q-Bound-owned generic input adapter | VisualIntervention OFF | dynamic DECOMPOSE + Q-OEI + COMPOSE + BAPGR + PPBR(cap=2.0) + PSRC | mass-preserving counterfactual evidence validation | lambda_suf=0.05 | lambda_nec=0.05 | necessity_margin=0.20 | necessity_correct_only=true"
   cuda: "0"
   seed: 2024

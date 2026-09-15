@@ -163,6 +163,21 @@ class Decoder(nn.Module):
       * the calibrated temporal output is still consumed by CRA ``x_bar`` in
         this version so input decoupling is isolated from output-adapter work.
 
+    V1.11-B counterfactual consumer contract:
+      * QBoundCore exposes the mass-preserving differentiable MAIN support:
+            keep(t), remove(t)=1-keep(t)
+        whose forward values are identical to V1.11-A support.
+      * RefineDecoder creates a deterministic in-batch cyclic donor sequence.
+      * The factual CRA sequence and donor sequence are detached for the
+        counterfactual path, so the new objective cannot reshape CRA x_bar.
+      * MAIN temporal pooling weights are detached for the counterfactual path.
+      * CRA ``video_proj`` weights/bias are also detached for this path.
+      * Therefore answer-level counterfactual gradients are intended to flow
+        through keep/remove support back into Q-Bound, not into the CRA
+        consumer. The ordinary factual MAIN branch remains fully unchanged.
+      * No counterfactual answer loss is computed in this file; the pipeline
+        owns sufficiency/necessity objectives.
+
     The official answer-space representations are:
 
         qbound_calibrated_video_proj     # V1.10.2 MAIN
@@ -291,6 +306,12 @@ class Decoder(nn.Module):
 
         self.qbound_hidden_dim = None
         self.qbound_detach_backbone_inputs = True
+        self.qbound_counterfactual_evidence_interface = bool(
+            qbound_cfg.get(
+                "counterfactual_evidence_interface",
+                False,
+            )
+        )
 
         if self.qbound_enabled:
             self.qbound_hidden_dim = int(
@@ -426,13 +447,10 @@ class Decoder(nn.Module):
                 input_adapter_use_position=bool(
                     qbound_cfg.get("input_adapter_use_position", True)
                 ),
-                # V1.11-A keeps this disabled. V1.11-B may enable the
-                # counterfactual evidence interface without changing the core.
-                counterfactual_evidence_interface=bool(
-                    qbound_cfg.get(
-                        "counterfactual_evidence_interface",
-                        False,
-                    )
+                # V1.11-A keeps this disabled. V1.11-B enables the
+                # mass-preserving counterfactual evidence interface.
+                counterfactual_evidence_interface=(
+                    self.qbound_counterfactual_evidence_interface
                 ),
             )
 
@@ -576,6 +594,79 @@ class Decoder(nn.Module):
             )
 
         return self.video_proj[1](pooled * dropout_mask)
+
+    def _apply_video_projection_frozen(
+        self,
+        pooled,
+        dropout_mask,
+    ):
+        """
+        Apply CRA's answer-space projection as a fixed consumer.
+
+        V1.11-B counterfactual losses must supervise Q-Bound temporal evidence,
+        not update CRA's projection layer.  The factual MAIN branch still uses
+        the ordinary trainable projection helper above.
+        """
+        if pooled.shape != dropout_mask.shape:
+            raise ValueError(
+                "pooled representation and dropout mask must have "
+                "the same shape. Got "
+                f"{tuple(pooled.shape)} and {tuple(dropout_mask.shape)}."
+            )
+
+        linear = self.video_proj[1]
+        weight = linear.weight.detach()
+        bias = (
+            linear.bias.detach()
+            if linear.bias is not None
+            else None
+        )
+        return F.linear(
+            pooled * dropout_mask.detach(),
+            weight,
+            bias,
+        )
+
+    def _project_counterfactual_sequence(
+        self,
+        sequence,
+        temporal_weights,
+        valid_mask,
+        projection_dropout_mask,
+    ):
+        """
+        Pool a counterfactual sequence with a fixed MAIN temporal readout and
+        project it through a frozen CRA consumer.
+
+        Only ``sequence`` may carry counterfactual gradients.  In V1.11-B the
+        sequence depends on Q-Bound keep/remove support while factual/donor
+        features are detached.
+        """
+        if sequence.ndim != 3:
+            raise ValueError(
+                "counterfactual sequence must be [B,T,D]."
+            )
+        if temporal_weights.shape != sequence.shape[:2]:
+            raise ValueError(
+                "counterfactual temporal weights must be [B,T]."
+            )
+        if valid_mask.shape != sequence.shape[:2]:
+            raise ValueError(
+                "counterfactual valid mask must be [B,T]."
+            )
+
+        fixed_weights = self._normalize_temporal_distribution(
+            temporal_weights.detach(),
+            valid_mask,
+        )
+        pooled = torch.sum(
+            sequence * fixed_weights.unsqueeze(-1),
+            dim=1,
+        )
+        return self._apply_video_projection_frozen(
+            pooled,
+            projection_dropout_mask,
+        )
 
     def _project_grounded_video(
         self,
@@ -958,10 +1049,16 @@ class Decoder(nn.Module):
                 "generic_context_raw_rms",
                 "generic_context_adapted_rms",
                 "counterfactual_evidence_interface_enabled",
+                "counterfactual_mass_preserving_gradient_enabled",
+                "counterfactual_raw_keep_support",
+                "counterfactual_raw_remove_support",
+                "counterfactual_raw_keep_fraction",
                 "counterfactual_keep_support",
                 "counterfactual_remove_support",
                 "counterfactual_keep_fraction",
                 "counterfactual_remove_fraction",
+                "counterfactual_support_forward_error",
+                "counterfactual_support_complement_error",
 
                 # Official V1.11 MAIN (BAPGR/PPBR/PSRC retained).
                 "event_temporal_prob",
@@ -1205,6 +1302,54 @@ class Decoder(nn.Module):
                 raise RuntimeError(
                     "Controlled V1.11 expects Q-Bound to reuse one adapted "
                     "generic visual stream for raw/context states."
+                )
+
+            configured_cf_interface = float(
+                self.qbound_counterfactual_evidence_interface
+            )
+            actual_cf_interface = float(
+                qbound_aux[
+                    "counterfactual_evidence_interface_enabled"
+                ].detach().item()
+            )
+            if actual_cf_interface != configured_cf_interface:
+                raise RuntimeError(
+                    "Q-Bound V1.11 counterfactual interface flag mismatch: "
+                    f"decoder={configured_cf_interface}, "
+                    f"core={actual_cf_interface}."
+                )
+
+            actual_mass_guard = float(
+                qbound_aux[
+                    "counterfactual_mass_preserving_gradient_enabled"
+                ].detach().item()
+            )
+            if actual_mass_guard != configured_cf_interface:
+                raise RuntimeError(
+                    "Q-Bound V1.11-B mass-preserving counterfactual "
+                    "gradient guard does not match the configured interface."
+                )
+
+            cf_forward_error = float(
+                qbound_aux[
+                    "counterfactual_support_forward_error"
+                ].detach().max().item()
+            )
+            cf_complement_error = float(
+                qbound_aux[
+                    "counterfactual_support_complement_error"
+                ].detach().max().item()
+            )
+            if cf_forward_error > 1e-6:
+                raise RuntimeError(
+                    "V1.11-B counterfactual gradient view changed the "
+                    "forward MAIN support; max error="
+                    f"{cf_forward_error}."
+                )
+            if cf_complement_error > 1e-6:
+                raise RuntimeError(
+                    "V1.11-B keep/remove supports are not complementary; "
+                    f"max error={cf_complement_error}."
                 )
 
             # Fail early if a V1.8/V1.6 routing contract is accidentally loaded.
@@ -1504,6 +1649,145 @@ class Decoder(nn.Module):
                 x_star_proj=x_star_proj,
             )
 
+            # ----------------------------------------------------------
+            # 3c) V1.11-B COUNTERFACTUAL EVIDENCE CONSUMER.
+            #
+            # The core's mass-preserving keep/remove support is used to
+            # construct two feature-level interventions:
+            #
+            #   X_suff = keep * X + remove * X_donor
+            #   X_nec  = remove * X + keep * X_donor
+            #
+            # Controlled-gradient contract:
+            #   * X / donor X are detached CRA representations;
+            #   * donor assignment is a deterministic cyclic derangement;
+            #   * MAIN temporal pooling weights are detached;
+            #   * CRA video_proj weights are detached;
+            #   * VisualIntervention must remain OFF;
+            #   * gradient therefore flows from future CF answer losses mainly
+            #     into Q-Bound keep/remove support.
+            # ----------------------------------------------------------
+            counterfactual_sufficient_video_proj = None
+            counterfactual_necessary_video_proj = None
+            counterfactual_donor_available = torch.as_tensor(
+                0.0,
+                dtype=x_bar.dtype,
+                device=x_bar.device,
+            )
+            counterfactual_donor_shift = torch.as_tensor(
+                0.0,
+                dtype=x_bar.dtype,
+                device=x_bar.device,
+            )
+            counterfactual_donor_valid_overlap = torch.as_tensor(
+                1.0,
+                dtype=x_bar.dtype,
+                device=x_bar.device,
+            )
+
+            if self.qbound_counterfactual_evidence_interface:
+                if do:
+                    raise RuntimeError(
+                        "Controlled Q-Bound V1.11-B counterfactual training "
+                        "requires model.do=false. VisualIntervention must not "
+                        "enter the counterfactual consumer."
+                    )
+
+                keep_support = qbound_aux[
+                    "counterfactual_keep_support"
+                ]
+                remove_support = qbound_aux[
+                    "counterfactual_remove_support"
+                ]
+
+                if keep_support.shape != valid_mask.shape:
+                    raise ValueError(
+                        "counterfactual_keep_support must match [B,T]."
+                    )
+                if remove_support.shape != valid_mask.shape:
+                    raise ValueError(
+                        "counterfactual_remove_support must match [B,T]."
+                    )
+
+                factual_cf_sequence = x_bar.detach()
+
+                if batch_size > 1:
+                    donor_cf_sequence = torch.roll(
+                        factual_cf_sequence,
+                        shifts=1,
+                        dims=0,
+                    )
+                    donor_valid_mask = torch.roll(
+                        valid_mask,
+                        shifts=1,
+                        dims=0,
+                    )
+                    counterfactual_donor_available = torch.as_tensor(
+                        1.0,
+                        dtype=x_bar.dtype,
+                        device=x_bar.device,
+                    )
+                    counterfactual_donor_shift = torch.as_tensor(
+                        1.0,
+                        dtype=x_bar.dtype,
+                        device=x_bar.device,
+                    )
+                else:
+                    # A one-sample minibatch has no valid in-batch donor.
+                    # Keep the forward finite and expose availability=0 so the
+                    # pipeline can skip the counterfactual loss for this batch.
+                    donor_cf_sequence = factual_cf_sequence
+                    donor_valid_mask = valid_mask
+
+                receiver_valid = valid_mask.to(x_bar.dtype)
+                donor_valid = donor_valid_mask.to(x_bar.dtype)
+                valid_intersection = receiver_valid * donor_valid
+                counterfactual_donor_valid_overlap = (
+                    valid_intersection.sum(dim=-1)
+                    / receiver_valid.sum(dim=-1).clamp_min(1.0)
+                ).mean()
+
+                # NExT-GQA controlled V1.11-B uses fixed T=32 masks.  Fail
+                # loudly rather than silently mixing padded donor positions.
+                if batch_size > 1 and not torch.equal(
+                    donor_valid_mask,
+                    valid_mask,
+                ):
+                    raise RuntimeError(
+                        "Controlled V1.11-B cyclic donor requires identical "
+                        "valid temporal masks within the minibatch. Current "
+                        "NExT-GQA loader should provide fixed T=32 masks."
+                    )
+
+                keep_3d = keep_support.unsqueeze(-1)
+                remove_3d = remove_support.unsqueeze(-1)
+
+                counterfactual_sufficient_sequence = (
+                    keep_3d * factual_cf_sequence
+                    + remove_3d * donor_cf_sequence
+                )
+                counterfactual_necessary_sequence = (
+                    remove_3d * factual_cf_sequence
+                    + keep_3d * donor_cf_sequence
+                )
+
+                counterfactual_sufficient_video_proj = (
+                    self._project_counterfactual_sequence(
+                        sequence=counterfactual_sufficient_sequence,
+                        temporal_weights=calibrated_qbound_key,
+                        valid_mask=valid_mask,
+                        projection_dropout_mask=projection_dropout_mask,
+                    )
+                )
+                counterfactual_necessary_video_proj = (
+                    self._project_counterfactual_sequence(
+                        sequence=counterfactual_necessary_sequence,
+                        temporal_weights=calibrated_qbound_key,
+                        valid_mask=valid_mask,
+                        projection_dropout_mask=projection_dropout_mask,
+                    )
+                )
+
             # Diagnostic projections do not define training objectives.
             with torch.no_grad():
                 raw_refined_qbound_video_proj = (
@@ -1636,10 +1920,16 @@ class Decoder(nn.Module):
                 "generic_context_raw_rms",
                 "generic_context_adapted_rms",
                 "counterfactual_evidence_interface_enabled",
+                "counterfactual_mass_preserving_gradient_enabled",
+                "counterfactual_raw_keep_support",
+                "counterfactual_raw_remove_support",
+                "counterfactual_raw_keep_fraction",
                 "counterfactual_keep_support",
                 "counterfactual_remove_support",
                 "counterfactual_keep_fraction",
                 "counterfactual_remove_fraction",
+                "counterfactual_support_forward_error",
+                "counterfactual_support_complement_error",
             ]
             for key in v111_interface_keys:
                 time_param[f"qbound_{key}"] = qbound_aux[key]
@@ -1661,6 +1951,124 @@ class Decoder(nn.Module):
             qbound_aux["qbound_input_uses_cra_embedding"] = time_param[
                 "qbound_input_uses_cra_embedding"
             ]
+
+            # ----------------------------------------------------------
+            # 5b) V1.11-B counterfactual consumer outputs.
+            # ----------------------------------------------------------
+            time_param["qbound_counterfactual_donor_available"] = (
+                counterfactual_donor_available
+            )
+            time_param["qbound_counterfactual_donor_shift"] = (
+                counterfactual_donor_shift
+            )
+            time_param["qbound_counterfactual_donor_valid_overlap"] = (
+                counterfactual_donor_valid_overlap
+            )
+            time_param["qbound_counterfactual_consumer_frozen"] = (
+                torch.as_tensor(
+                    float(
+                        self.qbound_counterfactual_evidence_interface
+                    ),
+                    dtype=video_proj.dtype,
+                    device=video_proj.device,
+                )
+            )
+
+            qbound_aux["qbound_counterfactual_donor_available"] = (
+                counterfactual_donor_available
+            )
+            qbound_aux["qbound_counterfactual_donor_shift"] = (
+                counterfactual_donor_shift
+            )
+            qbound_aux["qbound_counterfactual_donor_valid_overlap"] = (
+                counterfactual_donor_valid_overlap
+            )
+            qbound_aux["qbound_counterfactual_consumer_frozen"] = (
+                time_param["qbound_counterfactual_consumer_frozen"]
+            )
+
+            if self.qbound_counterfactual_evidence_interface:
+                if counterfactual_sufficient_video_proj is None:
+                    raise RuntimeError(
+                        "V1.11-B sufficiency representation was not built."
+                    )
+                if counterfactual_necessary_video_proj is None:
+                    raise RuntimeError(
+                        "V1.11-B necessity representation was not built."
+                    )
+
+                time_param[
+                    "qbound_counterfactual_factual_video_proj"
+                ] = calibrated_qbound_video_proj
+                time_param[
+                    "qbound_counterfactual_sufficient_video_proj"
+                ] = counterfactual_sufficient_video_proj
+                time_param[
+                    "qbound_counterfactual_necessary_video_proj"
+                ] = counterfactual_necessary_video_proj
+
+                qbound_aux[
+                    "qbound_counterfactual_factual_video_proj"
+                ] = calibrated_qbound_video_proj
+                qbound_aux[
+                    "qbound_counterfactual_sufficient_video_proj"
+                ] = counterfactual_sufficient_video_proj
+                qbound_aux[
+                    "qbound_counterfactual_necessary_video_proj"
+                ] = counterfactual_necessary_video_proj
+
+                factual_detached = calibrated_qbound_video_proj.detach()
+                suff_detached = (
+                    counterfactual_sufficient_video_proj.detach()
+                )
+                nec_detached = (
+                    counterfactual_necessary_video_proj.detach()
+                )
+
+                suff_cosine = F.cosine_similarity(
+                    factual_detached,
+                    suff_detached,
+                    dim=-1,
+                )
+                nec_cosine = F.cosine_similarity(
+                    factual_detached,
+                    nec_detached,
+                    dim=-1,
+                )
+                suff_l2 = torch.linalg.vector_norm(
+                    suff_detached - factual_detached,
+                    dim=-1,
+                )
+                nec_l2 = torch.linalg.vector_norm(
+                    nec_detached - factual_detached,
+                    dim=-1,
+                )
+
+                time_param[
+                    "qbound_counterfactual_sufficient_factual_cosine"
+                ] = suff_cosine
+                time_param[
+                    "qbound_counterfactual_necessary_factual_cosine"
+                ] = nec_cosine
+                time_param[
+                    "qbound_counterfactual_sufficient_factual_l2"
+                ] = suff_l2
+                time_param[
+                    "qbound_counterfactual_necessary_factual_l2"
+                ] = nec_l2
+
+                qbound_aux[
+                    "qbound_counterfactual_sufficient_factual_cosine"
+                ] = suff_cosine
+                qbound_aux[
+                    "qbound_counterfactual_necessary_factual_cosine"
+                ] = nec_cosine
+                qbound_aux[
+                    "qbound_counterfactual_sufficient_factual_l2"
+                ] = suff_l2
+                qbound_aux[
+                    "qbound_counterfactual_necessary_factual_l2"
+                ] = nec_l2
 
             # ----------------------------------------------------------
             # 6) Generic event / weak-alignment outputs.

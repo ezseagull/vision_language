@@ -36,7 +36,7 @@ class CRA(nn.Module):
       * RefineDecoder/QBoundCore fail fast if Q-Bound falls back to CRA-embedded
         visual tokens.
 
-    Three answer-space branches are exposed:
+    Three factual answer-space branches are exposed:
 
         qbound_calibrated_video_proj
             Official V1.11 MAIN branch.
@@ -46,6 +46,22 @@ class CRA(nn.Module):
 
         qbound_coarse_video_proj
             Detached hard-top1 COMPOSE branch, diagnostics/ablation only.
+
+    V1.11-B additionally propagates two counterfactual answer-space
+    representations built inside RefineDecoder:
+
+        qbound_counterfactual_sufficient_video_proj
+            Keep Q-Bound MAIN evidence, replace outside evidence with an
+            in-batch donor.
+
+        qbound_counterfactual_necessary_video_proj
+            Replace Q-Bound MAIN evidence with the donor while preserving the
+            outside context.
+
+    CRA does not compute the counterfactual loss.  It only validates and
+    exposes these representations.  The pipeline scores them with detached
+    candidate-answer features so the new supervision targets Q-Bound evidence
+    rather than adapting CRA/language answer consumers.
 
     Compatibility:
       * qbound_refined_video_proj aliases the calibrated MAIN branch.
@@ -128,6 +144,23 @@ class CRA(nn.Module):
                 ),
             )
         )
+        self.qbound_counterfactual_evidence_interface = bool(
+            qbound_cfg.get(
+                "counterfactual_evidence_interface",
+                False,
+            )
+        )
+
+        if (
+            self.qbound_enabled
+            and self.qbound_counterfactual_evidence_interface
+            and bool(model_cfg.get("do", False))
+        ):
+            raise ValueError(
+                "Controlled Q-Bound V1.11-B requires model.do=false. "
+                "VisualIntervention must remain disabled for the "
+                "counterfactual consumer."
+            )
 
         # Compatibility aliases for old checkpoints/logging.
         self.gpeb_enabled = self.qbound_enabled
@@ -466,10 +499,20 @@ class CRA(nn.Module):
                 "qbound_generic_context_raw_rms",
                 "qbound_generic_context_adapted_rms",
                 "qbound_counterfactual_evidence_interface_enabled",
+                "qbound_counterfactual_mass_preserving_gradient_enabled",
+                "qbound_counterfactual_raw_keep_support",
+                "qbound_counterfactual_raw_remove_support",
+                "qbound_counterfactual_raw_keep_fraction",
                 "qbound_counterfactual_keep_support",
                 "qbound_counterfactual_remove_support",
                 "qbound_counterfactual_keep_fraction",
                 "qbound_counterfactual_remove_fraction",
+                "qbound_counterfactual_support_forward_error",
+                "qbound_counterfactual_support_complement_error",
+                "qbound_counterfactual_donor_available",
+                "qbound_counterfactual_donor_shift",
+                "qbound_counterfactual_donor_valid_overlap",
+                "qbound_counterfactual_consumer_frozen",
                 "qbound_input_is_generic",
                 "qbound_input_uses_cra_embedding",
 
@@ -622,6 +665,19 @@ class CRA(nn.Module):
                 "qbound_v14_diagnostic_end",
             }
 
+            if self.qbound_counterfactual_evidence_interface:
+                required_time_keys.update(
+                    {
+                        "qbound_counterfactual_factual_video_proj",
+                        "qbound_counterfactual_sufficient_video_proj",
+                        "qbound_counterfactual_necessary_video_proj",
+                        "qbound_counterfactual_sufficient_factual_cosine",
+                        "qbound_counterfactual_necessary_factual_cosine",
+                        "qbound_counterfactual_sufficient_factual_l2",
+                        "qbound_counterfactual_necessary_factual_l2",
+                    }
+                )
+
             missing_time_keys = sorted(
                 required_time_keys.difference(time_param)
             )
@@ -650,12 +706,24 @@ class CRA(nn.Module):
                 "generic_context_raw_rms",
                 "generic_context_adapted_rms",
                 "counterfactual_evidence_interface_enabled",
+                "counterfactual_mass_preserving_gradient_enabled",
+                "counterfactual_raw_keep_support",
+                "counterfactual_raw_remove_support",
+                "counterfactual_raw_keep_fraction",
                 "counterfactual_keep_support",
                 "counterfactual_remove_support",
                 "counterfactual_keep_fraction",
                 "counterfactual_remove_fraction",
+                "counterfactual_support_forward_error",
+                "counterfactual_support_complement_error",
                 "qbound_input_is_generic",
                 "qbound_input_uses_cra_embedding",
+
+                # V1.11-B decoder-level counterfactual consumer diagnostics.
+                "qbound_counterfactual_donor_available",
+                "qbound_counterfactual_donor_shift",
+                "qbound_counterfactual_donor_valid_overlap",
+                "qbound_counterfactual_consumer_frozen",
 
                 # Answer representations.
                 "main_video_proj",
@@ -795,6 +863,19 @@ class CRA(nn.Module):
                 "merge_counterfactual_available",
             }
 
+            if self.qbound_counterfactual_evidence_interface:
+                required_aux_keys.update(
+                    {
+                        "qbound_counterfactual_factual_video_proj",
+                        "qbound_counterfactual_sufficient_video_proj",
+                        "qbound_counterfactual_necessary_video_proj",
+                        "qbound_counterfactual_sufficient_factual_cosine",
+                        "qbound_counterfactual_necessary_factual_cosine",
+                        "qbound_counterfactual_sufficient_factual_l2",
+                        "qbound_counterfactual_necessary_factual_l2",
+                    }
+                )
+
             missing_aux_keys = sorted(
                 required_aux_keys.difference(qbound_aux)
             )
@@ -854,6 +935,97 @@ class CRA(nn.Module):
                     f"config={expected_generic_adapter}, "
                     f"core={actual_generic_adapter}."
                 )
+
+            expected_cf_interface = float(
+                self.qbound_counterfactual_evidence_interface
+            )
+            actual_cf_interface = _scalar_flag(
+                "counterfactual_evidence_interface_enabled"
+            )
+            if actual_cf_interface != expected_cf_interface:
+                raise RuntimeError(
+                    "Q-Bound V1.11 counterfactual interface mismatch: "
+                    f"config={expected_cf_interface}, "
+                    f"core={actual_cf_interface}."
+                )
+
+            actual_mass_guard = _scalar_flag(
+                "counterfactual_mass_preserving_gradient_enabled"
+            )
+            if actual_mass_guard != expected_cf_interface:
+                raise RuntimeError(
+                    "Q-Bound V1.11-B mass-preserving gradient guard "
+                    "does not match the configured counterfactual interface."
+                )
+
+            cf_forward_error = float(
+                qbound_aux[
+                    "counterfactual_support_forward_error"
+                ].detach().max().item()
+            )
+            cf_complement_error = float(
+                qbound_aux[
+                    "counterfactual_support_complement_error"
+                ].detach().max().item()
+            )
+            if cf_forward_error > 1e-6:
+                raise RuntimeError(
+                    "V1.11-B counterfactual support changed its forward "
+                    f"value; max error={cf_forward_error}."
+                )
+            if cf_complement_error > 1e-6:
+                raise RuntimeError(
+                    "V1.11-B keep/remove supports are not complementary; "
+                    f"max error={cf_complement_error}."
+                )
+
+            if self.qbound_counterfactual_evidence_interface:
+                if _scalar_flag(
+                    "qbound_counterfactual_consumer_frozen"
+                ) != 1.0:
+                    raise RuntimeError(
+                        "V1.11-B requires the CRA counterfactual consumer "
+                        "to remain frozen."
+                    )
+
+                donor_available = _scalar_flag(
+                    "qbound_counterfactual_donor_available"
+                )
+                if batch_size > 1 and donor_available != 1.0:
+                    raise RuntimeError(
+                        "V1.11-B expected an in-batch counterfactual donor "
+                        "for batch_size > 1."
+                    )
+
+                donor_overlap = qbound_aux[
+                    "qbound_counterfactual_donor_valid_overlap"
+                ]
+                donor_overlap_value = float(
+                    donor_overlap.detach().mean().item()
+                )
+                if donor_overlap_value < 1.0 - 1e-6:
+                    raise RuntimeError(
+                        "Controlled V1.11-B expects identical receiver/donor "
+                        "valid masks; overlap="
+                        f"{donor_overlap_value}."
+                    )
+
+                for projection_name in (
+                    "qbound_counterfactual_factual_video_proj",
+                    "qbound_counterfactual_sufficient_video_proj",
+                    "qbound_counterfactual_necessary_video_proj",
+                ):
+                    projection = qbound_aux[projection_name]
+                    if not torch.is_tensor(projection):
+                        raise TypeError(
+                            f"{projection_name} must be a tensor."
+                        )
+                    if projection.shape != video_proj.shape:
+                        raise ValueError(
+                            f"{projection_name} shape mismatch: expected "
+                            f"{tuple(video_proj.shape)}, got "
+                            f"{tuple(projection.shape)}."
+                        )
 
             if _scalar_flag("uncertainty_calibration_enabled") != 1.0:
                 raise RuntimeError(
@@ -1107,10 +1279,27 @@ class CRA(nn.Module):
             "qbound_generic_context_raw_rms",
             "qbound_generic_context_adapted_rms",
             "qbound_counterfactual_evidence_interface_enabled",
+            "qbound_counterfactual_mass_preserving_gradient_enabled",
+            "qbound_counterfactual_raw_keep_support",
+            "qbound_counterfactual_raw_remove_support",
+            "qbound_counterfactual_raw_keep_fraction",
             "qbound_counterfactual_keep_support",
             "qbound_counterfactual_remove_support",
             "qbound_counterfactual_keep_fraction",
             "qbound_counterfactual_remove_fraction",
+            "qbound_counterfactual_support_forward_error",
+            "qbound_counterfactual_support_complement_error",
+            "qbound_counterfactual_donor_available",
+            "qbound_counterfactual_donor_shift",
+            "qbound_counterfactual_donor_valid_overlap",
+            "qbound_counterfactual_consumer_frozen",
+            "qbound_counterfactual_factual_video_proj",
+            "qbound_counterfactual_sufficient_video_proj",
+            "qbound_counterfactual_necessary_video_proj",
+            "qbound_counterfactual_sufficient_factual_cosine",
+            "qbound_counterfactual_necessary_factual_cosine",
+            "qbound_counterfactual_sufficient_factual_l2",
+            "qbound_counterfactual_necessary_factual_l2",
             "qbound_input_is_generic",
             "qbound_input_uses_cra_embedding",
 
@@ -1420,6 +1609,20 @@ class CRA(nn.Module):
             outs["qbound_counterfactual_evidence_interface_enabled"] = (
                 qbound_aux.get("counterfactual_evidence_interface_enabled")
             )
+            outs[
+                "qbound_counterfactual_mass_preserving_gradient_enabled"
+            ] = qbound_aux.get(
+                "counterfactual_mass_preserving_gradient_enabled"
+            )
+            outs["qbound_counterfactual_raw_keep_support"] = qbound_aux.get(
+                "counterfactual_raw_keep_support"
+            )
+            outs["qbound_counterfactual_raw_remove_support"] = qbound_aux.get(
+                "counterfactual_raw_remove_support"
+            )
+            outs["qbound_counterfactual_raw_keep_fraction"] = qbound_aux.get(
+                "counterfactual_raw_keep_fraction"
+            )
             outs["qbound_counterfactual_keep_support"] = qbound_aux.get(
                 "counterfactual_keep_support"
             )
@@ -1431,6 +1634,68 @@ class CRA(nn.Module):
             )
             outs["qbound_counterfactual_remove_fraction"] = qbound_aux.get(
                 "counterfactual_remove_fraction"
+            )
+            outs["qbound_counterfactual_support_forward_error"] = (
+                qbound_aux.get("counterfactual_support_forward_error")
+            )
+            outs["qbound_counterfactual_support_complement_error"] = (
+                qbound_aux.get("counterfactual_support_complement_error")
+            )
+
+            # V1.11-B counterfactual answer-space consumer.
+            outs["qbound_counterfactual_donor_available"] = qbound_aux.get(
+                "qbound_counterfactual_donor_available"
+            )
+            outs["qbound_counterfactual_donor_shift"] = qbound_aux.get(
+                "qbound_counterfactual_donor_shift"
+            )
+            outs["qbound_counterfactual_donor_valid_overlap"] = qbound_aux.get(
+                "qbound_counterfactual_donor_valid_overlap"
+            )
+            outs["qbound_counterfactual_consumer_frozen"] = qbound_aux.get(
+                "qbound_counterfactual_consumer_frozen"
+            )
+            outs["qbound_counterfactual_factual_video_proj"] = qbound_aux.get(
+                "qbound_counterfactual_factual_video_proj"
+            )
+            outs["qbound_counterfactual_sufficient_video_proj"] = (
+                qbound_aux.get(
+                    "qbound_counterfactual_sufficient_video_proj"
+                )
+            )
+            outs["qbound_counterfactual_necessary_video_proj"] = (
+                qbound_aux.get(
+                    "qbound_counterfactual_necessary_video_proj"
+                )
+            )
+            outs["qbound_counterfactual_sufficient_factual_cosine"] = (
+                qbound_aux.get(
+                    "qbound_counterfactual_sufficient_factual_cosine"
+                )
+            )
+            outs["qbound_counterfactual_necessary_factual_cosine"] = (
+                qbound_aux.get(
+                    "qbound_counterfactual_necessary_factual_cosine"
+                )
+            )
+            outs["qbound_counterfactual_sufficient_factual_l2"] = (
+                qbound_aux.get(
+                    "qbound_counterfactual_sufficient_factual_l2"
+                )
+            )
+            outs["qbound_counterfactual_necessary_factual_l2"] = (
+                qbound_aux.get(
+                    "qbound_counterfactual_necessary_factual_l2"
+                )
+            )
+
+            # Explicit detached answer candidates for V1.11-B scoring.
+            # The ordinary returned answer_proj remains trainable for the
+            # factual CRA/Q-Bound objective.
+            outs["qbound_counterfactual_answer_proj"] = (
+                answer_proj.detach()
+                if self.qbound_counterfactual_evidence_interface
+                else None
             )
 
             # Official MAIN.
@@ -1654,10 +1919,28 @@ class CRA(nn.Module):
                 "qbound_generic_input_token_cosine",
                 "qbound_generic_input_delta_ratio",
                 "qbound_counterfactual_evidence_interface_enabled",
+                "qbound_counterfactual_mass_preserving_gradient_enabled",
+                "qbound_counterfactual_raw_keep_support",
+                "qbound_counterfactual_raw_remove_support",
+                "qbound_counterfactual_raw_keep_fraction",
                 "qbound_counterfactual_keep_support",
                 "qbound_counterfactual_remove_support",
                 "qbound_counterfactual_keep_fraction",
                 "qbound_counterfactual_remove_fraction",
+                "qbound_counterfactual_support_forward_error",
+                "qbound_counterfactual_support_complement_error",
+                "qbound_counterfactual_donor_available",
+                "qbound_counterfactual_donor_shift",
+                "qbound_counterfactual_donor_valid_overlap",
+                "qbound_counterfactual_consumer_frozen",
+                "qbound_counterfactual_factual_video_proj",
+                "qbound_counterfactual_sufficient_video_proj",
+                "qbound_counterfactual_necessary_video_proj",
+                "qbound_counterfactual_sufficient_factual_cosine",
+                "qbound_counterfactual_necessary_factual_cosine",
+                "qbound_counterfactual_sufficient_factual_l2",
+                "qbound_counterfactual_necessary_factual_l2",
+                "qbound_counterfactual_answer_proj",
                 "qbound_calibrated_video_proj",
                 "qbound_calibrated_key",
                 "qbound_refined_video_proj",

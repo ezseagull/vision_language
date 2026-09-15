@@ -37,17 +37,31 @@ class CRAPipeline(BasePipeline):
     scoring, while Q-Bound receives the pre-CRA generic visual tokens through
     an explicit, separately validated route.
 
-    Controlled V1.11-A objective:
+    Controlled V1.11-B objective:
 
         L = L_CRA/main
             + lambda_align * L_weak_align
             + lambda_decomp * L_decomp
+            + lambda_suf * L_sufficiency
+            + lambda_nec * L_necessity
 
-    The CREDiT-inspired counterfactual evidence interface is propagated and
-    diagnosed in this pipeline, but no counterfactual answer loss is added in
-    V1.11-A.  This keeps the generic-input ablation controlled.  A later
-    V1.11-B run can add answer-level sufficiency/necessity supervision after a
-    dedicated generic/downstream counterfactual projection is introduced.
+    Counterfactual supervision uses the mass-preserving differentiable MAIN
+    support exposed by QBoundCore and the frozen CRA counterfactual consumer
+    exposed by RefineDecoder/CRA:
+
+        X_suff = keep * X + remove * X_donor
+        X_nec  = remove * X + keep * X_donor
+
+    Sufficiency requires the preserved-evidence branch to answer the original
+    question correctly. Necessity requires removal of selected evidence to
+    decrease the correct-answer logit relative to the detached factual branch.
+    Necessity is applied only to factual-correct samples by default so early
+    training does not reinforce evidence for an already-wrong factual answer.
+
+    The counterfactual answer candidates, CRA sequence, donor sequence, MAIN
+    pooling key, and CRA answer projection are detached/frozen on the CF path.
+    The added objective therefore supervises Q-Bound temporal evidence rather
+    than teaching CRA/language consumers to adapt to feature interventions.
 
     No temporal GT, IoU/IoP training loss, duration/minimality target,
     event-count forcing, CRA temporal handover, or direct event-token answer
@@ -108,7 +122,7 @@ class CRAPipeline(BasePipeline):
 
     def _qbound_v111_loss_settings(self):
         """
-        Read the controlled V1.11-A objective settings.
+        Read the shared V1.11 objective settings.
 
         Preferred YAML:
 
@@ -119,7 +133,7 @@ class CRAPipeline(BasePipeline):
                 decomposition:
                   loss_weight: 0.10
 
-        V1.11-A keeps the V1.10.3 task/alignment/decomposition objective unchanged
+        V1.11 keeps the V1.10.3 task/alignment/decomposition objective unchanged
         so generic-input decoupling is isolated. No coarse-answer auxiliary,
         minimal-sufficient/span-length, or reliability loss is added.
         """
@@ -166,6 +180,125 @@ class CRAPipeline(BasePipeline):
             align_temperature,
             decomp_weight,
         )
+
+    def _qbound_v111b_counterfactual_settings(self):
+        """
+        Read V1.11-B counterfactual evidence-training settings.
+
+        Preferred YAML:
+
+            model:
+              qbound:
+                counterfactual_evidence_interface: true
+                counterfactual:
+                  training_enabled: true
+                  sufficiency_weight: 0.05
+                  necessity_weight: 0.05
+                  necessity_margin: 0.20
+                  necessity_correct_only: true
+
+        The first controlled V1.11-B run changes only evidence supervision.
+        It does not change BAPGR/PPBR/PSRC, span length, topology, or the
+        generic-input adapter.
+        """
+        model_cfg = self.cfgs.get("model", {})
+        qbound_cfg = model_cfg.get("qbound", {})
+        if not isinstance(qbound_cfg, dict):
+            qbound_cfg = {}
+
+        interface_enabled = bool(
+            qbound_cfg.get(
+                "counterfactual_evidence_interface",
+                False,
+            )
+        )
+
+        cf_cfg = qbound_cfg.get("counterfactual", {})
+        if cf_cfg is None:
+            cf_cfg = {}
+        if not isinstance(cf_cfg, dict):
+            raise TypeError(
+                "model.qbound.counterfactual must be a mapping/dict."
+            )
+
+        training_enabled = bool(
+            cf_cfg.get(
+                "training_enabled",
+                qbound_cfg.get(
+                    "counterfactual_training_enabled",
+                    interface_enabled,
+                ),
+            )
+        )
+        sufficiency_weight = float(
+            cf_cfg.get(
+                "sufficiency_weight",
+                qbound_cfg.get(
+                    "counterfactual_sufficiency_weight",
+                    0.05,
+                ),
+            )
+        )
+        necessity_weight = float(
+            cf_cfg.get(
+                "necessity_weight",
+                qbound_cfg.get(
+                    "counterfactual_necessity_weight",
+                    0.05,
+                ),
+            )
+        )
+        necessity_margin = float(
+            cf_cfg.get(
+                "necessity_margin",
+                qbound_cfg.get(
+                    "counterfactual_necessity_margin",
+                    0.20,
+                ),
+            )
+        )
+        necessity_correct_only = bool(
+            cf_cfg.get(
+                "necessity_correct_only",
+                True,
+            )
+        )
+
+        if training_enabled and not interface_enabled:
+            raise RuntimeError(
+                "Q-Bound V1.11-B counterfactual training requires "
+                "model.qbound.counterfactual_evidence_interface=true."
+            )
+        if sufficiency_weight < 0.0:
+            raise ValueError(
+                "counterfactual sufficiency_weight must be >= 0."
+            )
+        if necessity_weight < 0.0:
+            raise ValueError(
+                "counterfactual necessity_weight must be >= 0."
+            )
+        if necessity_margin < 0.0:
+            raise ValueError(
+                "counterfactual necessity_margin must be >= 0."
+            )
+        if (
+            training_enabled
+            and sufficiency_weight <= 0.0
+            and necessity_weight <= 0.0
+        ):
+            raise ValueError(
+                "V1.11-B counterfactual training is enabled but both "
+                "counterfactual loss weights are zero."
+            )
+
+        return {
+            "interface_enabled": interface_enabled,
+            "training_enabled": training_enabled,
+            "sufficiency_weight": sufficiency_weight,
+            "necessity_weight": necessity_weight,
+            "necessity_margin": necessity_margin,
+            "necessity_correct_only": necessity_correct_only,
+        }
 
     @staticmethod
     def _qbound_inbatch_alignment(
@@ -414,6 +547,260 @@ class CRAPipeline(BasePipeline):
 
         return logits
 
+    def _qbound_v111b_counterfactual_losses(
+        self,
+        model_outputs,
+        labels,
+        factual_logits,
+        settings,
+    ):
+        """
+        Compute V1.11-B answer-level sufficiency and necessity losses.
+
+        Gradient contract:
+          * counterfactual answer candidates are detached by CRA;
+          * CF video representations were built from detached CRA features and
+            projected by a frozen CRA consumer in RefineDecoder;
+          * factual logits are detached inside the necessity target;
+          * gradients therefore enter Q-Bound through the differentiable
+            keep/remove temporal support.
+
+        Sufficiency:
+            CE(f(X_suff, q), y)
+
+        Necessity:
+            relu(
+                margin
+                - [ stopgrad(s_y(X)) - s_y(X_nec) ]
+            )
+
+        By default necessity is evaluated only for samples whose factual MAIN
+        prediction is already correct.
+        """
+        if not isinstance(model_outputs, dict):
+            raise TypeError(
+                "V1.11-B counterfactual training requires model_outputs dict."
+            )
+
+        answer_proj = model_outputs.get(
+            "qbound_counterfactual_answer_proj"
+        )
+        sufficient_proj = model_outputs.get(
+            "qbound_counterfactual_sufficient_video_proj"
+        )
+        necessary_proj = model_outputs.get(
+            "qbound_counterfactual_necessary_video_proj"
+        )
+        donor_available = model_outputs.get(
+            "qbound_counterfactual_donor_available"
+        )
+        consumer_frozen = model_outputs.get(
+            "qbound_counterfactual_consumer_frozen"
+        )
+
+        required = {
+            "qbound_counterfactual_answer_proj": answer_proj,
+            "qbound_counterfactual_sufficient_video_proj": sufficient_proj,
+            "qbound_counterfactual_necessary_video_proj": necessary_proj,
+            "qbound_counterfactual_donor_available": donor_available,
+            "qbound_counterfactual_consumer_frozen": consumer_frozen,
+        }
+        missing = [
+            name
+            for name, value in required.items()
+            if value is None
+        ]
+        if missing:
+            raise KeyError(
+                "V1.11-B counterfactual outputs are missing: "
+                + ", ".join(missing)
+            )
+
+        if not torch.is_tensor(answer_proj):
+            raise TypeError(
+                "qbound_counterfactual_answer_proj must be a tensor."
+            )
+        if not torch.is_tensor(sufficient_proj):
+            raise TypeError(
+                "qbound_counterfactual_sufficient_video_proj must be a tensor."
+            )
+        if not torch.is_tensor(necessary_proj):
+            raise TypeError(
+                "qbound_counterfactual_necessary_video_proj must be a tensor."
+            )
+        if not torch.is_tensor(donor_available):
+            raise TypeError(
+                "qbound_counterfactual_donor_available must be a tensor."
+            )
+        if not torch.is_tensor(consumer_frozen):
+            raise TypeError(
+                "qbound_counterfactual_consumer_frozen must be a tensor."
+            )
+
+        donor_flag = float(donor_available.detach().item())
+        frozen_flag = float(consumer_frozen.detach().item())
+        if frozen_flag != 1.0:
+            raise RuntimeError(
+                "V1.11-B counterfactual consumer must remain frozen."
+            )
+
+        sufficient_logits = self._score_answer_candidates(
+            answer_proj=answer_proj,
+            representation=sufficient_proj,
+            detach_answer=True,
+        )
+        necessary_logits = self._score_answer_candidates(
+            answer_proj=answer_proj,
+            representation=necessary_proj,
+            detach_answer=True,
+        )
+
+        if sufficient_logits.shape != factual_logits.shape:
+            raise ValueError(
+                "V1.11-B sufficient logits must match factual logits."
+            )
+        if necessary_logits.shape != factual_logits.shape:
+            raise ValueError(
+                "V1.11-B necessary logits must match factual logits."
+            )
+
+        labels = labels.reshape(-1)
+        if labels.numel() != factual_logits.size(0):
+            raise ValueError(
+                "V1.11-B labels do not match factual batch size."
+            )
+
+        # If batch_size==1 there is no valid in-batch donor. Keep graph-valid
+        # zero losses and let the caller skip the CF contribution.
+        if donor_flag <= 0.0:
+            zero = (
+                sufficient_logits.sum()
+                + necessary_logits.sum()
+            ) * 0.0
+            return {
+                "sufficiency_loss": zero,
+                "necessity_loss": zero,
+                "sufficient_logits": sufficient_logits,
+                "necessary_logits": necessary_logits,
+                "necessity_active_ratio": 0.0,
+                "donor_available": 0.0,
+            }
+
+        sufficiency_per_sample = F.cross_entropy(
+            sufficient_logits,
+            labels,
+            reduction="none",
+        )
+        sufficiency_loss = sufficiency_per_sample.mean()
+
+        label_index = labels.unsqueeze(-1)
+        factual_correct_logit = factual_logits.detach().gather(
+            dim=-1,
+            index=label_index,
+        ).squeeze(-1)
+        sufficient_correct_logit = sufficient_logits.gather(
+            dim=-1,
+            index=label_index,
+        ).squeeze(-1)
+        necessary_correct_logit = necessary_logits.gather(
+            dim=-1,
+            index=label_index,
+        ).squeeze(-1)
+
+        necessity_gap = (
+            factual_correct_logit
+            - necessary_correct_logit
+        )
+        necessity_violation = F.relu(
+            float(settings["necessity_margin"])
+            - necessity_gap
+        )
+
+        if bool(settings["necessity_correct_only"]):
+            factual_correct_mask = (
+                factual_logits.detach().argmax(dim=-1) == labels
+            ).to(necessity_violation.dtype)
+        else:
+            factual_correct_mask = torch.ones_like(
+                necessity_violation
+            )
+
+        active_count = factual_correct_mask.sum()
+        if float(active_count.detach().item()) > 0.0:
+            necessity_loss = (
+                necessity_violation
+                * factual_correct_mask
+            ).sum() / active_count
+        else:
+            necessity_loss = necessary_logits.sum() * 0.0
+
+        necessity_active_ratio = (
+            factual_correct_mask.mean().detach().item()
+        )
+
+        with torch.no_grad():
+            factual_prob = F.softmax(
+                factual_logits.detach(),
+                dim=-1,
+            ).gather(
+                dim=-1,
+                index=label_index,
+            ).squeeze(-1)
+            sufficient_prob = F.softmax(
+                sufficient_logits.detach(),
+                dim=-1,
+            ).gather(
+                dim=-1,
+                index=label_index,
+            ).squeeze(-1)
+            necessary_prob = F.softmax(
+                necessary_logits.detach(),
+                dim=-1,
+            ).gather(
+                dim=-1,
+                index=label_index,
+            ).squeeze(-1)
+
+            diagnostics = {
+                "factual_correct_logit": (
+                    factual_correct_logit.mean().item()
+                ),
+                "sufficient_correct_logit": (
+                    sufficient_correct_logit.detach().mean().item()
+                ),
+                "necessary_correct_logit": (
+                    necessary_correct_logit.detach().mean().item()
+                ),
+                "factual_minus_sufficient_logit": (
+                    factual_correct_logit
+                    - sufficient_correct_logit.detach()
+                ).mean().item(),
+                "necessity_gap": necessity_gap.detach().mean().item(),
+                "factual_correct_prob": factual_prob.mean().item(),
+                "sufficient_correct_prob": sufficient_prob.mean().item(),
+                "necessary_correct_prob": necessary_prob.mean().item(),
+                "sufficient_acc": (
+                    sufficient_logits.detach().argmax(dim=-1) == labels
+                ).float().mean().item(),
+                "necessary_acc": (
+                    necessary_logits.detach().argmax(dim=-1) == labels
+                ).float().mean().item(),
+                "necessity_margin_satisfied_ratio": (
+                    necessity_gap.detach()
+                    >= float(settings["necessity_margin"])
+                ).float().mean().item(),
+            }
+
+        return {
+            "sufficiency_loss": sufficiency_loss,
+            "necessity_loss": necessity_loss,
+            "sufficient_logits": sufficient_logits,
+            "necessary_logits": necessary_logits,
+            "necessity_active_ratio": necessity_active_ratio,
+            "donor_available": donor_flag,
+            **diagnostics,
+        }
+
     @staticmethod
     def _normalize_distribution(
         values,
@@ -543,12 +930,23 @@ class CRAPipeline(BasePipeline):
             "generic_input_token_cosine",
             "generic_input_delta_ratio",
             "counterfactual_evidence_interface_enabled",
+            "counterfactual_mass_preserving_gradient_enabled",
+            "counterfactual_raw_keep_support",
+            "counterfactual_raw_remove_support",
+            "counterfactual_raw_keep_fraction",
             "counterfactual_keep_support",
             "counterfactual_remove_support",
             "counterfactual_keep_fraction",
             "counterfactual_remove_fraction",
+            "counterfactual_support_forward_error",
+            "counterfactual_support_complement_error",
             "qbound_input_is_generic",
             "qbound_input_uses_cra_embedding",
+
+            "qbound_counterfactual_donor_available",
+            "qbound_counterfactual_donor_shift",
+            "qbound_counterfactual_donor_valid_overlap",
+            "qbound_counterfactual_consumer_frozen",
 
             "cra_video_proj",
             "main_video_proj",
@@ -696,6 +1094,24 @@ class CRAPipeline(BasePipeline):
             ].detach().float()
             counterfactual_remove_fraction = qbound_aux[
                 "counterfactual_remove_fraction"
+            ].detach().float()
+            counterfactual_mass_guard = qbound_aux[
+                "counterfactual_mass_preserving_gradient_enabled"
+            ].detach().float()
+            counterfactual_forward_error = qbound_aux[
+                "counterfactual_support_forward_error"
+            ].detach().float()
+            counterfactual_core_complement_error = qbound_aux[
+                "counterfactual_support_complement_error"
+            ].detach().float()
+            counterfactual_donor_available = qbound_aux[
+                "qbound_counterfactual_donor_available"
+            ].detach().float()
+            counterfactual_donor_overlap = qbound_aux[
+                "qbound_counterfactual_donor_valid_overlap"
+            ].detach().float()
+            counterfactual_consumer_frozen = qbound_aux[
+                "qbound_counterfactual_consumer_frozen"
             ].detach().float()
 
             # Core contract: keep/remove are complementary on valid frames and
@@ -1100,6 +1516,24 @@ class CRAPipeline(BasePipeline):
             # Counterfactual evidence interface diagnostics only in V1.11-A.
             "qbound_counterfactual_evidence_interface_enabled": (
                 counterfactual_interface_enabled.mean().item()
+            ),
+            "qbound_counterfactual_mass_preserving_gradient_enabled": (
+                counterfactual_mass_guard.mean().item()
+            ),
+            "qbound_counterfactual_support_forward_error": (
+                counterfactual_forward_error.mean().item()
+            ),
+            "qbound_counterfactual_core_complement_error": (
+                counterfactual_core_complement_error.mean().item()
+            ),
+            "qbound_counterfactual_donor_available": (
+                counterfactual_donor_available.mean().item()
+            ),
+            "qbound_counterfactual_donor_valid_overlap": (
+                counterfactual_donor_overlap.mean().item()
+            ),
+            "qbound_counterfactual_consumer_frozen": (
+                counterfactual_consumer_frozen.mean().item()
             ),
             "qbound_counterfactual_keep_fraction": (
                 counterfactual_keep_fraction.mean().item()
@@ -1517,10 +1951,22 @@ class CRAPipeline(BasePipeline):
             "generic_input_token_cosine",
             "generic_input_delta_ratio",
             "counterfactual_evidence_interface_enabled",
+            "counterfactual_mass_preserving_gradient_enabled",
+            "counterfactual_raw_keep_fraction",
             "counterfactual_keep_fraction",
             "counterfactual_remove_fraction",
+            "counterfactual_support_forward_error",
+            "counterfactual_support_complement_error",
             "qbound_input_is_generic",
             "qbound_input_uses_cra_embedding",
+            "qbound_counterfactual_donor_available",
+            "qbound_counterfactual_donor_shift",
+            "qbound_counterfactual_donor_valid_overlap",
+            "qbound_counterfactual_consumer_frozen",
+            "qbound_counterfactual_sufficient_factual_cosine",
+            "qbound_counterfactual_necessary_factual_cosine",
+            "qbound_counterfactual_sufficient_factual_l2",
+            "qbound_counterfactual_necessary_factual_l2",
         ]
         for key in v111_interface_scalar_keys:
             scalar = self._scalar_mean(qbound_aux.get(key))
@@ -2525,8 +2971,33 @@ class CRAPipeline(BasePipeline):
                 "qbound_generic_input_token_cosine",
                 "qbound_generic_input_delta_ratio",
                 "qbound_counterfactual_evidence_interface_enabled",
+                "qbound_counterfactual_mass_preserving_gradient_enabled",
                 "qbound_counterfactual_training_enabled",
                 "qbound_counterfactual_loss_weight",
+                "qbound_counterfactual_sufficiency_weight",
+                "qbound_counterfactual_necessity_weight",
+                "qbound_counterfactual_necessity_margin",
+                "qbound_counterfactual_necessity_correct_only",
+                "qbound_counterfactual_donor_available",
+                "qbound_counterfactual_donor_valid_overlap",
+                "qbound_counterfactual_consumer_frozen",
+                "qbound_counterfactual_sufficiency_loss",
+                "qbound_counterfactual_necessity_loss",
+                "qbound_counterfactual_total_loss",
+                "qbound_counterfactual_factual_correct_logit",
+                "qbound_counterfactual_sufficient_correct_logit",
+                "qbound_counterfactual_necessary_correct_logit",
+                "qbound_counterfactual_factual_minus_sufficient_logit",
+                "qbound_counterfactual_necessity_gap",
+                "qbound_counterfactual_factual_correct_prob",
+                "qbound_counterfactual_sufficient_correct_prob",
+                "qbound_counterfactual_necessary_correct_prob",
+                "qbound_counterfactual_sufficient_acc",
+                "qbound_counterfactual_necessary_acc",
+                "qbound_counterfactual_necessity_active_ratio",
+                "qbound_counterfactual_necessity_margin_satisfied_ratio",
+                "qbound_counterfactual_support_forward_error",
+                "qbound_counterfactual_core_complement_error",
                 "qbound_counterfactual_keep_fraction",
                 "qbound_counterfactual_remove_fraction",
                 "qbound_counterfactual_support_complement_error",
@@ -2836,17 +3307,19 @@ class CRAPipeline(BasePipeline):
         qbound_mix=1.0,
     ):
         """
-        Controlled V1.11-A objective:
+        Controlled V1.11-B objective:
 
             L =
                 L_CRA/main_reliability_calibrated_task
                 + lambda_align * L_weak_align
                 + lambda_decomp * L_decomp
+                + lambda_suf * L_sufficiency
+                + lambda_nec * L_necessity
 
-        Loss weights are unchanged from V1.8.  The mechanism change is inside QBoundCore: Composer task gradients use the
-        differentiable coarse MAIN component, while Refiner task gradients use
-        the BAPGR + PPBR fine component. The Composer posterior routed into
-        REFINE is detached and the learned Refiner correction is bounded.
+        The V1.11-A factual mechanism is unchanged.  V1.11-B only adds
+        counterfactual evidence supervision through the mass-preserving MAIN
+        support.  The CF consumer and answer candidates are frozen/detached so
+        the new gradients target Q-Bound temporal evidence.
 
         No separate coarse VQA loss, reliability loss, minimal-sufficient loss,
         temporal GT, IoU/IoP loss, entropy loss, or target duration is used.
@@ -2976,6 +3449,16 @@ class CRAPipeline(BasePipeline):
         align_weight = 0.0
         decomp_weight = 0.0
 
+        cf_settings = {
+            "interface_enabled": False,
+            "training_enabled": False,
+            "sufficiency_weight": 0.0,
+            "necessity_weight": 0.0,
+            "necessity_margin": 0.0,
+            "necessity_correct_only": True,
+        }
+        cf_result = None
+
         qbound_aux = self._get_qbound_aux(gqa_output)
 
         if self._qbound_enabled() and qbound_aux is not None:
@@ -2984,6 +3467,9 @@ class CRAPipeline(BasePipeline):
                 align_temperature,
                 decomp_weight,
             ) = self._qbound_v111_loss_settings()
+            cf_settings = (
+                self._qbound_v111b_counterfactual_settings()
+            )
 
             # Fail fast if a V1.7 objective/routing mechanism is accidentally on.
             minimality_flag = qbound_aux.get(
@@ -3052,6 +3538,23 @@ class CRAPipeline(BasePipeline):
                 "counterfactual_evidence_interface_enabled",
                 expected_cf_interface,
             )
+            _require_scalar_flag(
+                "counterfactual_mass_preserving_gradient_enabled",
+                expected_cf_interface,
+            )
+
+            if bool(cf_settings["interface_enabled"]) != bool(
+                expected_cf_interface
+            ):
+                raise RuntimeError(
+                    "V1.11-B pipeline/config counterfactual interface mismatch."
+                )
+
+            if cf_settings["training_enabled"]:
+                _require_scalar_flag(
+                    "qbound_counterfactual_consumer_frozen",
+                    1.0,
+                )
 
             _require_scalar_flag(
                 "posterior_guided_refinement_enabled", 1.0
@@ -3173,6 +3676,45 @@ class CRAPipeline(BasePipeline):
                     + decomp_weight * qbound_decomp_loss
                 )
 
+            # ------------------------------------------------------
+            # V1.11-B COUNTERFACTUAL EVIDENCE SUPERVISION.
+            # ------------------------------------------------------
+            if cf_settings["training_enabled"]:
+                model_outputs = gqa_output[2]
+                cf_result = self._qbound_v111b_counterfactual_losses(
+                    model_outputs=model_outputs,
+                    labels=answer_id_device,
+                    factual_logits=calibrated_logits,
+                    settings=cf_settings,
+                )
+
+                qbound_sufficiency_loss = cf_result[
+                    "sufficiency_loss"
+                ]
+                qbound_necessity_loss = cf_result[
+                    "necessity_loss"
+                ]
+
+                weighted_cf_loss = (
+                    float(cf_settings["sufficiency_weight"])
+                    * qbound_sufficiency_loss
+                    + float(cf_settings["necessity_weight"])
+                    * qbound_necessity_loss
+                )
+
+                loss["qbound_counterfactual_sufficiency_loss"] = (
+                    qbound_sufficiency_loss
+                )
+                loss["qbound_counterfactual_necessity_loss"] = (
+                    qbound_necessity_loss
+                )
+                loss["qbound_counterfactual_total_loss"] = (
+                    weighted_cf_loss
+                )
+                loss["total_loss"] = (
+                    loss["total_loss"] + weighted_cf_loss
+                )
+
         # ----------------------------------------------------------
         # Diagnostic answer branches only. These outputs are already
         # detached/no-grad in the decoder and never enter total_loss.
@@ -3212,11 +3754,92 @@ class CRAPipeline(BasePipeline):
         )
 
         if self._qbound_enabled():
-            # V1.11-A is the controlled generic-input ablation.  The
-            # counterfactual interface is logged but contributes no answer
-            # objective yet.
-            qbound_logs["qbound_counterfactual_training_enabled"] = 0.0
-            qbound_logs["qbound_counterfactual_loss_weight"] = 0.0
+            qbound_logs["qbound_counterfactual_training_enabled"] = float(
+                bool(cf_settings["training_enabled"])
+            )
+            qbound_logs["qbound_counterfactual_sufficiency_weight"] = float(
+                cf_settings["sufficiency_weight"]
+            )
+            qbound_logs["qbound_counterfactual_necessity_weight"] = float(
+                cf_settings["necessity_weight"]
+            )
+            qbound_logs["qbound_counterfactual_loss_weight"] = float(
+                cf_settings["sufficiency_weight"]
+                + cf_settings["necessity_weight"]
+            )
+            qbound_logs["qbound_counterfactual_necessity_margin"] = float(
+                cf_settings["necessity_margin"]
+            )
+            qbound_logs[
+                "qbound_counterfactual_necessity_correct_only"
+            ] = float(
+                bool(cf_settings["necessity_correct_only"])
+            )
+
+            if cf_result is not None:
+                qbound_logs[
+                    "qbound_counterfactual_sufficiency_loss"
+                ] = float(
+                    cf_result["sufficiency_loss"].detach().item()
+                )
+                qbound_logs[
+                    "qbound_counterfactual_necessity_loss"
+                ] = float(
+                    cf_result["necessity_loss"].detach().item()
+                )
+                qbound_logs[
+                    "qbound_counterfactual_total_loss"
+                ] = float(
+                    (
+                        float(cf_settings["sufficiency_weight"])
+                        * cf_result["sufficiency_loss"].detach()
+                        + float(cf_settings["necessity_weight"])
+                        * cf_result["necessity_loss"].detach()
+                    ).item()
+                )
+                qbound_logs[
+                    "qbound_counterfactual_necessity_active_ratio"
+                ] = float(cf_result["necessity_active_ratio"])
+                qbound_logs[
+                    "qbound_counterfactual_factual_correct_logit"
+                ] = float(cf_result["factual_correct_logit"])
+                qbound_logs[
+                    "qbound_counterfactual_sufficient_correct_logit"
+                ] = float(cf_result["sufficient_correct_logit"])
+                qbound_logs[
+                    "qbound_counterfactual_necessary_correct_logit"
+                ] = float(cf_result["necessary_correct_logit"])
+                qbound_logs[
+                    "qbound_counterfactual_factual_minus_sufficient_logit"
+                ] = float(
+                    cf_result["factual_minus_sufficient_logit"]
+                )
+                qbound_logs[
+                    "qbound_counterfactual_necessity_gap"
+                ] = float(cf_result["necessity_gap"])
+                qbound_logs[
+                    "qbound_counterfactual_factual_correct_prob"
+                ] = float(cf_result["factual_correct_prob"])
+                qbound_logs[
+                    "qbound_counterfactual_sufficient_correct_prob"
+                ] = float(cf_result["sufficient_correct_prob"])
+                qbound_logs[
+                    "qbound_counterfactual_necessary_correct_prob"
+                ] = float(cf_result["necessary_correct_prob"])
+                qbound_logs[
+                    "qbound_counterfactual_sufficient_acc"
+                ] = float(cf_result["sufficient_acc"])
+                qbound_logs[
+                    "qbound_counterfactual_necessary_acc"
+                ] = float(cf_result["necessary_acc"])
+                qbound_logs[
+                    "qbound_counterfactual_necessity_margin_satisfied_ratio"
+                ] = float(
+                    cf_result["necessity_margin_satisfied_ratio"]
+                )
+                qbound_logs[
+                    "qbound_counterfactual_donor_available"
+                ] = float(cf_result["donor_available"])
 
             qbound_logs["qbound_weak_align_weight"] = float(
                 align_weight
@@ -3269,6 +3892,15 @@ class CRAPipeline(BasePipeline):
         if self._qbound_enabled():
             self.monitor.reset_kv("qbound_align_loss")
             self.monitor.reset_kv("qbound_decomp_loss")
+            self.monitor.reset_kv(
+                "qbound_counterfactual_sufficiency_loss"
+            )
+            self.monitor.reset_kv(
+                "qbound_counterfactual_necessity_loss"
+            )
+            self.monitor.reset_kv(
+                "qbound_counterfactual_total_loss"
+            )
             for key in self._qbound_monitor_keys():
                 self.monitor.reset_kv(key)
 
@@ -3443,7 +4075,7 @@ class CRAPipeline(BasePipeline):
 
         def _print_readouts(split_prefix):
             display_names = [
-                ("pre-hoc", "V1.11 generic-input + BAPGR/PPBR/PSRC MAIN"),
+                ("pre-hoc", "V1.11-B generic-input + CF evidence + BAPGR/PPBR/PSRC MAIN"),
                 (
                     "raw-refined",
                     "BAPGR + PPBR RAW REFINE diagnostic",

@@ -476,32 +476,24 @@ class BasePipeline(object):
         Structural safety check for controlled
         Q-Bound V1.8/V1.9/V1.10.1/V1.10.2/V1.11 runs.
 
-        V1.10.2 intentionally keeps the same trainable stage modules as
-        V1.10.1:
+        V1.11 keeps the successful V1.10.2 temporal mechanism:
 
-            DECOMPOSE -> RELATE -> COMPOSE -> REFINE -> GROUND
+            DECOMPOSE -> RELATE -> COMPOSE -> BAPGR -> PPBR -> PSRC -> GROUND
 
-        V1.10.2 keeps the V1.10.1 BAPGR pair geometry and changes only the
-        learned Refiner update:
+        and adds:
+          * a Q-Bound-owned generic visual input adapter;
+          * optionally (V1.11-B) a parameter-free counterfactual evidence
+            interface with answer-level sufficiency/necessity supervision.
 
-          * no hard top-1 Composer route into REFINE;
-          * the Composer posterior routed into REFINE remains detached;
-          * BAPGR anchors starts toward the first-event left boundary and
-            ends toward the last-event right boundary;
-          * PPBR bounds the learned Refiner correction with a fixed
-            ``correction_cap``;
-          * posterior-stable reliability calibration remains parameter-free.
-
-        Therefore:
-          * no new optimizer group is expected;
-          * all trainable Q-Bound tensors remain in the dedicated ``qbound``
+        Important optimizer contract:
+          * V1.11-B adds NO new trainable counterfactual module;
+          * all trainable Q-Bound tensors remain in the existing ``qbound``
             optimizer group and use ``optim.qbound_lr``;
           * shared CRA ``decoder.video_proj`` remains in the base group;
-          * V1.10.2 config must advertise the BAPGR + PPBR contract;
-          * boundary anchoring and the correction cap are fixed structural
-            settings, not trainable gates or span-length objectives;
-          * no trainable calibration/reliability/correction gate may silently
-            appear.
+          * BAPGR anchor power and PPBR correction cap remain fixed structural
+            constants rather than learned gates;
+          * the CF evidence route must remain parameter-free and Visual
+            Intervention must remain disabled in the controlled V1.11-B run.
         """
         if not self._qbound_enabled():
             return
@@ -532,13 +524,21 @@ class BasePipeline(object):
                 expected_routing_flags["boundary_structured"] = True
 
             for key, expected in expected_routing_flags.items():
-                if key not in refinement_cfg:
-                    raise RuntimeError(
-                        f"Q-Bound V{version} config is missing "
-                        f"refinement.{key}. Expected {expected!r}."
+                if version == "1.11":
+                    # V1.11 modules already default to these fixed routing
+                    # choices. Allow omission in a future compact/paper YAML,
+                    # but fail if an explicitly supplied value changes them.
+                    actual = bool(
+                        refinement_cfg.get(key, expected)
                     )
+                else:
+                    if key not in refinement_cfg:
+                        raise RuntimeError(
+                            f"Q-Bound V{version} config is missing "
+                            f"refinement.{key}. Expected {expected!r}."
+                        )
+                    actual = bool(refinement_cfg[key])
 
-                actual = bool(refinement_cfg[key])
                 if actual != expected:
                     raise RuntimeError(
                         f"Q-Bound V{version} routing config mismatch for "
@@ -766,9 +766,12 @@ class BasePipeline(object):
                 )
 
         if version == "1.11":
+            # ----------------------------------------------------------
+            # V1.11 family contract
+            # ----------------------------------------------------------
             expected_refinement_type = "prior_preserving_bounded_refiner"
             actual_refinement_type = str(
-                refinement_cfg.get("type", "")
+                refinement_cfg.get("type", expected_refinement_type)
             )
             if actual_refinement_type != expected_refinement_type:
                 raise RuntimeError(
@@ -777,14 +780,17 @@ class BasePipeline(object):
                     f"got {actual_refinement_type!r}."
                 )
 
-            if "boundary_anchor_power" not in refinement_cfg:
-                raise RuntimeError(
-                    "Q-Bound V1.11 config is missing "
-                    "refinement.boundary_anchor_power."
-                )
+            # These are fixed structural constants for the controlled V1.11
+            # family, not free/tuned hyperparameters. They may be omitted from
+            # a future compact YAML because all V1.11 modules already default
+            # to the same values.
             boundary_anchor_power = float(
-                refinement_cfg["boundary_anchor_power"]
+                refinement_cfg.get("boundary_anchor_power", 2.0)
             )
+            correction_cap = float(
+                refinement_cfg.get("correction_cap", 2.0)
+            )
+
             if (
                 not math.isfinite(boundary_anchor_power)
                 or boundary_anchor_power <= 0.0
@@ -794,15 +800,6 @@ class BasePipeline(object):
                     "must be finite and > 0; got "
                     f"{boundary_anchor_power}."
                 )
-
-            if "correction_cap" not in refinement_cfg:
-                raise RuntimeError(
-                    "Q-Bound V1.11 config is missing "
-                    "refinement.correction_cap."
-                )
-            correction_cap = float(
-                refinement_cfg["correction_cap"]
-            )
             if (
                 not math.isfinite(correction_cap)
                 or correction_cap <= 0.0
@@ -820,7 +817,7 @@ class BasePipeline(object):
                 abs_tol=0.0,
             ):
                 raise RuntimeError(
-                    "Controlled Q-Bound V1.11-A expects "
+                    "Controlled Q-Bound V1.11 expects fixed "
                     "refinement.boundary_anchor_power=2.0; got "
                     f"{boundary_anchor_power}."
                 )
@@ -831,22 +828,133 @@ class BasePipeline(object):
                 abs_tol=0.0,
             ):
                 raise RuntimeError(
-                    "Controlled Q-Bound V1.11-A expects "
+                    "Controlled Q-Bound V1.11 expects fixed "
                     "refinement.correction_cap=2.0; got "
                     f"{correction_cap}."
                 )
 
-            if not bool(qbound_cfg.get("use_generic_input_adapter", False)):
+            if not bool(
+                qbound_cfg.get("use_generic_input_adapter", True)
+            ):
                 raise RuntimeError(
                     "Q-Bound V1.11 requires "
                     "model.qbound.use_generic_input_adapter=true."
                 )
-            if not bool(qbound_cfg.get("input_adapter_use_position", True)):
+
+            if not bool(
+                qbound_cfg.get("input_adapter_use_position", True)
+            ):
                 raise RuntimeError(
-                    "Controlled Q-Bound V1.11-A expects "
-                    "model.qbound.input_adapter_use_position=true."
+                    "Controlled Q-Bound V1.11 expects positional encoding "
+                    "inside the generic input adapter."
                 )
 
+            # ------------------------------------------------------
+            # Counterfactual settings.
+            #
+            # V1.11-A:
+            #   interface=false -> generic-input baseline.
+            #
+            # V1.11-B:
+            #   interface=true + counterfactual.training_enabled=true.
+            #
+            # The CF weights/margin are objective coefficients, not new
+            # architectural modules. Defaults are centralized here so a
+            # future compact YAML may omit them without changing behavior.
+            # ------------------------------------------------------
+            configured_cf_interface = bool(
+                qbound_cfg.get(
+                    "counterfactual_evidence_interface",
+                    False,
+                )
+            )
+
+            counterfactual_cfg = qbound_cfg.get(
+                "counterfactual",
+                {},
+            )
+            if counterfactual_cfg is None:
+                counterfactual_cfg = {}
+            if not isinstance(counterfactual_cfg, dict):
+                raise TypeError(
+                    "model.qbound.counterfactual must be a mapping/dict."
+                )
+
+            cf_training_enabled = bool(
+                counterfactual_cfg.get(
+                    "training_enabled",
+                    configured_cf_interface,
+                )
+            )
+            cf_sufficiency_weight = float(
+                counterfactual_cfg.get(
+                    "sufficiency_weight",
+                    0.05,
+                )
+            )
+            cf_necessity_weight = float(
+                counterfactual_cfg.get(
+                    "necessity_weight",
+                    0.05,
+                )
+            )
+            cf_necessity_margin = float(
+                counterfactual_cfg.get(
+                    "necessity_margin",
+                    0.20,
+                )
+            )
+            cf_necessity_correct_only = bool(
+                counterfactual_cfg.get(
+                    "necessity_correct_only",
+                    True,
+                )
+            )
+
+            if cf_training_enabled and not configured_cf_interface:
+                raise RuntimeError(
+                    "Q-Bound V1.11 counterfactual training cannot be enabled "
+                    "while counterfactual_evidence_interface=false."
+                )
+            if cf_sufficiency_weight < 0.0:
+                raise ValueError(
+                    "Q-Bound V1.11 counterfactual.sufficiency_weight "
+                    "must be >= 0."
+                )
+            if cf_necessity_weight < 0.0:
+                raise ValueError(
+                    "Q-Bound V1.11 counterfactual.necessity_weight "
+                    "must be >= 0."
+                )
+            if cf_necessity_margin < 0.0:
+                raise ValueError(
+                    "Q-Bound V1.11 counterfactual.necessity_margin "
+                    "must be >= 0."
+                )
+            if (
+                cf_training_enabled
+                and cf_sufficiency_weight <= 0.0
+                and cf_necessity_weight <= 0.0
+            ):
+                raise RuntimeError(
+                    "Q-Bound V1.11-B enables counterfactual training but "
+                    "both CF loss weights are zero."
+                )
+
+            # Controlled V1.11-B keeps VisualIntervention OFF so the
+            # counterfactual consumer is not confounded by a second causal
+            # intervention mechanism.
+            if (
+                configured_cf_interface
+                and bool(model_cfg.get("do", False))
+            ):
+                raise RuntimeError(
+                    "Controlled Q-Bound V1.11-B requires model.do=false."
+                )
+
+            # ------------------------------------------------------
+            # Cross-file version/interface consistency.
+            # ------------------------------------------------------
             model_core = (
                 self.model.module
                 if hasattr(self.model, "module")
@@ -944,23 +1052,43 @@ class BasePipeline(object):
                     "match the YAML configuration."
                 )
 
-            configured_cf_interface = bool(
-                qbound_cfg.get(
-                    "counterfactual_evidence_interface",
-                    False,
-                )
-            )
-            actual_cf_interface = bool(
+            actual_core_cf_interface = bool(
                 getattr(
                     qbound_core,
                     "counterfactual_evidence_interface",
                     False,
                 )
             )
-            if actual_cf_interface != configured_cf_interface:
+            if actual_core_cf_interface != configured_cf_interface:
                 raise RuntimeError(
                     "QBoundCore V1.11 counterfactual interface setting "
                     "does not match the YAML configuration."
+                )
+
+            actual_decoder_cf_interface = bool(
+                getattr(
+                    decoder,
+                    "qbound_counterfactual_evidence_interface",
+                    False,
+                )
+            )
+            if actual_decoder_cf_interface != configured_cf_interface:
+                raise RuntimeError(
+                    "RefineDecoder V1.11 counterfactual interface setting "
+                    "does not match the YAML configuration."
+                )
+
+            actual_model_cf_interface = bool(
+                getattr(
+                    model_core,
+                    "qbound_counterfactual_evidence_interface",
+                    False,
+                )
+            )
+            if actual_model_cf_interface != configured_cf_interface:
+                raise RuntimeError(
+                    "CRA V1.11 counterfactual interface setting does not "
+                    "match the YAML configuration."
                 )
 
         required_component_tokens = {
@@ -1076,6 +1204,17 @@ class BasePipeline(object):
             "posterior_score",
         )
 
+        if version == "1.11":
+            # V1.11-B counterfactual validation is intentionally parameter-free:
+            # the only trainable objects are the existing Q-Bound modules.
+            forbidden_trainable_tokens = (
+                *forbidden_trainable_tokens,
+                "counterfactual_gate",
+                "counterfactual_score",
+                "counterfactual_proj",
+                "counterfactual_adapter",
+            )
+
         if version in {"1.10.1", "1.10.2", "1.11"}:
             # BAPGR's boundary anchor is intentionally a fixed structural
             # prior. A trainable "boundary_anchor*" tensor would silently
@@ -1171,6 +1310,22 @@ class BasePipeline(object):
             print("  posterior-stable reliability config: YES")
 
         if version == "1.11":
+            cf_cfg = qbound_cfg.get("counterfactual", {})
+            if not isinstance(cf_cfg, dict):
+                cf_cfg = {}
+            cf_interface = bool(
+                qbound_cfg.get(
+                    "counterfactual_evidence_interface",
+                    False,
+                )
+            )
+            cf_training = bool(
+                cf_cfg.get(
+                    "training_enabled",
+                    cf_interface,
+                )
+            )
+
             print("  generic Q-Bound input adapter: YES")
             print(
                 "  input_adapter_use_position: "
@@ -1178,18 +1333,36 @@ class BasePipeline(object):
             )
             print(
                 "  counterfactual_evidence_interface: "
-                f"{bool(qbound_cfg.get('counterfactual_evidence_interface', False))}"
+                f"{cf_interface}"
             )
+            print(
+                "  counterfactual_training_enabled: "
+                f"{cf_training}"
+            )
+            if cf_training:
+                print(
+                    "  CF weights (suf/nec): "
+                    f"{float(cf_cfg.get('sufficiency_weight', 0.05))}/"
+                    f"{float(cf_cfg.get('necessity_weight', 0.05))}"
+                )
+                print(
+                    "  CF necessity_margin: "
+                    f"{float(cf_cfg.get('necessity_margin', 0.20))}"
+                )
+                print(
+                    "  CF necessity_correct_only: "
+                    f"{bool(cf_cfg.get('necessity_correct_only', True))}"
+                )
             print("  detached posterior-guided refinement config: YES")
             print("  boundary-structured BAPGR config: YES")
             print(
-                "  boundary_anchor_power: "
-                f"{float(refinement_cfg['boundary_anchor_power'])}"
+                "  boundary_anchor_power (fixed): "
+                f"{float(refinement_cfg.get('boundary_anchor_power', 2.0))}"
             )
             print("  prior-preserving bounded refinement (PPBR): YES")
             print(
-                "  correction_cap: "
-                f"{float(refinement_cfg['correction_cap'])}"
+                "  correction_cap (fixed): "
+                f"{float(refinement_cfg.get('correction_cap', 2.0))}"
             )
             print("  posterior-stable reliability config: YES")
 

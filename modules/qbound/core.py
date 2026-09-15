@@ -47,8 +47,16 @@ class QBoundCore(nn.Module):
     The core exposes differentiable soft keep/remove supports derived from the
     reliability-calibrated MAIN support:
 
-        keep_support(t)   = MAIN soft temporal support in [0,1]
-        remove_support(t) = 1 - keep_support(t) on valid frames
+        raw_keep(t)       = MAIN soft temporal support in [0,1]
+        raw_remove(t)     = 1 - raw_keep(t) on valid frames
+
+    V1.11-B uses a mass-preserving gradient view with identical forward values:
+
+        cf_keep = raw_keep + stopgrad(mean_valid(raw_keep)) - mean_valid(raw_keep)
+        cf_remove = 1 - cf_keep
+
+    This blocks the trivial all-video support solution for CF training without
+    introducing minimality, sparsity, or target-duration supervision.
 
     This is only an interface.  The core does NOT compute answer logits or add
     a counterfactual loss.  A downstream consumer can later construct, e.g.:
@@ -3430,32 +3438,72 @@ class QBoundCore(nn.Module):
         )
 
         # --------------------------------------------------------------
-        # E. V1.11 COUNTERFACTUAL EVIDENCE INTERFACE (no loss in core).
+        # E. V1.11-B COUNTERFACTUAL EVIDENCE INTERFACE (no loss in core).
         # --------------------------------------------------------------
-        # Use soft interval-membership support, not a unit-sum temporal
-        # probability, as the feature-level keep/remove gate.  This preserves
-        # the semantics of "inside relevant evidence" without imposing a
-        # sparsity/minimality objective.
-        counterfactual_keep_support = refinement[
+        # Start from the official reliability-calibrated MAIN soft support.
+        # This is an interval-membership support in [0,1], not a unit-sum
+        # temporal probability.
+        mask_f_cf = video_mask.to(
+            refinement["calibrated_soft_support"].dtype
+        )
+        counterfactual_raw_keep_support = refinement[
             "calibrated_soft_support"
         ].clamp(0.0, 1.0)
-        counterfactual_keep_support = (
-            counterfactual_keep_support
-            * video_mask.to(counterfactual_keep_support.dtype)
+        counterfactual_raw_keep_support = (
+            counterfactual_raw_keep_support * mask_f_cf
         )
-        counterfactual_remove_support = (
-            video_mask.to(counterfactual_keep_support.dtype)
-            - counterfactual_keep_support
+        counterfactual_raw_remove_support = (
+            mask_f_cf - counterfactual_raw_keep_support
         ).clamp(0.0, 1.0)
 
         cf_valid_length = video_mask.sum(dim=-1).to(
-            counterfactual_keep_support.dtype
+            counterfactual_raw_keep_support.dtype
         ).clamp_min(1.0)
+        counterfactual_raw_keep_fraction = (
+            counterfactual_raw_keep_support.sum(dim=-1)
+            / cf_valid_length
+        )
+
+        # Mass-preserving counterfactual gradient view.
+        # Forward values are unchanged, but the CF objective cannot win by
+        # globally expanding/shrinking all frame supports together:
+        #   cf_keep = raw_keep + stopgrad(mean_keep) - mean_keep
+        if self.counterfactual_evidence_interface:
+            mean_keep = counterfactual_raw_keep_fraction
+            mean_correction = (
+                mean_keep.detach() - mean_keep
+            ).unsqueeze(-1)
+            counterfactual_keep_support = (
+                counterfactual_raw_keep_support
+                + mean_correction * mask_f_cf
+            )
+        else:
+            counterfactual_keep_support = counterfactual_raw_keep_support
+
+        # Do not clamp again: the correction is numerically zero in forward,
+        # while an extra clamp could unnecessarily alter gradients at 0/1.
+        counterfactual_remove_support = (
+            mask_f_cf - counterfactual_keep_support
+        )
+
         counterfactual_keep_fraction = (
             counterfactual_keep_support.sum(dim=-1) / cf_valid_length
         )
         counterfactual_remove_fraction = (
             counterfactual_remove_support.sum(dim=-1) / cf_valid_length
+        )
+
+        # Forward-equivalence / complement diagnostics.
+        counterfactual_support_forward_error = (
+            counterfactual_keep_support.detach()
+            - counterfactual_raw_keep_support.detach()
+        ).abs().amax(dim=-1)
+        counterfactual_support_complement_error = (
+            (
+                counterfactual_keep_support.detach()
+                + counterfactual_remove_support.detach()
+                - mask_f_cf.detach()
+            ).abs().amax(dim=-1)
         )
 
         boundary_hard = decomposition["hard_boundary"]
@@ -3531,12 +3579,27 @@ class QBoundCore(nn.Module):
                 dtype=video_tokens.dtype,
                 device=video_tokens.device,
             ),
-            # Differentiable interface.  Downstream code decides whether the
-            # flag above is active for a V1.11-B answer-level objective.
+            "counterfactual_mass_preserving_gradient_enabled": torch.as_tensor(
+                float(self.counterfactual_evidence_interface),
+                dtype=video_tokens.dtype,
+                device=video_tokens.device,
+            ),
+            # Raw MAIN support retained for diagnostics.
+            "counterfactual_raw_keep_support": counterfactual_raw_keep_support,
+            "counterfactual_raw_remove_support": counterfactual_raw_remove_support,
+            "counterfactual_raw_keep_fraction": counterfactual_raw_keep_fraction,
+            # Differentiable V1.11-B CF training view. Forward values are
+            # identical to the raw support; only the backward path is guarded.
             "counterfactual_keep_support": counterfactual_keep_support,
             "counterfactual_remove_support": counterfactual_remove_support,
             "counterfactual_keep_fraction": counterfactual_keep_fraction,
             "counterfactual_remove_fraction": counterfactual_remove_fraction,
+            "counterfactual_support_forward_error": (
+                counterfactual_support_forward_error
+            ),
+            "counterfactual_support_complement_error": (
+                counterfactual_support_complement_error
+            ),
 
             # Core states.
             "qa_state": qa_state,
