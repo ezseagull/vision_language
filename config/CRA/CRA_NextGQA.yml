@@ -33,184 +33,148 @@ model:
   n_negs: 1
   prop_num: 1
 
-  # CRA is only the downstream VideoQA consumer/testbed.
-  # Q-Bound V1.12 receives sampled raw CLIP-L tokens through its own adapter.
-  # The CRA temporal key is retained only for diagnostics and is never used as
-  # a Q-Bound temporal prior/handover signal.
+  # CRA remains only the downstream VideoQA consumer/testbed.
+  # Q-Bound V2.0.0 receives the sampled raw CLIP-L sequence through its own
+  # generic adapter. CRA temporal grounding is retained only as a diagnostic.
   sigma: 3.0
   gamma: 1
   lamb: 0.15
   window_sizes: [1, 3, 5]
   time_penalty: null
 
-  # Keep CRA VisualIntervention OFF. V1.12 does not use it in either the
-  # question-only grounding student or the privileged answer-aware critic.
+  # Controlled V2.0.0 path: VisualIntervention stays OFF.
   do: false
 
   vg_loss: 1
   vote: 0
 
   # ============================================================
-  # Q-Bound V1.12 — EVENT-GUIDED TEMPORAL HYPOTHESIS COMPETITION
-  #                  + PRIVILEGED ANSWER-AWARE DISTILLATION
+  # Q-Bound V2.0.0 — FUNCTIONAL QUERY-ADAPTIVE TEMPORAL COMPOSITION
   #
-  # Main grounding path (train and inference):
+  # Main path:
   #
-  #   raw CLIP-L + question
-  #          ↓
-  #   Q-Bound generic input adapter
-  #          ↓
-  #   dynamic DECOMPOSE (K_i varies per sample)
-  #          ↓
-  #   Q-OEI RELATE
-  #          ↓
-  #   frame-exact contiguous hypothesis bank
-  #          ↓
-  #   question-only hypothesis scorer p_theta(H | V,Q)
-  #          ↓
-  #   hard winning hypothesis H*
-  #          ↓
-  #   exact temporal grounding
+  #   raw CLIP-L video + question-only semantics
+  #                    ↓
+  #            generic input adapter
+  #                    ↓
+  #             temporal dynamics
+  #          (state + Δx + Δ²x)
+  #                    ↓
+  #        video-only boundary prior b_t
+  #                    │
+  #                    ├──────── question
+  #                    ↓
+  #       bounded question residual δ_t^Q
+  #                    ↓
+  #        functional soft cut field c_t^Q
+  #                    ↓
+  #        boundary-gated local reasoning O(T)
+  #          + sparse query anchors O(T*R)
+  #                    ↓
+  #          factorized start/end heads
+  #                    ↓
+  #                 hard H*
   #
-  # For T=32, the exact hypothesis bank contains T(T+1)/2 = 528 intervals.
-  # Dynamic events provide semantic structure but DO NOT constrain the final
-  # start/end to event boundaries.
+  # Training uses GT answer labels only as weak functional supervision:
+  #   KEEP vs MERGE consequence -> functional composition loss
+  #   trim/expand consequence   -> boundary-equilibrium loss
   #
-  # Training-only privileged critic:
-  #
-  #   candidate answers + GT answer
-  #             ↓
-  #   stop-gradient CRA answer-aware critic
-  #             ↓
-  #   utility over H / trim / expand / complement
-  #             ↓
-  #   detached teacher distribution q(H)
-  #             ↓
-  #   KL(q || p_theta)
-  #
-  # Answers are NEVER inputs to QBoundCore and are NOT required to generate
-  # grounding at inference. This preserves answer-free grounding while using
-  # answer semantics as privileged supervision during training.
-  #
-  # V1.12 deliberately removes the V1.11 main-path machinery:
-  #   * latent COMPOSE as final selector
-  #   * BAPGR
-  #   * PPBR
-  #   * PSRC reliability calibration
-  #   * cross-video donor counterfactuals
-  #   * minimality / target-duration supervision
-  #   * CRA -> Q-Bound temporal handover
-  #   * direct event-token answer residual
+  # Temporal GT / IoU / IoP never enter the training loss.
+  # There is no fixed event count, max-event cap, event-count target,
+  # 528-span hypothesis bank, teacher distribution, or KL distillation.
   # ============================================================
   qbound:
     enabled: true
-    version: "1.12"
+    version: "2.0.0"
 
     # ----------------------------------------------------------
-    # Generic Q-Bound interface / capacity
+    # Generic answer-free Q-Bound interface
     # ----------------------------------------------------------
     hidden_dim: 256
-
-    # Capacity ceiling only. The selected event count K_i remains dynamic.
-    # We start with K_max=6; proposal_candidates=8 gives enough candidate
-    # change points to represent every event count up to this capacity.
-    max_events: 6
-    proposal_candidates: 8
-
-    # Q-Bound temporal reasoning/scoring uses question-only semantics.
     require_question_only: true
 
-    # No CRA temporal prior enters Q-Bound.
-    use_temporal_prior: false
-
-    # External visual/language encoders do not receive gradient through the
-    # Q-Bound route. Q-Bound's own adapter/core remain trainable.
+    # External CLIP/RoBERTa encoders do not receive gradients through the
+    # Q-Bound route; Q-Bound's private adapter/core remain trainable.
     detach_backbone_inputs: true
 
     dropout: 0.3
 
     # ----------------------------------------------------------
-    # Q-Bound-owned generic visual input adapter
+    # Generic visual input adapter
     # ----------------------------------------------------------
     use_generic_input_adapter: true
     input_adapter_dropout: 0.3
     input_adapter_use_position: true
 
     # ----------------------------------------------------------
-    # Question-conditioned temporal geometry retained from V1.4+
+    # Query-adaptive functional cut field
     # ----------------------------------------------------------
-    question_modulation_scale: 0.10
+    # Soft cut probabilities are produced from:
+    #   video-only prior logit + bounded question residual.
+    cut_temperature: 0.7
+
+    # Used to convert the soft cut field into hard event-count diagnostics.
+    # It is NOT a maximum/minimum event-count constraint.
+    cut_threshold: 0.5
+
+    # Maximum magnitude of the question-conditioned residual in cut-logit space.
+    # This keeps the video dynamics prior as the structural anchor.
+    question_residual_scale: 0.5
 
     # ----------------------------------------------------------
-    # DECOMPOSE: dynamic boundary proposals
+    # Boundary-gated temporal reasoning
     # ----------------------------------------------------------
-    boundary_temperature: 0.7
-    boundary_threshold: 0.5
-    boundary_radius: 2
-    boundary_bias_init: -0.5
-    min_event_mass: 0.25
+    # num_anchor_heads is a compute budget for sparse global reasoning,
+    # NOT a cap on the number of latent events.
+    num_anchor_heads: 4
+    num_local_reasoning_layers: 2
 
     # ----------------------------------------------------------
-    # DECOMPOSE: latent partition objective
+    # Weak functional composition supervision
     # ----------------------------------------------------------
-    decomposition:
-      enabled: true
+    # GT answers evaluate whether KEEP or MERGE preserves useful evidence.
+    # Near-ties receive low confidence rather than being forced into a cut/merge.
+    functional_composition:
       loss_weight: 0.10
-      complexity_weight: 1.25
-      boundary_weight: 0.50
-      temperature: 0.20
+      confidence_scale: 0.25
 
     # ----------------------------------------------------------
-    # RELATE: Question-Conditioned Ordered Event Interaction
+    # Functional boundary equilibrium
     # ----------------------------------------------------------
-    reasoning:
-      enabled: true
-      type: ordered_event_interaction
-
-    # ----------------------------------------------------------
-    # V1.12 privileged answer-aware hypothesis teacher
-    # ----------------------------------------------------------
-    hypothesis_teacher:
-      enabled: true
-
-      # Single new supervision weight. Teacher utility internally uses fixed,
-      # equal contributions from sufficiency, trim, expand and complement.
+    # GT-answer consequences of one-step trim/expand operations provide
+    # detached local correction targets for differentiable start/end heads.
+    boundary_equilibrium:
       loss_weight: 0.10
-
-      # Train ranking only when the full-video privileged critic predicts the
-      # GT answer correctly, avoiding unreliable temporal ordering targets.
-      correct_only: true
+      confidence_scale: 0.25
 
     # ----------------------------------------------------------
-    # Weak question/event semantic alignment retained
-    # ----------------------------------------------------------
-    weak_align_weight: 0.10
-    weak_align_temperature: 0.07
-
-    # ----------------------------------------------------------
-    # V1.12 controlled exclusions
+    # V2.0.0 controlled exclusions
     # ----------------------------------------------------------
     # No:
     #   temporal-GT supervision
-    #   supervised start/end loss
+    #   supervised start/end labels
     #   IoU / IoP optimization loss
-    #   fixed event-count target
-    #   target duration / minimum-span rule
-    #   minimality / sparsity loss
-    #   Composer/Refiner entropy regularization
-    #   BAPGR / PPBR / PSRC
-    #   cross-video donor counterfactual
+    #   max_events / min_events / event-count target
+    #   event-count regularization
+    #   target duration / minimality / sparsity loss
+    #   hard pre-reasoning event partition
+    #   all-pair O(K^2) event graph
+    #   528-span hypothesis bank
+    #   privileged teacher distribution / KL distillation
+    #   weak-align auxiliary branch from V1.12
     #   CRA -> Q-Bound temporal handover
     #   direct reasoned-event -> answer residual
-    #   answer feature input to QBoundCore
+    #   answer features inside QBoundCore
     #   answer requirement at grounding inference
 
 optim:
   pipeline: cra
   optimizer: Adam
 
-  # Main CRA task remains unchanged. V1.12 adds weak alignment,
-  # decomposition and listwise hypothesis-distillation losses in the pipeline.
+  # Main CRA objectives remain unchanged. Q-Bound V2.0.0 adds only:
+  #   lambda_comp * L_functional_composition
+  #   lambda_eq   * L_boundary_equilibrium
+  # Their weights are configured inside model.qbound above.
   loss:
     ce:
       vq: 1
@@ -223,8 +187,7 @@ optim:
   weight_decay: 0
   amsgrad: true
 
-  # All decoder.qbound.* parameters, including the generic input adapter,
-  # dynamic DECOMPOSE/Q-OEI and hypothesis scorer, use this optimizer group.
+  # All decoder.qbound.* parameters use the higher Q-Bound learning rate.
   qbound_lr: 5.e-5
 
   epochs: 15
@@ -243,11 +206,11 @@ stat:
 
   record_dir: ./output
 
-  # V1.12 is a structural redesign. Train from scratch; do not resume V1.11.
+  # V2.0.0 is an architectural reset. Train from scratch.
   resume: null
 
 misc:
-  running_name: CRA/NextGQA/QBound_v1.12_hypothesis_competition_seed2024
-  info: "CRA downstream testbed + Q-Bound V1.12 | raw CLIP-L -> Q-Bound generic adapter | VisualIntervention OFF | dynamic DECOMPOSE K<=6 + Q-OEI | exact 528 frame-level temporal hypotheses for T=32 | question-only student hypothesis scorer | stop-gradient privileged answer-aware critic | sufficiency + trim + expand + complement utility | listwise KL distillation lambda_rank=0.10 | answer-free grounding inference"
+  running_name: CRA/NextGQA/QBound_v2.0.0_functional_composition_seed2024
+  info: "CRA downstream testbed + Q-Bound V2.0.0 | raw CLIP-L -> temporal dynamics -> video-only boundary prior + bounded question residual -> dynamic functional cut field | no event-count cap | boundary-gated O(T) local reasoning + 4 query anchors | direct start/end grounding | GT-answer KEEP-vs-MERGE functional supervision lambda_comp=0.10 | trim/expand boundary-equilibrium lambda_eq=0.10 | no temporal GT | no 528 hypotheses | no teacher distillation | answer-free grounding inference"
   cuda: "0"
   seed: 2024

@@ -21,76 +21,73 @@ from utils.misc.misc import (
 
 class CRAPipeline(BasePipeline):
     """
-    CRA training/evaluation pipeline with Q-Bound Version 1.12.
+    CRA training/evaluation pipeline with Q-Bound Version 2.0.0.
 
-    V1.12 is a structural redesign.  Q-Bound no longer uses the historical
-    COMPOSE -> BAPGR -> PPBR -> PSRC -> donor-counterfactual chain.  The active
-    temporal path is:
+    V2.0.0 is a representation-level reset rather than another V1.x temporal
+    patch.  Q-Bound no longer commits to a fixed event partition, no longer
+    enumerates 528 temporal hypotheses, and no longer learns from a teacher
+    distribution.  The active temporal path is:
 
-        generic video tokens + question-only features
-            -> dynamic DECOMPOSE
-            -> ordered event RELATE
-            -> frame-exact temporal hypothesis bank
-            -> question-only hypothesis scorer
-            -> hard winning hypothesis H*
-            -> exact temporal grounding
+        generic video tokens
+            -> temporal dynamics
+            -> video-only transition prior
+            -> bounded question-conditioned functional cut residual
+            -> query-specific soft cut field
+            -> boundary-gated temporal reasoning
+            -> direct start/end grounding
+            -> hard H* at inference
 
-    The key new training signal is *privileged answer-aware temporal
-    distillation*.  Candidate-answer information never enters QBoundCore and is
-    not required for grounding at inference.  Instead, CRA exposes a
-    stop-gradient training-only critic that scores every temporal hypothesis and
-    its complement in answer space.
+    The event count is emergent.  There is no semantic ``max_events`` and no
+    event-count target.  A cut field c_t^Q only states whether preserving the
+    distinction between adjacent temporal states is useful for the current
+    question.
 
-    For a hypothesis H, the critic evaluates four properties without temporal
-    ground truth:
+    Weak supervision
+    ----------------
+    QBoundCore itself remains answer-free.  Candidate-answer information is
+    used only after the V+Q grounding forward pass by two deterministic,
+    stop-gradient CRA verifier interfaces:
 
-      1) sufficiency:
-            H should preserve the full-video answer decision;
+      1) Functional composition verifier:
+             KEEP(P_t | P_{t+1})  vs  MERGE(P_t,P_{t+1})
 
-      2) irredundancy:
-            trimming either valid boundary should not improve the answer
-            explanation and should preferably weaken it;
+         The GT-answer decision-margin change provides a local functional
+         signal for whether that temporal distinction should be preserved.
+         Small/noisy verifier differences receive little weight rather than
+         forcing arbitrary cuts.
 
-      3) completeness:
-            expanding either valid boundary should not materially improve the
-            answer explanation;
+      2) Boundary-equilibrium verifier:
+             H*, trim-left, trim-right, expand-left, expand-right
 
-      4) exclusivity:
-            H should explain the answer better than its temporal complement.
+         If a one-step boundary perturbation improves GT-answer evidence, that
+         action becomes a detached local correction target for the differentiable
+         start/end heads.  When no local perturbation improves evidence, the
+         boundary is at a local functional equilibrium and this auxiliary loss
+         vanishes.
 
-    These comparisons are computed from per-sample z-normalized answer decision
-    margins and combined with equal, fixed weights.  There is deliberately no
-    span-length/minimality reward: shorter is not automatically better.  Extra
-    evidence must improve the answer explanation to earn its place.
-
-    The detached critic utility induces a listwise target distribution over
-    temporal hypotheses.  Q-Bound's answer-free student scorer learns this
-    distribution with KL distillation:
+    Thus the Q-Bound-specific objective is:
 
         L = L_CRA/main
-            + lambda_align * L_weak_align
-            + lambda_decomp * L_decomp
-            + lambda_rank * KL(q_teacher || p_QBound)
+            + lambda_comp * L_functional_composition
+            + lambda_eq   * L_boundary_equilibrium
 
-    By default the ranking objective is applied only when the full-video critic
-    predicts the ground-truth answer correctly.  This prevents an unreliable
-    answer critic from teaching temporal ranking on samples it cannot yet solve.
+    where L_CRA/main is the repository's ordinary factual VQA/VQ objective.
+    No temporal GT, IoU, IoP, pseudo timestamp, teacher KL, span-length target,
+    or event-count regularizer is used for training.
 
-    Important invariants:
-      * no temporal GT / IoU / IoP training loss;
-      * no answer features inside QBoundCore;
-      * no CRA temporal handover into Q-Bound;
-      * no target span length or minimality objective;
-      * no donor-video intervention;
-      * no differentiable all-span answer marginalization;
-      * teacher/critic tensors are stop-gradient;
-      * inference grounding uses only video + question.
+    Important gradient rule
+    -----------------------
+    The functional composition loss uses the *detached* video transition prior
+    plus the trainable question residual.  Therefore this auxiliary loss teaches
+    the question-conditioned merge/cut adjustment without directly collapsing
+    the video-only prior.  The prior itself is learned through the factual QA
+    path because the cut field causally gates temporal reasoning.
     """
 
     def __init__(self, cfgs) -> None:
         super().__init__(cfgs)
 
-        self.qbound_version = "1.12"
+        self.qbound_version = "2.0.0"
         if self._qbound_enabled():
             model_cfg = self.cfgs.get("model", {})
             qbound_cfg = model_cfg.get("qbound", {})
@@ -131,7 +128,7 @@ class CRAPipeline(BasePipeline):
         )
 
     def _qbound_handover_settings(self):
-        """Compatibility helper: V1.12 has no CRA -> Q-Bound handover."""
+        """Compatibility helper: V2.0.0 has no CRA -> Q-Bound handover."""
         return 1.0, 0
 
     def _train_qbound_mix(self, epoch, batch_index, batches_per_epoch):
@@ -168,6 +165,14 @@ class CRAPipeline(BasePipeline):
         if values.numel() == 0:
             return 0.0
         return values.detach().float().mean().item()
+
+    @staticmethod
+    def _masked_mean_scalar(values, mask):
+        if values.shape != mask.shape:
+            raise ValueError("values/mask must have identical shape.")
+        mask_f = mask.to(values.dtype)
+        denominator = mask_f.sum().clamp_min(1.0)
+        return (values * mask_f).sum() / denominator
 
     @staticmethod
     def _normalize_distribution(values, mask=None, eps=1e-8):
@@ -214,159 +219,84 @@ class CRAPipeline(BasePipeline):
         return 0.5 * (first_kl + second_kl)
 
     # ------------------------------------------------------------------
-    # V1.12 objective configuration
+    # V2.0.0 objective configuration
     # ------------------------------------------------------------------
-    def _qbound_v112_loss_settings(self):
+    def _qbound_v200_loss_settings(self):
         """
         Preferred compact YAML:
 
             model:
               qbound:
-                weak_align_weight: 0.10
-                weak_align_temperature: 0.07
-                decomposition:
+                cut_temperature: 0.7
+                functional_composition:
                   loss_weight: 0.10
-                hypothesis_teacher:
-                  enabled: true
+                  confidence_scale: 0.25
+                boundary_equilibrium:
                   loss_weight: 0.10
-                  correct_only: true
+                  confidence_scale: 0.25
 
-        The four teacher criteria use equal fixed weights by design.  Their
-        scales are stabilized by per-sample z-normalization, so V1.12 does not
-        introduce separate sufficiency/trim/expand/complement coefficients or
-        an answer-logit margin hyperparameter.
+        ``confidence_scale`` does not define a desired answer margin.  It only
+        controls how strongly a measured verifier difference is trusted.  Near
+        ties receive almost zero auxiliary weight, which avoids forcing noisy
+        KEEP/MERGE or trim/expand decisions.
         """
         model_cfg = self.cfgs.get("model", {})
         qbound_cfg = model_cfg.get("qbound", {})
         if not isinstance(qbound_cfg, dict):
             qbound_cfg = {}
 
-        decomp_cfg = qbound_cfg.get("decomposition", {})
-        if not isinstance(decomp_cfg, dict):
-            decomp_cfg = {}
-
-        teacher_cfg = qbound_cfg.get("hypothesis_teacher", {})
-        if teacher_cfg is None:
-            teacher_cfg = {}
-        if not isinstance(teacher_cfg, dict):
+        comp_cfg = qbound_cfg.get("functional_composition", {})
+        if comp_cfg is None:
+            comp_cfg = {}
+        if not isinstance(comp_cfg, dict):
             raise TypeError(
-                "model.qbound.hypothesis_teacher must be a mapping/dict."
+                "model.qbound.functional_composition must be a mapping/dict."
             )
 
-        align_weight = float(
-            qbound_cfg.get(
-                "weak_align_weight",
-                model_cfg.get("qbound_weak_align_weight", 0.10),
+        eq_cfg = qbound_cfg.get("boundary_equilibrium", {})
+        if eq_cfg is None:
+            eq_cfg = {}
+        if not isinstance(eq_cfg, dict):
+            raise TypeError(
+                "model.qbound.boundary_equilibrium must be a mapping/dict."
             )
-        )
-        align_temperature = float(
-            qbound_cfg.get(
-                "weak_align_temperature",
-                model_cfg.get("qbound_weak_align_temperature", 0.07),
-            )
-        )
-        decomp_weight = float(
-            qbound_cfg.get(
-                "decomp_weight",
-                decomp_cfg.get(
-                    "loss_weight",
-                    model_cfg.get("qbound_decomp_weight", 0.10),
-                ),
-            )
-        )
-        teacher_enabled = bool(teacher_cfg.get("enabled", True))
-        teacher_loss_weight = float(teacher_cfg.get("loss_weight", 0.10))
-        teacher_correct_only = bool(teacher_cfg.get("correct_only", True))
 
-        if align_weight < 0.0:
-            raise ValueError("qbound weak_align_weight must be >= 0.")
-        if align_temperature <= 0.0:
-            raise ValueError("qbound weak_align_temperature must be > 0.")
-        if decomp_weight < 0.0:
-            raise ValueError("qbound decomposition loss_weight must be >= 0.")
-        if teacher_loss_weight < 0.0:
+        comp_weight = float(comp_cfg.get("loss_weight", 0.10))
+        comp_confidence_scale = float(
+            comp_cfg.get("confidence_scale", 0.25)
+        )
+        eq_weight = float(eq_cfg.get("loss_weight", 0.10))
+        eq_confidence_scale = float(
+            eq_cfg.get("confidence_scale", 0.25)
+        )
+        cut_temperature = float(qbound_cfg.get("cut_temperature", 0.7))
+
+        if comp_weight < 0.0:
             raise ValueError(
-                "qbound hypothesis_teacher.loss_weight must be >= 0."
+                "qbound functional_composition.loss_weight must be >= 0."
             )
-        if teacher_enabled and teacher_loss_weight <= 0.0:
+        if comp_confidence_scale <= 0.0:
             raise ValueError(
-                "V1.12 hypothesis teacher is enabled but its loss_weight is zero."
+                "qbound functional_composition.confidence_scale must be > 0."
             )
+        if eq_weight < 0.0:
+            raise ValueError(
+                "qbound boundary_equilibrium.loss_weight must be >= 0."
+            )
+        if eq_confidence_scale <= 0.0:
+            raise ValueError(
+                "qbound boundary_equilibrium.confidence_scale must be > 0."
+            )
+        if cut_temperature <= 0.0:
+            raise ValueError("qbound cut_temperature must be > 0.")
 
         return {
-            "align_weight": align_weight,
-            "align_temperature": align_temperature,
-            "decomp_weight": decomp_weight,
-            "teacher_enabled": teacher_enabled,
-            "teacher_loss_weight": teacher_loss_weight,
-            "teacher_correct_only": teacher_correct_only,
+            "functional_composition_weight": comp_weight,
+            "functional_confidence_scale": comp_confidence_scale,
+            "boundary_equilibrium_weight": eq_weight,
+            "equilibrium_confidence_scale": eq_confidence_scale,
+            "cut_temperature": cut_temperature,
         }
-
-    # ------------------------------------------------------------------
-    # Existing weak supervision retained from V1.11
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _qbound_inbatch_alignment(
-        evidence_visual_token,
-        question_state,
-        temperature,
-    ):
-        if evidence_visual_token is None or question_state is None:
-            raise ValueError(
-                "Q-Bound V1.12 weak alignment requires "
-                "evidence_visual_token and qa_state."
-            )
-        if evidence_visual_token.ndim != 2 or question_state.ndim != 2:
-            raise ValueError(
-                "Q-Bound weak-alignment tensors must both be [B,H]."
-            )
-        if evidence_visual_token.shape != question_state.shape:
-            raise ValueError(
-                "Q-Bound weak-alignment shape mismatch: "
-                f"{tuple(evidence_visual_token.shape)} vs "
-                f"{tuple(question_state.shape)}."
-            )
-
-        batch_size = evidence_visual_token.size(0)
-        if batch_size < 2:
-            return evidence_visual_token.sum() * 0.0, 0.0
-
-        visual = F.normalize(
-            evidence_visual_token,
-            p=2,
-            dim=-1,
-            eps=1e-6,
-        )
-        semantic = F.normalize(
-            question_state.detach(),
-            p=2,
-            dim=-1,
-            eps=1e-6,
-        )
-        logits = torch.matmul(visual, semantic.transpose(0, 1))
-        logits = logits / float(temperature)
-        labels = torch.arange(batch_size, device=logits.device)
-        visual_to_text = F.cross_entropy(logits, labels)
-        text_to_visual = F.cross_entropy(logits.transpose(0, 1), labels)
-        align_loss = 0.5 * (visual_to_text + text_to_visual)
-        retrieval_acc = (
-            logits.detach().argmax(dim=-1) == labels
-        ).float().mean().item()
-        return align_loss, retrieval_acc
-
-    @staticmethod
-    def _qbound_decomposition_loss(qbound_aux):
-        decomp_loss = qbound_aux.get("decomp_loss")
-        if not torch.is_tensor(decomp_loss):
-            raise KeyError(
-                "Q-Bound V1.12 requires qbound_aux['decomp_loss']."
-            )
-        value = decomp_loss.mean()
-        if not torch.isfinite(value):
-            raise FloatingPointError(
-                "Q-Bound V1.12 decomposition loss is NaN/Inf."
-            )
-        return value
 
     # ------------------------------------------------------------------
     # Repository answer scoring
@@ -451,29 +381,30 @@ class CRAPipeline(BasePipeline):
         return logits
 
     # ------------------------------------------------------------------
-    # V1.12 answer-aware hypothesis teacher
+    # Functional verifier helpers
     # ------------------------------------------------------------------
     @staticmethod
     def _answer_decision_margin(logits, labels):
         """
-        Decision margin:
+        GT-answer decision margin:
 
             z_y - logsumexp_{a != y}(z_a)
 
-        Works with logits [B,C] or [B,S,C].
+        Supports [B,C] or [B,M,C].  Verifier logits are already stop-gradient;
+        this helper is therefore used to derive local functional targets only.
         """
         if logits.ndim not in {2, 3}:
             raise ValueError(
-                "Decision-margin logits must be [B,C] or [B,S,C]."
+                "Decision-margin logits must be [B,C] or [B,M,C]."
             )
         if logits.size(-1) < 2:
             raise ValueError(
-                "V1.12 answer-aware teacher requires at least two answers."
+                "Functional verification requires at least two answers."
             )
 
         labels = labels.reshape(-1)
         if labels.numel() != logits.size(0):
-            raise ValueError("labels do not match teacher-logit batch size.")
+            raise ValueError("labels do not match verifier-logit batch size.")
 
         if logits.ndim == 2:
             gather_index = labels[:, None]
@@ -486,576 +417,429 @@ class CRAPipeline(BasePipeline):
 
         correct = logits.gather(-1, gather_index).squeeze(-1)
         wrong = logits.clone()
-        wrong.scatter_(
-            -1,
-            gather_index,
-            float("-inf"),
-        )
+        wrong.scatter_(-1, gather_index, float("-inf"))
         wrong_lse = torch.logsumexp(wrong, dim=-1)
         return correct - wrong_lse
 
     @staticmethod
-    def _masked_zscore(values, valid_mask, eps=1e-5):
-        if values.ndim != 2 or valid_mask.shape != values.shape:
-            raise ValueError(
-                "masked z-score expects values/mask with shape [B,S]."
-            )
-        valid = valid_mask.to(values.dtype)
-        count = valid.sum(dim=-1, keepdim=True).clamp_min(1.0)
-        mean = (values * valid).sum(dim=-1, keepdim=True) / count
-        variance = (
-            ((values - mean).pow(2) * valid).sum(dim=-1, keepdim=True)
-            / count
-        )
-        std = torch.sqrt(variance + eps)
-        normalized = (values - mean) / std
-        normalized = torch.where(
-            valid_mask,
-            normalized,
-            torch.zeros_like(normalized),
-        )
-        return normalized, mean.squeeze(-1), std.squeeze(-1)
+    def _confidence_from_gap(gap, scale):
+        """Map |functional change| to [0,1) without inventing a margin target."""
+        return 1.0 - torch.exp(-gap.abs() / float(scale))
 
-    @staticmethod
-    def _masked_softmax(logits, mask, dim=-1):
-        if logits.shape != mask.shape:
-            raise ValueError(
-                "masked softmax requires logits/mask with identical shape."
-            )
-        mask = mask.bool()
-        if not torch.all(mask.any(dim=dim)):
-            raise ValueError(
-                "Every sample needs at least one valid temporal hypothesis."
-            )
-        masked_logits = logits.masked_fill(~mask, -1e4)
-        probability = F.softmax(masked_logits, dim=dim)
-        probability = probability * mask.to(probability.dtype)
-        return probability / probability.sum(
-            dim=dim,
-            keepdim=True,
-        ).clamp_min(1e-8)
-
-    @staticmethod
-    def _masked_log_softmax(logits, mask, dim=-1):
-        if logits.shape != mask.shape:
-            raise ValueError(
-                "masked log-softmax requires logits/mask with identical shape."
-            )
-        mask = mask.bool()
-        if not torch.all(mask.any(dim=dim)):
-            raise ValueError(
-                "Every sample needs at least one valid temporal hypothesis."
-            )
-        masked_logits = logits.masked_fill(~mask, -1e4)
-        return F.log_softmax(masked_logits, dim=dim)
-
-    @staticmethod
-    def _gather_neighbor(values, indices):
-        if values.ndim != 2 or indices.shape != values.shape:
-            raise ValueError(
-                "neighbor gather expects values/indices with shape [B,S]."
-            )
-        safe = indices.clamp_min(0).to(torch.long)
-        return values.gather(dim=1, index=safe)
-
-    def _qbound_v112_hypothesis_distillation(
+    def _qbound_functional_composition_objective(
         self,
-        model_outputs,
+        qbound_aux,
         labels,
         settings,
     ):
         """
-        Build the detached privileged teacher and listwise ranking loss.
+        Learn query-specific cuts from local KEEP-vs-MERGE consequences.
 
-        The critic logits come from CRA.forward and are already stop-gradient.
-        This function converts them into a temporal utility without any GT span.
+        A positive GT-answer margin gap means KEEP preserves more useful
+        information than MERGE, so the detached target is CUT=1.  A negative
+        gap means MERGE is at least as functional, so the target is CUT=0.
+        Near ties are down-weighted by a continuous confidence term.
 
-        Utility terms use equal fixed weights after per-sample margin z-score:
+        Crucially, the auxiliary BCE is evaluated on:
 
-            sufficiency  : log sigmoid(M_H - M_full)
-            trim         : log sigmoid(M_H - M_trim)
-            expand       : log sigmoid(M_H - M_expand)
-            exclusivity  : log sigmoid(M_H - M_complement)
+            stopgrad(video_prior_logit) + trainable_question_residual
 
-        Only valid comparisons are included, and utility is divided by the
-        number of active comparisons for each hypothesis.  Therefore boundary
-        hypotheses do not receive a free advantage merely because one trim or
-        expansion neighbor does not exist.
+        so this loss cannot directly erase the video-only transition prior.
+        The prior remains trainable through the factual QA path, where the cut
+        field causally gates temporal reasoning.
         """
-        if not isinstance(model_outputs, dict):
-            raise TypeError(
-                "V1.12 hypothesis distillation requires model_outputs dict."
-            )
-
-        required_names = (
-            "qbound_hypothesis_logits",
-            "qbound_hypothesis_valid_mask",
-            "qbound_hypothesis_trim_left_index",
-            "qbound_hypothesis_trim_right_index",
-            "qbound_hypothesis_expand_left_index",
-            "qbound_hypothesis_expand_right_index",
-            "qbound_hypothesis_trim_left_valid_mask",
-            "qbound_hypothesis_trim_right_valid_mask",
-            "qbound_hypothesis_expand_left_valid_mask",
-            "qbound_hypothesis_expand_right_valid_mask",
-            "qbound_teacher_hypothesis_answer_logits",
-            "qbound_teacher_complement_answer_logits",
-            "qbound_teacher_full_video_answer_logits",
-            "qbound_teacher_hypothesis_valid_mask",
-            "qbound_teacher_complement_valid_mask",
-            "qbound_teacher_critic_stop_gradient",
-            "qbound_teacher_critic_projection_dropout_enabled",
-            "qbound_teacher_uses_answer_information",
-            "qbound_teacher_affects_grounding_forward",
-            "qbound_grounding_requires_answer_at_inference",
-            "qbound_selected_hypothesis_index",
-        )
-        missing = [
-            name for name in required_names
-            if model_outputs.get(name) is None
-        ]
-        if missing:
-            raise KeyError(
-                "V1.12 hypothesis-teacher outputs are missing: "
-                + ", ".join(missing)
-            )
-
-        student_logits = model_outputs["qbound_hypothesis_logits"]
-        valid_mask = model_outputs["qbound_hypothesis_valid_mask"].bool()
-        teacher_valid_mask = model_outputs[
-            "qbound_teacher_hypothesis_valid_mask"
-        ].bool()
-        complement_valid = model_outputs[
-            "qbound_teacher_complement_valid_mask"
-        ].bool()
-
-        hypothesis_answer_logits = model_outputs[
-            "qbound_teacher_hypothesis_answer_logits"
-        ].detach()
-        complement_answer_logits = model_outputs[
-            "qbound_teacher_complement_answer_logits"
-        ].detach()
-        full_video_answer_logits = model_outputs[
-            "qbound_teacher_full_video_answer_logits"
-        ].detach()
-
-        if student_logits.ndim != 2:
-            raise ValueError("qbound_hypothesis_logits must be [B,S].")
-        if valid_mask.shape != student_logits.shape:
-            raise ValueError(
-                "qbound_hypothesis_valid_mask must match student logits."
-            )
-        if not torch.equal(valid_mask, teacher_valid_mask):
-            raise RuntimeError(
-                "Student/teacher hypothesis-valid masks disagree in V1.12."
-            )
-        if hypothesis_answer_logits.shape[:2] != student_logits.shape:
-            raise ValueError(
-                "Teacher hypothesis logits must match [B,S] student bank."
-            )
-        if complement_answer_logits.shape != hypothesis_answer_logits.shape:
-            raise ValueError(
-                "Teacher complement logits must match hypothesis logits."
-            )
-        if full_video_answer_logits.ndim != 2:
-            raise ValueError("Teacher full-video logits must be [B,C].")
-
-        for flag_name, expected in (
-            ("qbound_teacher_critic_stop_gradient", 1.0),
-            ("qbound_teacher_critic_projection_dropout_enabled", 0.0),
-            ("qbound_teacher_uses_answer_information", 1.0),
-            ("qbound_teacher_affects_grounding_forward", 0.0),
-            ("qbound_grounding_requires_answer_at_inference", 0.0),
-        ):
-            flag = model_outputs[flag_name]
-            if not torch.is_tensor(flag):
-                raise TypeError(f"{flag_name} must be a tensor.")
-            actual = float(flag.detach().item())
-            if actual != expected:
-                raise RuntimeError(
-                    f"V1.12 invariant {flag_name}={expected} violated; "
-                    f"got {actual}."
-                )
-
-        labels = labels.reshape(-1)
-        if labels.numel() != student_logits.size(0):
-            raise ValueError("V1.12 labels do not match hypothesis batch size.")
-
-        with torch.no_grad():
-            margin_h = self._answer_decision_margin(
-                hypothesis_answer_logits,
-                labels,
-            )
-            margin_comp = self._answer_decision_margin(
-                complement_answer_logits,
-                labels,
-            )
-            margin_full = self._answer_decision_margin(
-                full_video_answer_logits,
-                labels,
-            )
-
-            margin_h_z, margin_mean, margin_std = self._masked_zscore(
-                margin_h,
-                valid_mask,
-            )
-            margin_full_z = (
-                margin_full - margin_mean
-            ) / margin_std.clamp_min(1e-5)
-            margin_comp_z = (
-                margin_comp - margin_mean[:, None]
-            ) / margin_std[:, None].clamp_min(1e-5)
-
-            # Fixed equal-weight comparisons.  log-sigmoid is bounded above by
-            # zero, scale-robust after z-normalization, and does not require a
-            # hand-tuned answer-logit margin.
-            sufficiency_score = F.logsigmoid(
-                margin_h_z - margin_full_z[:, None]
-            )
-            sufficiency_score = (
-                sufficiency_score * valid_mask.to(sufficiency_score.dtype)
-            )
-            utility_sum = sufficiency_score.clone()
-            utility_count = valid_mask.to(utility_sum.dtype)
-
-            component_sums = {
-                "sufficiency": sufficiency_score.clone(),
-                "trim": torch.zeros_like(utility_sum),
-                "expand": torch.zeros_like(utility_sum),
-                "exclusivity": torch.zeros_like(utility_sum),
-            }
-            component_counts = {
-                "sufficiency": valid_mask.to(utility_sum.dtype),
-                "trim": torch.zeros_like(utility_sum),
-                "expand": torch.zeros_like(utility_sum),
-                "exclusivity": torch.zeros_like(utility_sum),
-            }
-
-            neighbor_specs = (
-                (
-                    "trim",
-                    "qbound_hypothesis_trim_left_index",
-                    "qbound_hypothesis_trim_left_valid_mask",
-                ),
-                (
-                    "trim",
-                    "qbound_hypothesis_trim_right_index",
-                    "qbound_hypothesis_trim_right_valid_mask",
-                ),
-                (
-                    "expand",
-                    "qbound_hypothesis_expand_left_index",
-                    "qbound_hypothesis_expand_left_valid_mask",
-                ),
-                (
-                    "expand",
-                    "qbound_hypothesis_expand_right_index",
-                    "qbound_hypothesis_expand_right_valid_mask",
-                ),
-            )
-
-            for component_name, index_name, valid_name in neighbor_specs:
-                indices = model_outputs[index_name].detach().long()
-                compare_valid = (
-                    model_outputs[valid_name].detach().bool()
-                    & valid_mask
-                )
-                neighbor_margin = self._gather_neighbor(
-                    margin_h_z,
-                    indices,
-                )
-                score = F.logsigmoid(margin_h_z - neighbor_margin)
-                score = score * compare_valid.to(score.dtype)
-                utility_sum = utility_sum + score
-                utility_count = utility_count + compare_valid.to(score.dtype)
-                component_sums[component_name] = (
-                    component_sums[component_name] + score
-                )
-                component_counts[component_name] = (
-                    component_counts[component_name]
-                    + compare_valid.to(score.dtype)
-                )
-
-            exclusivity_valid = complement_valid & valid_mask
-            exclusivity_score = F.logsigmoid(
-                margin_h_z - margin_comp_z
-            )
-            exclusivity_score = (
-                exclusivity_score
-                * exclusivity_valid.to(exclusivity_score.dtype)
-            )
-            utility_sum = utility_sum + exclusivity_score
-            utility_count = (
-                utility_count
-                + exclusivity_valid.to(exclusivity_score.dtype)
-            )
-            component_sums["exclusivity"] = exclusivity_score
-            component_counts["exclusivity"] = exclusivity_valid.to(
-                exclusivity_score.dtype
-            )
-
-            teacher_utility = utility_sum / utility_count.clamp_min(1.0)
-            teacher_utility = teacher_utility.masked_fill(~valid_mask, -1e4)
-            teacher_probability = self._masked_softmax(
-                teacher_utility,
-                valid_mask,
-            ).detach()
-
-            full_video_correct = (
-                full_video_answer_logits.argmax(dim=-1) == labels
-            )
-            if bool(settings["teacher_correct_only"]):
-                active_sample = full_video_correct
-            else:
-                active_sample = torch.ones_like(full_video_correct)
-
-            teacher_top1_index = teacher_probability.argmax(dim=-1)
-            student_top1_index = student_logits.detach().masked_fill(
-                ~valid_mask,
-                -1e4,
-            ).argmax(dim=-1)
-            selected_index = model_outputs[
-                "qbound_selected_hypothesis_index"
-            ].detach().long().reshape(-1)
-
-            batch_index = torch.arange(
-                student_logits.size(0),
-                device=student_logits.device,
-            )
-            selected_teacher_prob = teacher_probability[
-                batch_index,
-                selected_index,
-            ]
-            selected_teacher_utility = teacher_utility[
-                batch_index,
-                selected_index,
-            ]
-            best_teacher_utility = teacher_utility[
-                batch_index,
-                teacher_top1_index,
-            ]
-
-            # Rank 1 is best.  Percentile 1.0 means teacher-best, 0.0 means
-            # worst among valid hypotheses.
-            greater = (
-                teacher_utility
-                > selected_teacher_utility[:, None]
-            ) & valid_mask
-            selected_rank = 1.0 + greater.sum(dim=-1).to(torch.float32)
-            valid_count = valid_mask.sum(dim=-1).clamp_min(1).to(torch.float32)
-            selected_rank_percentile = torch.where(
-                valid_count > 1.0,
-                1.0 - (selected_rank - 1.0) / (valid_count - 1.0),
-                torch.ones_like(valid_count),
-            )
-
-            teacher_entropy = -torch.sum(
-                teacher_probability
-                * torch.log(teacher_probability.clamp_min(1e-8)),
-                dim=-1,
-            )
-            max_entropy = torch.log(valid_count.clamp_min(1.0))
-            teacher_entropy_ratio = torch.where(
-                valid_count > 1.0,
-                teacher_entropy / max_entropy.clamp_min(1e-6),
-                torch.zeros_like(teacher_entropy),
-            )
-
-            teacher_best_answer_logits = hypothesis_answer_logits[
-                batch_index,
-                teacher_top1_index,
-            ]
-            selected_answer_logits = hypothesis_answer_logits[
-                batch_index,
-                selected_index,
-            ]
-            selected_complement_logits = complement_answer_logits[
-                batch_index,
-                selected_index,
-            ]
-
-            component_means = {}
-            for component_name in component_sums:
-                numerator = component_sums[component_name].sum(dim=-1)
-                denominator = component_counts[component_name].sum(
-                    dim=-1
-                ).clamp_min(1.0)
-                component_means[component_name] = numerator / denominator
-
-        # Student side remains differentiable.
-        student_log_probability = self._masked_log_softmax(
-            student_logits,
-            valid_mask,
-        )
-        per_sample_kl = torch.sum(
-            teacher_probability
-            * (
-                torch.log(teacher_probability.clamp_min(1e-8))
-                - student_log_probability
-            ),
-            dim=-1,
-        )
-
-        active_float = active_sample.to(per_sample_kl.dtype)
-        active_count = active_float.sum()
-        if float(active_count.detach().item()) > 0.0:
-            ranking_loss = (
-                per_sample_kl * active_float
-            ).sum() / active_count
-        else:
-            ranking_loss = student_logits.sum() * 0.0
-
-        with torch.no_grad():
-            student_probability = self._masked_softmax(
-                student_logits.detach(),
-                valid_mask,
-            )
-            student_entropy = -torch.sum(
-                student_probability
-                * torch.log(student_probability.clamp_min(1e-8)),
-                dim=-1,
-            )
-            valid_count = valid_mask.sum(dim=-1).clamp_min(1).to(
-                student_probability.dtype
-            )
-            student_entropy_ratio = torch.where(
-                valid_count > 1.0,
-                student_entropy
-                / torch.log(valid_count).clamp_min(1e-6),
-                torch.zeros_like(student_entropy),
-            )
-
-            selected_margin = margin_h[
-                batch_index,
-                selected_index,
-            ]
-            best_margin = margin_h[
-                batch_index,
-                teacher_top1_index,
-            ]
-            selected_complement_margin = margin_comp[
-                batch_index,
-                selected_index,
-            ]
-
-            diagnostics = {
-                "teacher_active_ratio": active_float.mean().item(),
-                "teacher_full_video_acc": full_video_correct.float().mean().item(),
-                "teacher_top1_probability": teacher_probability.max(
-                    dim=-1
-                ).values.mean().item(),
-                "teacher_entropy": teacher_entropy.mean().item(),
-                "teacher_entropy_ratio": teacher_entropy_ratio.mean().item(),
-                "teacher_effective_count": torch.exp(
-                    teacher_entropy
-                ).mean().item(),
-                "student_top1_probability": student_probability.max(
-                    dim=-1
-                ).values.mean().item(),
-                "student_entropy": student_entropy.mean().item(),
-                "student_entropy_ratio": student_entropy_ratio.mean().item(),
-                "teacher_student_top1_agreement": (
-                    teacher_top1_index == student_top1_index
-                ).float().mean().item(),
-                "selected_is_teacher_top1_ratio": (
-                    selected_index == teacher_top1_index
-                ).float().mean().item(),
-                "selected_teacher_probability": selected_teacher_prob.mean().item(),
-                "selected_teacher_utility": selected_teacher_utility.mean().item(),
-                "teacher_best_utility": best_teacher_utility.mean().item(),
-                "teacher_best_minus_selected_utility": (
-                    best_teacher_utility - selected_teacher_utility
-                ).mean().item(),
-                "selected_rank_percentile": selected_rank_percentile.mean().item(),
-                "teacher_best_answer_acc": (
-                    teacher_best_answer_logits.argmax(dim=-1) == labels
-                ).float().mean().item(),
-                "teacher_selected_answer_acc": (
-                    selected_answer_logits.argmax(dim=-1) == labels
-                ).float().mean().item(),
-                "teacher_selected_complement_acc": (
-                    selected_complement_logits.argmax(dim=-1) == labels
-                ).float().mean().item(),
-                "teacher_full_margin": margin_full.mean().item(),
-                "teacher_selected_margin": selected_margin.mean().item(),
-                "teacher_best_margin": best_margin.mean().item(),
-                "teacher_selected_complement_margin": (
-                    selected_complement_margin.mean().item()
-                ),
-                "teacher_sufficiency_component": (
-                    component_means["sufficiency"].mean().item()
-                ),
-                "teacher_trim_component": (
-                    component_means["trim"].mean().item()
-                ),
-                "teacher_expand_component": (
-                    component_means["expand"].mean().item()
-                ),
-                "teacher_exclusivity_component": (
-                    component_means["exclusivity"].mean().item()
-                ),
-            }
-
-        return {
-            "ranking_loss": ranking_loss,
-            "teacher_probability": teacher_probability,
-            "teacher_utility": teacher_utility,
-            "teacher_top1_index": teacher_top1_index,
-            "active_sample_mask": active_sample,
-            **diagnostics,
-        }
-
-    # ------------------------------------------------------------------
-    # V1.12 diagnostics
-    # ------------------------------------------------------------------
-    def _validate_v112_contract(self, qbound_aux):
-        if qbound_aux is None:
-            raise KeyError("Q-Bound V1.12 must expose qbound_aux.")
-
         required = {
-            "qbound_version",
-            "dynamic_event_count_enabled",
-            "hypothesis_competition_enabled",
-            "answer_features_used_in_core",
-            "legacy_composer_enabled",
-            "legacy_refiner_enabled",
-            "legacy_counterfactual_donor_enabled",
-            "generic_input_adapter_enabled",
-            "generic_input_context_reuse",
-            "qbound_input_is_generic",
-            "qbound_input_uses_cra_embedding",
-            "event_count",
-            "event_capacity",
-            "decomp_loss",
-            "evidence_visual_token",
-            "qa_state",
-            "hypothesis_logits",
-            "hypothesis_posterior",
-            "hypothesis_valid_mask",
-            "hypothesis_start_frame",
-            "hypothesis_end_frame",
-            "hypothesis_frame_weights",
-            "hypothesis_complement_frame_weights",
-            "selected_hypothesis_index",
-            "selected_hypothesis_start_frame",
-            "selected_hypothesis_end_frame",
-            "selected_hypothesis_span_length",
-            "main_temporal_prob",
-            "qbound_key",
-            "final_key",
-            "teacher_hypothesis_answer_logits",
-            "teacher_complement_answer_logits",
-            "teacher_full_video_answer_logits",
-            "teacher_critic_stop_gradient",
-            "teacher_critic_projection_dropout_enabled",
-            "teacher_uses_answer_information",
-            "teacher_affects_grounding_forward",
-            "grounding_requires_answer_at_inference",
+            "functional_cut_prob",
+            "video_boundary_prior_logits",
+            "question_cut_residual",
+            "functional_pair_valid_mask",
+            "functional_keep_answer_logits",
+            "functional_merge_answer_logits",
+            "functional_left_answer_logits",
+            "functional_right_answer_logits",
+            "functional_verifier_stop_gradient",
+            "teacher_distribution_used",
         }
         missing = sorted(required.difference(qbound_aux))
         if missing:
             raise KeyError(
-                "Missing Q-Bound V1.12 outputs: " + ", ".join(missing)
+                "V2.0.0 functional-composition interface is missing: "
+                + ", ".join(missing)
+            )
+
+        pair_valid = qbound_aux["functional_pair_valid_mask"].bool()
+        keep_logits = qbound_aux["functional_keep_answer_logits"].detach()
+        merge_logits = qbound_aux["functional_merge_answer_logits"].detach()
+        left_logits = qbound_aux["functional_left_answer_logits"].detach()
+        right_logits = qbound_aux["functional_right_answer_logits"].detach()
+
+        if keep_logits.ndim != 3:
+            raise ValueError(
+                "functional_keep_answer_logits must be [B,T-1,C]."
+            )
+        if merge_logits.shape != keep_logits.shape:
+            raise ValueError("KEEP/MERGE verifier logits must have same shape.")
+        if left_logits.shape != keep_logits.shape or right_logits.shape != keep_logits.shape:
+            raise ValueError("LEFT/RIGHT verifier logits must match KEEP logits.")
+        if pair_valid.shape != keep_logits.shape[:2]:
+            raise ValueError(
+                "functional_pair_valid_mask must match verifier [B,T-1]."
+            )
+
+        with torch.no_grad():
+            keep_margin = self._answer_decision_margin(keep_logits, labels)
+            merge_margin = self._answer_decision_margin(merge_logits, labels)
+            left_margin = self._answer_decision_margin(left_logits, labels)
+            right_margin = self._answer_decision_margin(right_logits, labels)
+            functional_gap = keep_margin - merge_margin
+
+            target_cut = (functional_gap > 0.0).to(keep_margin.dtype)
+            confidence = self._confidence_from_gap(
+                functional_gap,
+                settings["functional_confidence_scale"],
+            )
+            confidence = confidence * pair_valid.to(confidence.dtype)
+
+        # Do not let this local answer-based objective directly rewrite the
+        # video-only prior.  It teaches only the question-conditioned residual.
+        effective_logits = (
+            qbound_aux["video_boundary_prior_logits"].detach()
+            + qbound_aux["question_cut_residual"]
+        ) / float(settings["cut_temperature"])
+
+        element_loss = F.binary_cross_entropy_with_logits(
+            effective_logits,
+            target_cut,
+            reduction="none",
+        )
+        denominator = confidence.sum()
+        if float(denominator.detach().item()) > 0.0:
+            composition_loss = (
+                element_loss * confidence
+            ).sum() / denominator
+        else:
+            # Preserve graph connectivity to the question residual.
+            composition_loss = qbound_aux["question_cut_residual"].sum() * 0.0
+
+        with torch.no_grad():
+            valid_float = pair_valid.to(functional_gap.dtype)
+            valid_count = valid_float.sum().clamp_min(1.0)
+            predicted_cut = qbound_aux["functional_cut_prob"].detach() >= 0.5
+            confident_mask = pair_valid & (confidence > 0.05)
+            if confident_mask.any():
+                agreement = (
+                    predicted_cut[confident_mask]
+                    == target_cut.bool()[confident_mask]
+                ).float().mean().item()
+            else:
+                agreement = 0.0
+
+            diagnostics = {
+                "functional_gap_mean": (
+                    functional_gap * valid_float
+                ).sum().item() / valid_count.item(),
+                "functional_gap_abs_mean": (
+                    functional_gap.abs() * valid_float
+                ).sum().item() / valid_count.item(),
+                "functional_keep_better_ratio": (
+                    ((functional_gap > 0.0) & pair_valid).float().sum()
+                    / valid_count
+                ).item(),
+                "functional_merge_better_ratio": (
+                    ((functional_gap < 0.0) & pair_valid).float().sum()
+                    / valid_count
+                ).item(),
+                "functional_target_cut_ratio": (
+                    (target_cut * valid_float).sum() / valid_count
+                ).item(),
+                "functional_confidence_mean": (
+                    confidence.sum() / valid_count
+                ).item(),
+                "functional_cut_target_agreement": agreement,
+                "functional_left_right_margin_gap": (
+                    ((left_margin - right_margin).abs() * valid_float).sum()
+                    / valid_count
+                ).item(),
+            }
+
+        return composition_loss, diagnostics
+
+    def _qbound_boundary_equilibrium_objective(
+        self,
+        qbound_aux,
+        labels,
+        settings,
+    ):
+        """
+        Convert local answer-evidence improvements into endpoint corrections.
+
+        The verifier itself is detached, so directly summing pairwise margin
+        penalties would have zero gradient.  Instead, the best *improving*
+        one-step action becomes a detached pseudo-action for the differentiable
+        start/end heads:
+
+          start: trim-left => s+1, expand-left => s-1
+          end  : trim-right => e-1, expand-right => e+1
+
+        If neither local action improves the selected span's GT-answer margin,
+        that boundary is already at local functional equilibrium and receives
+        zero auxiliary correction.  This avoids self-training the model to keep
+        an early, possibly wrong, hard boundary merely because it selected it.
+        """
+        required = {
+            "start_logits",
+            "end_logits",
+            "selected_span_start_frame",
+            "selected_span_end_frame",
+            "equilibrium_selected_answer_logits",
+            "equilibrium_trim_left_answer_logits",
+            "equilibrium_trim_right_answer_logits",
+            "equilibrium_expand_left_answer_logits",
+            "equilibrium_expand_right_answer_logits",
+            "equilibrium_trim_left_valid_mask",
+            "equilibrium_trim_right_valid_mask",
+            "equilibrium_expand_left_valid_mask",
+            "equilibrium_expand_right_valid_mask",
+            "equilibrium_verifier_stop_gradient",
+            "teacher_distribution_used",
+        }
+        missing = sorted(required.difference(qbound_aux))
+        if missing:
+            raise KeyError(
+                "V2.0.0 boundary-equilibrium interface is missing: "
+                + ", ".join(missing)
+            )
+
+        start_logits = qbound_aux["start_logits"]
+        end_logits = qbound_aux["end_logits"]
+        if start_logits.ndim != 2 or end_logits.shape != start_logits.shape:
+            raise ValueError("start_logits/end_logits must be matching [B,T].")
+        batch_size, time_steps = start_logits.shape
+
+        selected_start = qbound_aux["selected_span_start_frame"].detach().long()
+        selected_end = qbound_aux["selected_span_end_frame"].detach().long()
+        if selected_start.shape != (batch_size,) or selected_end.shape != (batch_size,):
+            raise ValueError("selected span endpoints must be [B].")
+
+        selected_answer = qbound_aux[
+            "equilibrium_selected_answer_logits"
+        ].detach()
+        trim_left_answer = qbound_aux[
+            "equilibrium_trim_left_answer_logits"
+        ].detach()
+        trim_right_answer = qbound_aux[
+            "equilibrium_trim_right_answer_logits"
+        ].detach()
+        expand_left_answer = qbound_aux[
+            "equilibrium_expand_left_answer_logits"
+        ].detach()
+        expand_right_answer = qbound_aux[
+            "equilibrium_expand_right_answer_logits"
+        ].detach()
+
+        with torch.no_grad():
+            selected_margin = self._answer_decision_margin(selected_answer, labels)
+            trim_left_margin = self._answer_decision_margin(trim_left_answer, labels)
+            trim_right_margin = self._answer_decision_margin(trim_right_answer, labels)
+            expand_left_margin = self._answer_decision_margin(expand_left_answer, labels)
+            expand_right_margin = self._answer_decision_margin(expand_right_answer, labels)
+
+            tl_valid = qbound_aux["equilibrium_trim_left_valid_mask"].detach().bool()
+            tr_valid = qbound_aux["equilibrium_trim_right_valid_mask"].detach().bool()
+            el_valid = qbound_aux["equilibrium_expand_left_valid_mask"].detach().bool()
+            er_valid = qbound_aux["equilibrium_expand_right_valid_mask"].detach().bool()
+
+            neg_inf = torch.full_like(selected_margin, float("-inf"))
+            tl_gain = torch.where(
+                tl_valid,
+                trim_left_margin - selected_margin,
+                neg_inf,
+            )
+            el_gain = torch.where(
+                el_valid,
+                expand_left_margin - selected_margin,
+                neg_inf,
+            )
+            tr_gain = torch.where(
+                tr_valid,
+                trim_right_margin - selected_margin,
+                neg_inf,
+            )
+            er_gain = torch.where(
+                er_valid,
+                expand_right_margin - selected_margin,
+                neg_inf,
+            )
+
+            left_gains = torch.stack([tl_gain, el_gain], dim=-1)
+            right_gains = torch.stack([tr_gain, er_gain], dim=-1)
+            left_best_gain, left_action = left_gains.max(dim=-1)
+            right_best_gain, right_action = right_gains.max(dim=-1)
+
+            left_improves = torch.isfinite(left_best_gain) & (left_best_gain > 0.0)
+            right_improves = torch.isfinite(right_best_gain) & (right_best_gain > 0.0)
+
+            target_start = selected_start.clone()
+            target_start = torch.where(
+                left_improves & (left_action == 0),
+                target_start + 1,
+                target_start,
+            )
+            target_start = torch.where(
+                left_improves & (left_action == 1),
+                target_start - 1,
+                target_start,
+            )
+
+            target_end = selected_end.clone()
+            target_end = torch.where(
+                right_improves & (right_action == 0),
+                target_end - 1,
+                target_end,
+            )
+            target_end = torch.where(
+                right_improves & (right_action == 1),
+                target_end + 1,
+                target_end,
+            )
+
+            target_start = target_start.clamp(min=0, max=time_steps - 1)
+            target_end = target_end.clamp(min=0, max=time_steps - 1)
+
+            left_positive_gain = torch.where(
+                left_improves,
+                left_best_gain.clamp_min(0.0),
+                torch.zeros_like(left_best_gain),
+            )
+            right_positive_gain = torch.where(
+                right_improves,
+                right_best_gain.clamp_min(0.0),
+                torch.zeros_like(right_best_gain),
+            )
+            left_confidence = self._confidence_from_gap(
+                left_positive_gain,
+                settings["equilibrium_confidence_scale"],
+            ) * left_improves.to(left_positive_gain.dtype)
+            right_confidence = self._confidence_from_gap(
+                right_positive_gain,
+                settings["equilibrium_confidence_scale"],
+            ) * right_improves.to(right_positive_gain.dtype)
+
+        start_ce = F.cross_entropy(
+            start_logits,
+            target_start,
+            reduction="none",
+        )
+        end_ce = F.cross_entropy(
+            end_logits,
+            target_end,
+            reduction="none",
+        )
+
+        denominator = left_confidence.sum() + right_confidence.sum()
+        if float(denominator.detach().item()) > 0.0:
+            equilibrium_loss = (
+                (start_ce * left_confidence).sum()
+                + (end_ce * right_confidence).sum()
+            ) / denominator
+        else:
+            equilibrium_loss = (start_logits.sum() + end_logits.sum()) * 0.0
+
+        with torch.no_grad():
+            tl_action = left_improves & (left_action == 0)
+            el_action = left_improves & (left_action == 1)
+            tr_action = right_improves & (right_action == 0)
+            er_action = right_improves & (right_action == 1)
+            diagnostics = {
+                "equilibrium_selected_margin": selected_margin.mean().item(),
+                "equilibrium_active_left_ratio": left_improves.float().mean().item(),
+                "equilibrium_active_right_ratio": right_improves.float().mean().item(),
+                "equilibrium_active_any_ratio": (
+                    left_improves | right_improves
+                ).float().mean().item(),
+                "equilibrium_trim_left_action_ratio": tl_action.float().mean().item(),
+                "equilibrium_expand_left_action_ratio": el_action.float().mean().item(),
+                "equilibrium_trim_right_action_ratio": tr_action.float().mean().item(),
+                "equilibrium_expand_right_action_ratio": er_action.float().mean().item(),
+                "equilibrium_left_gain_mean": left_positive_gain.mean().item(),
+                "equilibrium_right_gain_mean": right_positive_gain.mean().item(),
+                "equilibrium_left_confidence_mean": left_confidence.mean().item(),
+                "equilibrium_right_confidence_mean": right_confidence.mean().item(),
+                "equilibrium_start_shift_abs_mean": (
+                    target_start - selected_start
+                ).abs().float().mean().item(),
+                "equilibrium_end_shift_abs_mean": (
+                    target_end - selected_end
+                ).abs().float().mean().item(),
+            }
+
+        return equilibrium_loss, diagnostics
+
+    # ------------------------------------------------------------------
+    # V2.0.0 contract + diagnostics
+    # ------------------------------------------------------------------
+    def _validate_v200_contract(self, qbound_aux):
+        if qbound_aux is None:
+            raise KeyError("Q-Bound V2.0.0 must expose qbound_aux.")
+
+        required = {
+            "qbound_version",
+            "qbound_input_is_generic",
+            "qbound_input_uses_cra_embedding",
+            "functional_composition_enabled",
+            "dynamic_event_count_enabled",
+            "fixed_event_partition_enabled",
+            "event_count_cap_enabled",
+            "hypothesis_competition_enabled",
+            "teacher_distillation_enabled",
+            "answer_features_used_in_core",
+            "boundary_equilibrium_interface_enabled",
+            "functional_answer_verifier_ready",
+            "boundary_equilibrium_verifier_ready",
+            "functional_verifier_consumer_stop_gradient",
+            "teacher_distribution_used",
+            "functional_verifier_uses_answer_information",
+            "functional_verifier_affects_grounding_forward",
+            "grounding_requires_answer_at_inference",
+            "temporal_gt_used_in_training",
+            "functional_verifier_stop_gradient",
+            "equilibrium_verifier_stop_gradient",
+            "video_boundary_prior_logits",
+            "video_boundary_prior_prob",
+            "question_cut_residual",
+            "functional_cut_logits",
+            "functional_cut_prob",
+            "functional_merge_gate",
+            "functional_pair_valid_mask",
+            "hard_event_count",
+            "soft_effective_event_count",
+            "one_event_indicator",
+            "all_split_indicator",
+            "start_logits",
+            "end_logits",
+            "start_prob",
+            "end_prob",
+            "training_temporal_prob",
+            "main_temporal_prob",
+            "selected_span_start_frame",
+            "selected_span_end_frame",
+            "selected_span_length",
+            "selected_span_fraction",
+            "functional_keep_answer_logits",
+            "functional_merge_answer_logits",
+            "equilibrium_selected_answer_logits",
+            "equilibrium_trim_left_answer_logits",
+            "equilibrium_trim_right_answer_logits",
+            "equilibrium_expand_left_answer_logits",
+            "equilibrium_expand_right_answer_logits",
+            "cra_key",
+            "qbound_key",
+            "qbound_training_key",
+        }
+        missing = sorted(required.difference(qbound_aux))
+        if missing:
+            raise KeyError(
+                "Missing Q-Bound V2.0.0 outputs: " + ", ".join(missing)
             )
 
         if str(qbound_aux["qbound_version"]) != self.qbound_version:
@@ -1067,29 +851,50 @@ class CRAPipeline(BasePipeline):
 
         def _flag(name, expected):
             value = qbound_aux[name]
-            if not torch.is_tensor(value):
-                raise TypeError(f"Q-Bound flag {name!r} must be a tensor.")
+            if not torch.is_tensor(value) or value.numel() != 1:
+                raise TypeError(f"Q-Bound flag {name!r} must be a scalar tensor.")
             actual = float(value.detach().item())
             if actual != float(expected):
                 raise RuntimeError(
-                    f"Q-Bound V1.12 flag {name!r} must be {expected}; "
+                    f"Q-Bound V2.0.0 flag {name!r} must be {expected}; "
                     f"got {actual}."
                 )
 
-        _flag("dynamic_event_count_enabled", 1.0)
-        _flag("hypothesis_competition_enabled", 1.0)
-        _flag("answer_features_used_in_core", 0.0)
-        _flag("legacy_composer_enabled", 0.0)
-        _flag("legacy_refiner_enabled", 0.0)
-        _flag("legacy_counterfactual_donor_enabled", 0.0)
-        _flag("qbound_input_is_generic", 1.0)
-        _flag("qbound_input_uses_cra_embedding", 0.0)
-        _flag("generic_input_context_reuse", 1.0)
-        _flag("teacher_critic_stop_gradient", 1.0)
-        _flag("teacher_critic_projection_dropout_enabled", 0.0)
-        _flag("teacher_uses_answer_information", 1.0)
-        _flag("teacher_affects_grounding_forward", 0.0)
-        _flag("grounding_requires_answer_at_inference", 0.0)
+        expected_flags = {
+            "qbound_input_is_generic": 1.0,
+            "qbound_input_uses_cra_embedding": 0.0,
+            "functional_composition_enabled": 1.0,
+            "dynamic_event_count_enabled": 1.0,
+            "fixed_event_partition_enabled": 0.0,
+            "event_count_cap_enabled": 0.0,
+            "hypothesis_competition_enabled": 0.0,
+            "teacher_distillation_enabled": 0.0,
+            "answer_features_used_in_core": 0.0,
+            "boundary_equilibrium_interface_enabled": 1.0,
+            "functional_answer_verifier_ready": 1.0,
+            "boundary_equilibrium_verifier_ready": 1.0,
+            "functional_verifier_consumer_stop_gradient": 1.0,
+            "functional_verifier_stop_gradient": 1.0,
+            "equilibrium_verifier_stop_gradient": 1.0,
+            "teacher_distribution_used": 0.0,
+            "functional_verifier_uses_answer_information": 1.0,
+            "functional_verifier_affects_grounding_forward": 0.0,
+            "grounding_requires_answer_at_inference": 0.0,
+            "temporal_gt_used_in_training": 0.0,
+        }
+        for name, expected in expected_flags.items():
+            _flag(name, expected)
+
+        cut_prob = qbound_aux["functional_cut_prob"]
+        pair_valid = qbound_aux["functional_pair_valid_mask"]
+        if cut_prob.ndim != 2 or pair_valid.shape != cut_prob.shape:
+            raise ValueError(
+                "functional_cut_prob/pair mask must be matching [B,T-1]."
+            )
+        if qbound_aux["start_logits"].ndim != 2:
+            raise ValueError("start_logits must be [B,T].")
+        if qbound_aux["end_logits"].shape != qbound_aux["start_logits"].shape:
+            raise ValueError("start/end logits must have the same shape.")
 
     def _collect_qbound_stats(self, gqa_output, extra_logs=None):
         stats = {}
@@ -1100,228 +905,128 @@ class CRAPipeline(BasePipeline):
         if qbound_aux is None:
             return stats
 
-        # Architecture / input contract.
         scalar_keys = (
+            # Generic input / dynamics.
             "generic_input_adapter_enabled",
             "generic_input_position_enabled",
-            "generic_input_context_reuse",
             "generic_input_raw_rms",
             "generic_input_adapted_rms",
             "generic_input_token_cosine",
             "generic_input_delta_ratio",
+            "delta_magnitude",
+            "accel_magnitude",
+            # Architecture flags.
             "qbound_input_is_generic",
             "qbound_input_uses_cra_embedding",
+            "functional_composition_enabled",
             "dynamic_event_count_enabled",
-            "event_capacity",
+            "fixed_event_partition_enabled",
+            "event_count_cap_enabled",
             "hypothesis_competition_enabled",
+            "teacher_distillation_enabled",
             "answer_features_used_in_core",
-            "legacy_composer_enabled",
-            "legacy_refiner_enabled",
-            "legacy_counterfactual_donor_enabled",
-            "teacher_critic_stop_gradient",
-            "teacher_critic_projection_dropout_enabled",
-            "teacher_uses_answer_information",
-            "teacher_affects_grounding_forward",
-            "grounding_requires_answer_at_inference",
-            "qbound_smoothing_applied",
-
-            # Dynamic decomposition.
-            "boundary_prob_mean",
-            "boundary_count",
-            "event_count",
-            "effective_event_count",
+            "teacher_distribution_used",
+            "temporal_gt_used_in_training",
+            # Composition / anti-collapse.
+            "cut_mean",
+            "cut_std",
+            "prior_cut_mean",
+            "question_residual_abs_mean",
+            "hard_event_count",
             "soft_effective_event_count",
-            "decomp_loss",
-            "decomp_expected_energy",
-            "decomp_selected_coherence",
-            "decomp_selected_complexity",
-            "decomp_selected_complexity_cost",
-            "decomp_selected_boundary_reward",
-            "decomp_selected_boundary_term",
-            "decomp_selected_total_energy",
-            "decomp_expected_event_count",
-            "partition_entropy",
-            "accepted_split_gain",
-            "rejected_split_gain",
-            "event_mass_max",
-            "event_mass_min",
-            "event_mass_mean",
-
-            # Event evidence / RELATE.
-            "event_evidence_gate_mean",
-            "event_evidence_active_count",
-            "event_evidence_entropy",
-            "event_evidence_effective_count",
-            "top1_event_evidence_share",
-            "top2_event_evidence_share",
-            "multi_event_evidence",
-            "ordered_relation_gate_mean",
-            "ordered_update_gate_mean",
-            "ordered_relation_past_mass",
-            "ordered_relation_future_mass",
-            "reasoned_event_token_delta_norm",
-
-            # Hypothesis competition.
-            "hypothesis_candidate_count",
-            "hypothesis_entropy",
-            "hypothesis_effective_count",
-            "hypothesis_top1_posterior",
-            "hypothesis_expected_span_length",
-            "selected_hypothesis_span_length",
-            "selected_hypothesis_span_fraction",
-            "selected_hypothesis_posterior",
-            "hypothesis_touched_event_count",
-            "hypothesis_touched_event_ratio",
+            "one_event_indicator",
+            "all_split_indicator",
+            # Reasoning / grounding.
+            "anchor_effective_token_count",
+            "start_entropy",
+            "end_entropy",
+            "selected_span_length",
+            "selected_span_fraction",
+            "selected_pair_score",
         )
         for key in scalar_keys:
             scalar = self._scalar_mean(qbound_aux.get(key))
             if scalar is not None:
-                if key.startswith("qbound_"):
-                    stats[key] = scalar
-                else:
-                    stats[f"qbound_{key}"] = scalar
+                stats[f"qbound_{key}"] = scalar
 
-        raw_rms = self._scalar_mean(qbound_aux.get("generic_input_raw_rms"))
-        adapted_rms = self._scalar_mean(
-            qbound_aux.get("generic_input_adapted_rms")
-        )
-        if raw_rms is not None and adapted_rms is not None:
-            stats["qbound_generic_input_adapted_to_raw_rms_ratio"] = (
-                adapted_rms / max(raw_rms, 1e-8)
-            )
-
-        # Event-count histogram uses event_capacity, not a hard-coded 4.
-        event_count = qbound_aux.get("event_count")
-        capacity = int(
-            round(self._scalar_mean(qbound_aux.get("event_capacity")) or 0.0)
-        )
-        if torch.is_tensor(event_count) and capacity > 0:
-            values = event_count.detach().round().long()
-            for n_events in range(1, capacity + 1):
-                stats[f"qbound_event_count_{n_events}_ratio"] = (
-                    values == n_events
-                ).float().mean().item()
-
-        # Hypothesis-posterior health.
-        posterior = qbound_aux.get("hypothesis_posterior")
-        valid = qbound_aux.get("hypothesis_valid_mask")
-        if torch.is_tensor(posterior) and torch.is_tensor(valid):
-            posterior = posterior.detach().float()
-            valid = valid.detach().bool()
-            valid_count = valid.sum(dim=-1).clamp_min(1).float()
-            entropy = -torch.sum(
-                posterior * torch.log(posterior.clamp_min(1e-8)),
-                dim=-1,
-            )
-            max_entropy = torch.log(valid_count.clamp_min(1.0))
-            entropy_ratio = torch.where(
-                valid_count > 1,
-                entropy / max_entropy.clamp_min(1e-6),
-                torch.zeros_like(entropy),
-            )
-            stats["qbound_hypothesis_valid_candidate_count"] = (
-                valid_count.mean().item()
-            )
-            stats["qbound_hypothesis_entropy_ratio"] = (
-                entropy_ratio.mean().item()
-            )
-            sorted_prob = torch.sort(
-                posterior,
-                dim=-1,
-                descending=True,
-            ).values
-            stats["qbound_hypothesis_top1_share"] = (
-                sorted_prob[:, 0].mean().item()
-            )
-            if sorted_prob.size(-1) >= 2:
-                stats["qbound_hypothesis_top2_share"] = (
-                    sorted_prob[:, :2].sum(dim=-1).mean().item()
-                )
-
-        selected_length = qbound_aux.get("selected_hypothesis_span_length")
-        if torch.is_tensor(selected_length):
-            values = selected_length.detach().float()
-            stats["qbound_selected_hypothesis_span_length_min"] = (
-                values.min().item()
-            )
-            stats["qbound_selected_hypothesis_span_length_max"] = (
-                values.max().item()
-            )
-            stats["qbound_selected_hypothesis_point_span_ratio"] = (
-                (values <= 1.0).float().mean().item()
-            )
-
-        # Dynamic-topology health.
-        event_mass = qbound_aux.get("event_mass")
-        event_valid = qbound_aux.get("event_valid_mask")
-        if torch.is_tensor(event_mass):
-            mass = event_mass.detach().float()
-            valid_event = (
-                event_valid.detach().bool()
-                if torch.is_tensor(event_valid)
-                else mass > 0
-            )
-            if valid_event.any():
-                valid_mass = mass[valid_event]
-                stats["qbound_event_mass_valid_mean"] = valid_mass.mean().item()
-                stats["qbound_event_mass_valid_min"] = valid_mass.min().item()
-                stats["qbound_event_mass_valid_max"] = valid_mass.max().item()
-
-        candidate_valid = qbound_aux.get("boundary_candidate_valid_mask")
-        if torch.is_tensor(candidate_valid):
-            stats["qbound_boundary_candidate_count"] = (
-                candidate_valid.detach().float().sum(dim=-1).mean().item()
-            )
-
-        boundary_prob = qbound_aux.get("boundary_prob")
-        boundary_mask = qbound_aux.get("boundary_mask")
-        if torch.is_tensor(boundary_prob) and torch.is_tensor(boundary_mask):
-            values = boundary_prob[boundary_mask.bool()]
+        # Distribution of functional cuts over valid temporal edges.
+        cut_prob = qbound_aux.get("functional_cut_prob")
+        pair_valid = qbound_aux.get("functional_pair_valid_mask")
+        if torch.is_tensor(cut_prob) and torch.is_tensor(pair_valid):
+            values = cut_prob[pair_valid.bool()]
             if values.numel() > 0:
                 values = values.detach().float()
-                stats["qbound_boundary_prob_min"] = values.min().item()
-                stats["qbound_boundary_prob_max"] = values.max().item()
-                stats["qbound_boundary_prob_std"] = values.std(
+                stats["qbound_functional_cut_min"] = values.min().item()
+                stats["qbound_functional_cut_max"] = values.max().item()
+                stats["qbound_functional_cut_std_valid"] = values.std(
                     unbiased=False
                 ).item()
+                stats["qbound_functional_cut_hard_ratio"] = (
+                    values >= 0.5
+                ).float().mean().item()
 
-        # Question-conditioned event reasoning health.
-        relation = qbound_aux.get("ordered_relation_gates")
-        relation_mask = qbound_aux.get("ordered_relation_valid_mask")
-        if torch.is_tensor(relation) and torch.is_tensor(relation_mask):
-            values = relation[relation_mask.bool()]
-            if values.numel() > 0:
-                values = values.detach().float()
-                stats["qbound_ordered_relation_gate_valid_mean"] = (
-                    values.mean().item()
-                )
-                stats["qbound_ordered_relation_gate_valid_std"] = (
-                    values.std(unbiased=False).item()
-                )
-                stats["qbound_ordered_relation_active_ratio"] = (
-                    (values >= 0.5).float().mean().item()
+        prior_prob = qbound_aux.get("video_boundary_prior_prob")
+        if (
+            torch.is_tensor(prior_prob)
+            and torch.is_tensor(cut_prob)
+            and prior_prob.shape == cut_prob.shape
+        ):
+            valid = pair_valid.bool() if torch.is_tensor(pair_valid) else torch.ones_like(
+                cut_prob, dtype=torch.bool
+            )
+            if valid.any():
+                stats["qbound_prior_functional_cut_l1"] = (
+                    (prior_prob.detach() - cut_prob.detach()).abs()[valid]
+                    .float()
+                    .mean()
+                    .item()
                 )
 
-        # Exact hypothesis key vs CRA reference.
-        qbound_key = qbound_aux.get("qbound_key")
+        # Effective event count is emergent; no event-cap histogram is used.
+        hard_event_count = qbound_aux.get("hard_event_count")
+        if torch.is_tensor(hard_event_count):
+            values = hard_event_count.detach().float()
+            stats["qbound_hard_event_count_min"] = values.min().item()
+            stats["qbound_hard_event_count_max"] = values.max().item()
+            stats["qbound_hard_event_count_std"] = values.std(
+                unbiased=False
+            ).item()
+
+        # Endpoint health.
+        for prefix in ("start_prob", "end_prob"):
+            probability = qbound_aux.get(prefix)
+            if torch.is_tensor(probability):
+                p = self._normalize_distribution(probability.detach())
+                stats[f"qbound_{prefix}_top1"] = p.max(dim=-1).values.mean().item()
+
+        # Hard span vs differentiable soft temporal support.
+        hard_key = qbound_aux.get("qbound_key")
+        training_key = qbound_aux.get("qbound_training_key")
+        soft_key = qbound_aux.get("soft_temporal_prob")
         cra_key = qbound_aux.get("cra_key")
-        if torch.is_tensor(qbound_key) and torch.is_tensor(cra_key):
-            q = self._normalize_distribution(qbound_key.detach())
-            c = self._normalize_distribution(cra_key.detach())
+        if torch.is_tensor(hard_key) and torch.is_tensor(soft_key):
+            hard = self._normalize_distribution(hard_key.detach())
+            soft = self._normalize_distribution(soft_key.detach())
+            stats["qbound_hard_soft_js"] = self._js_divergence(
+                hard, soft
+            ).mean().item()
+            stats["qbound_hard_soft_l1"] = (
+                hard - soft
+            ).abs().mean().item()
+        if torch.is_tensor(hard_key) and torch.is_tensor(cra_key):
+            hard = self._normalize_distribution(hard_key.detach())
+            cra = self._normalize_distribution(cra_key.detach())
             stats["qbound_cra_qbound_js"] = self._js_divergence(
-                c, q
+                cra, hard
             ).mean().item()
             stats["qbound_cra_qbound_key_l1"] = (
-                c - q
+                cra - hard
             ).abs().mean().item()
-            stats["qbound_key_entropy"] = self._distribution_entropy(
-                q
-            ).mean().item()
-            stats["qbound_cra_key_entropy"] = self._distribution_entropy(
-                c
-            ).mean().item()
-            stats["qbound_key_max"] = q.max(dim=-1).values.mean().item()
-            stats["qbound_cra_key_max"] = c.max(dim=-1).values.mean().item()
+        if torch.is_tensor(training_key) and torch.is_tensor(hard_key):
+            # Forward values should be identical under the straight-through bridge.
+            stats["qbound_training_hard_forward_l1"] = (
+                training_key.detach() - hard_key.detach()
+            ).abs().mean().item()
 
         return stats
 
@@ -1345,16 +1050,20 @@ class CRAPipeline(BasePipeline):
         if not self._qbound_enabled():
             return {
                 "qbound_input_adapter_grad_norm": 0.0,
-                "qbound_hypothesis_scorer_grad_norm": 0.0,
-                "qbound_decompose_grad_norm": 0.0,
-                "qbound_relate_grad_norm": 0.0,
+                "qbound_dynamics_grad_norm": 0.0,
+                "qbound_video_prior_grad_norm": 0.0,
+                "qbound_functional_composer_grad_norm": 0.0,
+                "qbound_reasoner_grad_norm": 0.0,
+                "qbound_endpoint_grad_norm": 0.0,
             }
 
         totals = {
             "input": 0.0,
-            "hypothesis": 0.0,
-            "decompose": 0.0,
-            "relate": 0.0,
+            "dynamics": 0.0,
+            "prior": 0.0,
+            "composer": 0.0,
+            "reasoner": 0.0,
+            "endpoint": 0.0,
         }
         for name, parameter in self.model.named_parameters():
             if parameter.grad is None or "qbound" not in name.lower():
@@ -1362,35 +1071,60 @@ class CRAPipeline(BasePipeline):
             lower = name.lower()
             grad_sq = parameter.grad.detach().float().pow(2).sum().item()
 
-            if "generic_input_proj" in lower or "generic_input_norm" in lower:
+            if "generic_input_" in lower:
                 totals["input"] += grad_sq
-            if (
-                "hypothesis_feature_encoder" in lower
-                or "hypothesis_score" in lower
+            if any(
+                token in lower
+                for token in (
+                    "state_proj",
+                    "delta_proj",
+                    "accel_proj",
+                    "dynamics_fuse",
+                )
             ):
-                totals["hypothesis"] += grad_sq
-            if (
-                "boundary_score" in lower
-                or "decomp_" in lower
-                or "topology" in lower
+                totals["dynamics"] += grad_sq
+            if "video_boundary_encoder" in lower or "video_boundary_score" in lower:
+                totals["prior"] += grad_sq
+            if any(
+                token in lower
+                for token in (
+                    "functional_composer",
+                    "question_cut_residual",
+                    "question_proj",
+                )
             ):
-                totals["decompose"] += grad_sq
-            if (
-                "relation" in lower
-                or "ordered_" in lower
-                or "event_update" in lower
+                totals["composer"] += grad_sq
+            if any(
+                token in lower
+                for token in (
+                    "forward_scan_",
+                    "backward_scan_",
+                    "local_reasoning_fuse",
+                    "anchor_",
+                    "reasoning_norm",
+                )
             ):
-                totals["relate"] += grad_sq
+                totals["reasoner"] += grad_sq
+            if any(
+                token in lower
+                for token in (
+                    "endpoint_encoder",
+                    "start_score",
+                    "end_score",
+                    "frame_evidence_score",
+                )
+            ):
+                totals["endpoint"] += grad_sq
 
         return {
             "qbound_input_adapter_grad_norm": float(totals["input"] ** 0.5),
-            "qbound_hypothesis_scorer_grad_norm": float(
-                totals["hypothesis"] ** 0.5
+            "qbound_dynamics_grad_norm": float(totals["dynamics"] ** 0.5),
+            "qbound_video_prior_grad_norm": float(totals["prior"] ** 0.5),
+            "qbound_functional_composer_grad_norm": float(
+                totals["composer"] ** 0.5
             ),
-            "qbound_decompose_grad_norm": float(
-                totals["decompose"] ** 0.5
-            ),
-            "qbound_relate_grad_norm": float(totals["relate"] ** 0.5),
+            "qbound_reasoner_grad_norm": float(totals["reasoner"] ** 0.5),
+            "qbound_endpoint_grad_norm": float(totals["endpoint"] ** 0.5),
         }
 
     @staticmethod
@@ -1398,60 +1132,58 @@ class CRAPipeline(BasePipeline):
         return [
             "qbound_grad_norm",
             "qbound_input_adapter_grad_norm",
-            "qbound_hypothesis_scorer_grad_norm",
-            "qbound_decompose_grad_norm",
-            "qbound_relate_grad_norm",
-            "qbound_weak_align_weight",
-            "qbound_decomp_weight",
-            "qbound_hypothesis_rank_weight",
-            "qbound_hypothesis_teacher_enabled",
-            "qbound_hypothesis_teacher_correct_only",
-            "qbound_weak_align_retrieval_acc",
-            "qbound_hypothesis_rank_loss",
-            "qbound_teacher_active_ratio",
-            "qbound_teacher_full_video_acc",
-            "qbound_teacher_top1_probability",
-            "qbound_teacher_entropy",
-            "qbound_teacher_entropy_ratio",
-            "qbound_teacher_effective_count",
-            "qbound_student_top1_probability",
-            "qbound_student_entropy",
-            "qbound_student_entropy_ratio",
-            "qbound_teacher_student_top1_agreement",
-            "qbound_selected_is_teacher_top1_ratio",
-            "qbound_selected_teacher_probability",
-            "qbound_selected_teacher_utility",
-            "qbound_teacher_best_utility",
-            "qbound_teacher_best_minus_selected_utility",
-            "qbound_selected_rank_percentile",
-            "qbound_teacher_best_answer_acc",
-            "qbound_teacher_selected_answer_acc",
-            "qbound_teacher_selected_complement_acc",
-            "qbound_teacher_full_margin",
-            "qbound_teacher_selected_margin",
-            "qbound_teacher_best_margin",
-            "qbound_teacher_selected_complement_margin",
-            "qbound_teacher_sufficiency_component",
-            "qbound_teacher_trim_component",
-            "qbound_teacher_expand_component",
-            "qbound_teacher_exclusivity_component",
+            "qbound_dynamics_grad_norm",
+            "qbound_video_prior_grad_norm",
+            "qbound_functional_composer_grad_norm",
+            "qbound_reasoner_grad_norm",
+            "qbound_endpoint_grad_norm",
+            "qbound_functional_composition_weight",
+            "qbound_boundary_equilibrium_weight",
+            "qbound_functional_composition_loss",
+            "qbound_boundary_equilibrium_loss",
+            "qbound_functional_gap_mean",
+            "qbound_functional_gap_abs_mean",
+            "qbound_functional_keep_better_ratio",
+            "qbound_functional_merge_better_ratio",
+            "qbound_functional_target_cut_ratio",
+            "qbound_functional_confidence_mean",
+            "qbound_functional_cut_target_agreement",
+            "qbound_functional_left_right_margin_gap",
+            "qbound_equilibrium_selected_margin",
+            "qbound_equilibrium_active_left_ratio",
+            "qbound_equilibrium_active_right_ratio",
+            "qbound_equilibrium_active_any_ratio",
+            "qbound_equilibrium_trim_left_action_ratio",
+            "qbound_equilibrium_expand_left_action_ratio",
+            "qbound_equilibrium_trim_right_action_ratio",
+            "qbound_equilibrium_expand_right_action_ratio",
+            "qbound_equilibrium_left_gain_mean",
+            "qbound_equilibrium_right_gain_mean",
+            "qbound_equilibrium_left_confidence_mean",
+            "qbound_equilibrium_right_confidence_mean",
+            "qbound_equilibrium_start_shift_abs_mean",
+            "qbound_equilibrium_end_shift_abs_mean",
             "qbound_generic_input_token_cosine",
             "qbound_generic_input_delta_ratio",
-            "qbound_event_count",
-            "qbound_decomp_loss",
-            "qbound_partition_entropy",
+            "qbound_cut_mean",
+            "qbound_cut_std",
+            "qbound_prior_cut_mean",
+            "qbound_question_residual_abs_mean",
+            "qbound_hard_event_count",
             "qbound_soft_effective_event_count",
-            "qbound_hypothesis_candidate_count",
-            "qbound_hypothesis_entropy",
-            "qbound_hypothesis_entropy_ratio",
-            "qbound_hypothesis_effective_count",
-            "qbound_hypothesis_top1_posterior",
-            "qbound_hypothesis_expected_span_length",
-            "qbound_selected_hypothesis_span_length",
-            "qbound_selected_hypothesis_span_fraction",
-            "qbound_selected_hypothesis_point_span_ratio",
+            "qbound_one_event_indicator",
+            "qbound_all_split_indicator",
+            "qbound_functional_cut_hard_ratio",
+            "qbound_prior_functional_cut_l1",
+            "qbound_start_entropy",
+            "qbound_end_entropy",
+            "qbound_start_prob_top1",
+            "qbound_end_prob_top1",
+            "qbound_selected_span_length",
+            "qbound_selected_span_fraction",
+            "qbound_hard_soft_js",
             "qbound_cra_qbound_js",
-            "qbound_cra_qbound_key_l1",
+            "qbound_training_hard_forward_l1",
         ]
 
     # ------------------------------------------------------------------
@@ -1483,9 +1215,8 @@ class CRAPipeline(BasePipeline):
         prediction_dict = {}
         target_dict = {}
 
-        # ----------------------------------------------------------
-        # Original CRA VQ objective: unchanged, Q-Bound disabled.
-        # ----------------------------------------------------------
+        # Original CRA VQ objective remains a testbed objective and keeps
+        # Q-Bound disabled, exactly as in prior controlled runs.
         if self.cfgs["model"]["vg_loss"]:
             vq_output = self.model(
                 video_frames,
@@ -1515,9 +1246,9 @@ class CRAPipeline(BasePipeline):
             )
             target_dict["vq_align_gt"] = vq_output[2]["align_gt"]
 
-        # ----------------------------------------------------------
-        # MAIN VQA: exact hard winning temporal hypothesis H*.
-        # ----------------------------------------------------------
+        # MAIN VQA.  Forward numerics use hard H*, while RefineDecoder's
+        # straight-through training key lets the factual QA loss also train
+        # Q-Bound start/end distributions.
         gqa_output = self.model(
             video_frames,
             video_mask,
@@ -1543,120 +1274,58 @@ class CRAPipeline(BasePipeline):
         )
         target_dict["vqa_align_gt"] = gqa_output[2]["align_gt"]
 
-        # Preserve the repository's CRA task objective.
+        # Preserve the repository's factual CRA task objective.
         loss = self.criterion(prediction_dict, target_dict)
 
-        settings = self._qbound_v112_loss_settings()
-        weak_align_retrieval_acc = None
-        teacher_result = None
+        settings = self._qbound_v200_loss_settings()
         qbound_aux = self._get_qbound_aux(gqa_output)
+        qbound_logs = {}
 
         if self._qbound_enabled():
-            self._validate_v112_contract(qbound_aux)
+            self._validate_v200_contract(qbound_aux)
 
-            # Weak question/event semantic alignment.
-            if settings["align_weight"] > 0.0:
-                qbound_align_loss, weak_align_retrieval_acc = (
-                    self._qbound_inbatch_alignment(
-                        evidence_visual_token=qbound_aux.get(
-                            "evidence_visual_token"
-                        ),
-                        question_state=qbound_aux.get("qa_state"),
-                        temperature=settings["align_temperature"],
+            if settings["functional_composition_weight"] > 0.0:
+                comp_loss, comp_diag = (
+                    self._qbound_functional_composition_objective(
+                        qbound_aux=qbound_aux,
+                        labels=answer_id_device,
+                        settings=settings,
                     )
                 )
-                loss["qbound_align_loss"] = qbound_align_loss
-                loss["total_loss"] = (
-                    loss["total_loss"]
-                    + settings["align_weight"] * qbound_align_loss
+                weighted_comp = (
+                    settings["functional_composition_weight"] * comp_loss
+                )
+                loss["qbound_functional_composition_loss"] = comp_loss
+                loss["qbound_functional_composition_weighted_loss"] = weighted_comp
+                loss["total_loss"] = loss["total_loss"] + weighted_comp
+                qbound_logs.update(
+                    {f"qbound_{name}": value for name, value in comp_diag.items()}
                 )
 
-            # Dynamic event decomposition objective.
-            if settings["decomp_weight"] > 0.0:
-                qbound_decomp_loss = self._qbound_decomposition_loss(
-                    qbound_aux
-                )
-                loss["qbound_decomp_loss"] = qbound_decomp_loss
-                loss["total_loss"] = (
-                    loss["total_loss"]
-                    + settings["decomp_weight"] * qbound_decomp_loss
-                )
-
-            # Privileged answer-aware temporal ranking.
-            if settings["teacher_enabled"]:
-                teacher_result = self._qbound_v112_hypothesis_distillation(
-                    model_outputs=gqa_output[2],
+            if settings["boundary_equilibrium_weight"] > 0.0:
+                eq_loss, eq_diag = self._qbound_boundary_equilibrium_objective(
+                    qbound_aux=qbound_aux,
                     labels=answer_id_device,
                     settings=settings,
                 )
-                rank_loss = teacher_result["ranking_loss"]
-                weighted_rank_loss = (
-                    settings["teacher_loss_weight"] * rank_loss
+                weighted_eq = settings["boundary_equilibrium_weight"] * eq_loss
+                loss["qbound_boundary_equilibrium_loss"] = eq_loss
+                loss["qbound_boundary_equilibrium_weighted_loss"] = weighted_eq
+                loss["total_loss"] = loss["total_loss"] + weighted_eq
+                qbound_logs.update(
+                    {f"qbound_{name}": value for name, value in eq_diag.items()}
                 )
-                loss["qbound_hypothesis_rank_loss"] = rank_loss
-                loss["qbound_hypothesis_rank_weighted_loss"] = (
-                    weighted_rank_loss
-                )
-                loss["total_loss"] = loss["total_loss"] + weighted_rank_loss
 
-        qbound_logs = {}
-        if self._qbound_enabled():
             qbound_logs.update(
                 {
-                    "qbound_weak_align_weight": settings["align_weight"],
-                    "qbound_decomp_weight": settings["decomp_weight"],
-                    "qbound_hypothesis_rank_weight": settings[
-                        "teacher_loss_weight"
+                    "qbound_functional_composition_weight": settings[
+                        "functional_composition_weight"
                     ],
-                    "qbound_hypothesis_teacher_enabled": float(
-                        settings["teacher_enabled"]
-                    ),
-                    "qbound_hypothesis_teacher_correct_only": float(
-                        settings["teacher_correct_only"]
-                    ),
+                    "qbound_boundary_equilibrium_weight": settings[
+                        "boundary_equilibrium_weight"
+                    ],
                 }
             )
-            if weak_align_retrieval_acc is not None:
-                qbound_logs["qbound_weak_align_retrieval_acc"] = float(
-                    weak_align_retrieval_acc
-                )
-            if teacher_result is not None:
-                qbound_logs["qbound_hypothesis_rank_loss"] = float(
-                    teacher_result["ranking_loss"].detach().item()
-                )
-                teacher_log_mapping = {
-                    "teacher_active_ratio": "qbound_teacher_active_ratio",
-                    "teacher_full_video_acc": "qbound_teacher_full_video_acc",
-                    "teacher_top1_probability": "qbound_teacher_top1_probability",
-                    "teacher_entropy": "qbound_teacher_entropy",
-                    "teacher_entropy_ratio": "qbound_teacher_entropy_ratio",
-                    "teacher_effective_count": "qbound_teacher_effective_count",
-                    "student_top1_probability": "qbound_student_top1_probability",
-                    "student_entropy": "qbound_student_entropy",
-                    "student_entropy_ratio": "qbound_student_entropy_ratio",
-                    "teacher_student_top1_agreement": "qbound_teacher_student_top1_agreement",
-                    "selected_is_teacher_top1_ratio": "qbound_selected_is_teacher_top1_ratio",
-                    "selected_teacher_probability": "qbound_selected_teacher_probability",
-                    "selected_teacher_utility": "qbound_selected_teacher_utility",
-                    "teacher_best_utility": "qbound_teacher_best_utility",
-                    "teacher_best_minus_selected_utility": "qbound_teacher_best_minus_selected_utility",
-                    "selected_rank_percentile": "qbound_selected_rank_percentile",
-                    "teacher_best_answer_acc": "qbound_teacher_best_answer_acc",
-                    "teacher_selected_answer_acc": "qbound_teacher_selected_answer_acc",
-                    "teacher_selected_complement_acc": "qbound_teacher_selected_complement_acc",
-                    "teacher_full_margin": "qbound_teacher_full_margin",
-                    "teacher_selected_margin": "qbound_teacher_selected_margin",
-                    "teacher_best_margin": "qbound_teacher_best_margin",
-                    "teacher_selected_complement_margin": "qbound_teacher_selected_complement_margin",
-                    "teacher_sufficiency_component": "qbound_teacher_sufficiency_component",
-                    "teacher_trim_component": "qbound_teacher_trim_component",
-                    "teacher_expand_component": "qbound_teacher_expand_component",
-                    "teacher_exclusivity_component": "qbound_teacher_exclusivity_component",
-                }
-                for source_name, log_name in teacher_log_mapping.items():
-                    qbound_logs[log_name] = float(
-                        teacher_result[source_name]
-                    )
 
         predicted = main_logits.argmax(dim=-1).detach().cpu()
         running_accuracy = (
@@ -1686,10 +1355,10 @@ class CRAPipeline(BasePipeline):
             self.monitor.reset_kv(f"{key}_loss")
 
         if self._qbound_enabled():
-            self.monitor.reset_kv("qbound_align_loss")
-            self.monitor.reset_kv("qbound_decomp_loss")
-            self.monitor.reset_kv("qbound_hypothesis_rank_loss")
-            self.monitor.reset_kv("qbound_hypothesis_rank_weighted_loss")
+            self.monitor.reset_kv("qbound_functional_composition_loss")
+            self.monitor.reset_kv("qbound_functional_composition_weighted_loss")
+            self.monitor.reset_kv("qbound_boundary_equilibrium_loss")
+            self.monitor.reset_kv("qbound_boundary_equilibrium_weighted_loss")
             for key in self._qbound_monitor_keys():
                 self.monitor.reset_kv(key)
 
@@ -1802,23 +1471,16 @@ class CRAPipeline(BasePipeline):
             acc_key = f"{split}_acc"
             if acc_key in score:
                 self.monitor.log_info(
-                    f"\n{split.title()} Set\t V1.12 exact-hypothesis acc: "
+                    f"\n{split.title()} Set\t V2.0.0 functional-composition acc: "
                     f"{score[acc_key]:.2%}"
                 )
 
             prehoc_key = f"{split}_pre-hoc"
             if prehoc_key in score:
                 self.monitor.log_info(
-                    f"\n========== {split} V1.12 exact H* =========="
+                    f"\n========== {split} V2.0.0 hard H* =========="
                 )
                 _print_score(score[prehoc_key])
-
-            fixed_key = f"{split}_fixed-readout"
-            if fixed_key in score:
-                self.monitor.log_info(
-                    f"\n========== {split} same-key CRA fixed-window diagnostic =========="
-                )
-                _print_score(score[fixed_key])
 
             posthoc_key = f"{split}_post-hoc"
             if posthoc_key in score:
@@ -1841,7 +1503,7 @@ class CRAPipeline(BasePipeline):
         ]
         if qbound_keys:
             self.monitor.log_info(
-                "\n================ Q-Bound V1.12 diagnostics ================"
+                "\n================ Q-Bound V2.0.0 diagnostics ================"
             )
             for key in sorted(qbound_keys):
                 self.monitor.log_info(f"{key}: {score[key]:.6f}")
@@ -1849,8 +1511,8 @@ class CRAPipeline(BasePipeline):
         temporal_prefixes = (
             "val_QBound-",
             "test_QBound-",
-            "val_QBoundSoftHyp-",
-            "test_QBoundSoftHyp-",
+            "val_QBoundSoft-",
+            "test_QBoundSoft-",
             "val_CRA-",
             "test_CRA-",
         )
@@ -1929,18 +1591,16 @@ class CRAPipeline(BasePipeline):
         results = {}
         ground_res = {}
         ground_pre = {}
-        ground_fixed = {}
         keyframe = {}
         ori_keyframe = {}
         qbound_keyframe = {}
-        qbound_soft_hyp_keyframe = {}
+        qbound_soft_keyframe = {}
         cra_keyframe = {}
 
         qbound_stat_sums = collections.defaultdict(float)
         qbound_stat_count = 0
         saw_time_param = False
-
-        settings = self._qbound_v112_loss_settings()
+        settings = self._qbound_v200_loss_settings()
 
         with torch.no_grad():
             if not self.cfgs["dataset"]["mc"]:
@@ -2007,38 +1667,35 @@ class CRAPipeline(BasePipeline):
 
                 extra_logs = {}
                 if self._qbound_enabled() and qbound_aux is not None:
-                    self._validate_v112_contract(qbound_aux)
-                    if settings["teacher_enabled"]:
-                        teacher_result = (
-                            self._qbound_v112_hypothesis_distillation(
-                                model_outputs=model_outputs,
+                    self._validate_v200_contract(qbound_aux)
+                    if settings["functional_composition_weight"] > 0.0:
+                        comp_loss, comp_diag = (
+                            self._qbound_functional_composition_objective(
+                                qbound_aux=qbound_aux,
                                 labels=labels_device,
                                 settings=settings,
                             )
                         )
-                        extra_logs["qbound_hypothesis_rank_loss"] = float(
-                            teacher_result["ranking_loss"].item()
+                        extra_logs["qbound_functional_composition_loss"] = float(
+                            comp_loss.item()
                         )
-                        for source_name, log_name in (
-                            ("teacher_active_ratio", "qbound_teacher_active_ratio"),
-                            ("teacher_full_video_acc", "qbound_teacher_full_video_acc"),
-                            ("teacher_top1_probability", "qbound_teacher_top1_probability"),
-                            ("teacher_entropy_ratio", "qbound_teacher_entropy_ratio"),
-                            ("teacher_effective_count", "qbound_teacher_effective_count"),
-                            ("student_top1_probability", "qbound_student_top1_probability"),
-                            ("student_entropy_ratio", "qbound_student_entropy_ratio"),
-                            ("teacher_student_top1_agreement", "qbound_teacher_student_top1_agreement"),
-                            ("selected_is_teacher_top1_ratio", "qbound_selected_is_teacher_top1_ratio"),
-                            ("selected_teacher_probability", "qbound_selected_teacher_probability"),
-                            ("teacher_best_minus_selected_utility", "qbound_teacher_best_minus_selected_utility"),
-                            ("selected_rank_percentile", "qbound_selected_rank_percentile"),
-                            ("teacher_best_answer_acc", "qbound_teacher_best_answer_acc"),
-                            ("teacher_selected_answer_acc", "qbound_teacher_selected_answer_acc"),
-                            ("teacher_selected_complement_acc", "qbound_teacher_selected_complement_acc"),
-                        ):
-                            extra_logs[log_name] = float(
-                                teacher_result[source_name]
+                        extra_logs.update(
+                            {f"qbound_{name}": value for name, value in comp_diag.items()}
+                        )
+                    if settings["boundary_equilibrium_weight"] > 0.0:
+                        eq_loss, eq_diag = (
+                            self._qbound_boundary_equilibrium_objective(
+                                qbound_aux=qbound_aux,
+                                labels=labels_device,
+                                settings=settings,
                             )
+                        )
+                        extra_logs["qbound_boundary_equilibrium_loss"] = float(
+                            eq_loss.item()
+                        )
+                        extra_logs.update(
+                            {f"qbound_{name}": value for name, value in eq_diag.items()}
+                        )
 
                     batch_stats = self._collect_qbound_stats(
                         eval_wrapper,
@@ -2055,11 +1712,10 @@ class CRAPipeline(BasePipeline):
                     video_attention = video_attention[None, :]
 
                 batch_ground_pre = None
-                batch_fixed = None
                 batch_keyframe = None
                 batch_ori_keyframe = None
                 batch_qbound_key = None
-                batch_soft_hyp = None
+                batch_soft_key = None
                 batch_cra_key = None
 
                 if isinstance(time_param, dict):
@@ -2072,32 +1728,16 @@ class CRAPipeline(BasePipeline):
                     if qbound_aux is not None:
                         q_key = qbound_aux.get("qbound_key")
                         c_key = qbound_aux.get("cra_key")
-                        soft_hyp = qbound_aux.get("hypothesis_soft_support")
+                        soft_key = qbound_aux.get("soft_temporal_prob")
                         if torch.is_tensor(q_key):
                             batch_qbound_key = q_key.detach().cpu().numpy()
                         if torch.is_tensor(c_key):
                             batch_cra_key = c_key.detach().cpu().numpy()
-                        if torch.is_tensor(soft_hyp):
-                            soft_hyp = self._normalize_distribution(
-                                soft_hyp.detach()
+                        if torch.is_tensor(soft_key):
+                            soft_key = self._normalize_distribution(
+                                soft_key.detach()
                             )
-                            batch_soft_hyp = soft_hyp.cpu().numpy()
-
-                        fixed_start = time_param.get(
-                            "qbound_legacy_fixed_window_start"
-                        )
-                        fixed_end = time_param.get(
-                            "qbound_legacy_fixed_window_end"
-                        )
-                        if torch.is_tensor(fixed_start) and torch.is_tensor(
-                            fixed_end
-                        ):
-                            batch_fixed = np.column_stack(
-                                (
-                                    fixed_start.detach().cpu().numpy(),
-                                    fixed_end.detach().cpu().numpy(),
-                                )
-                            )
+                            batch_soft_key = soft_key.cpu().numpy()
 
                 for batch_index, qid in enumerate(question_id):
                     results[qid] = {
@@ -2108,18 +1748,14 @@ class CRAPipeline(BasePipeline):
 
                     if batch_ground_pre is not None:
                         ground_pre[qid] = batch_ground_pre[batch_index].tolist()
-                    if batch_fixed is not None:
-                        ground_fixed[qid] = batch_fixed[batch_index].tolist()
                     if batch_keyframe is not None:
                         keyframe[qid] = batch_keyframe[batch_index].tolist()
                     if batch_ori_keyframe is not None:
                         ori_keyframe[qid] = batch_ori_keyframe[batch_index].tolist()
                     if batch_qbound_key is not None:
                         qbound_keyframe[qid] = batch_qbound_key[batch_index].tolist()
-                    if batch_soft_hyp is not None:
-                        qbound_soft_hyp_keyframe[qid] = (
-                            batch_soft_hyp[batch_index].tolist()
-                        )
+                    if batch_soft_key is not None:
+                        qbound_soft_keyframe[qid] = batch_soft_key[batch_index].tolist()
                     if batch_cra_key is not None:
                         cra_keyframe[qid] = batch_cra_key[batch_index].tolist()
 
@@ -2159,7 +1795,7 @@ class CRAPipeline(BasePipeline):
         if qbound_keyframe:
             if not hasattr(self.metric, "temporal_key_metrics"):
                 raise AttributeError(
-                    "Q-Bound V1.12 requires Metric.temporal_key_metrics()."
+                    "Q-Bound V2.0.0 requires Metric.temporal_key_metrics()."
                 )
             score.update(
                 self.metric.temporal_key_metrics(
@@ -2169,13 +1805,13 @@ class CRAPipeline(BasePipeline):
                     prefix="QBound",
                 )
             )
-        if qbound_soft_hyp_keyframe:
+        if qbound_soft_keyframe:
             score.update(
                 self.metric.temporal_key_metrics(
-                    qbound_soft_hyp_keyframe,
+                    qbound_soft_keyframe,
                     ground_truth,
                     segments,
-                    prefix="QBoundSoftHyp",
+                    prefix="QBoundSoft",
                 )
             )
         if cra_keyframe:
@@ -2194,7 +1830,7 @@ class CRAPipeline(BasePipeline):
             "gt_ground": ground_truth,
             "ph_attn": ground_res,
             "qbound_key": qbound_keyframe,
-            "qbound_soft_hyp_key": qbound_soft_hyp_keyframe,
+            "qbound_soft_key": qbound_soft_keyframe,
             "cra_key": cra_keyframe,
         }
 
@@ -2205,13 +1841,6 @@ class CRAPipeline(BasePipeline):
                 results,
                 gs=True,
             )
-            if ground_fixed:
-                score["fixed-readout"] = self.metric(
-                    ground_fixed,
-                    ground_truth,
-                    results,
-                    gs=True,
-                )
 
             merge_ground = self.metric.combine(
                 ground_pre,
@@ -2229,32 +1858,9 @@ class CRAPipeline(BasePipeline):
                     "tg": ground_pre,
                     "key": keyframe,
                     "ori_key": ori_keyframe,
-                    "fixed_tg": ground_fixed,
                     "merge": merge_ground,
                 }
             )
-
-            if "fixed-readout" in score:
-                main_pre = score["pre-hoc"]
-                fixed_score = score["fixed-readout"]
-                for metric_name in (
-                    "mIoP",
-                    "mIoU",
-                    "TIoP@0.3",
-                    "TIoP@0.5",
-                    "TIoU@0.3",
-                    "TIoU@0.5",
-                    "Acc&GQA",
-                ):
-                    if metric_name in main_pre and metric_name in fixed_score:
-                        safe = metric_name.replace("@", "_at_").replace(
-                            "&", "_and_"
-                        )
-                        score[
-                            f"qbound_exact_minus_fixed_{safe}"
-                        ] = float(
-                            main_pre[metric_name] - fixed_score[metric_name]
-                        )
 
         return score, result
 

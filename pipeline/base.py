@@ -126,9 +126,10 @@ class BasePipeline(object):
 
         The grounding module and shared CRA projection remain base-model
         parameters. Only QBoundCore trainable parameters use the dedicated
-        Q-Bound learning rate. In V1.12 this includes the generic input
-        adapter, dynamic DECOMPOSE/Q-OEI modules, local evidence encoders, and
-        the question-only temporal-hypothesis scorer.
+        Q-Bound learning rate. In V2.0.0 this includes the generic input
+        adapter, temporal-dynamics encoder, video-only boundary prior,
+        query-adaptive functional composer, boundary-gated reasoner, sparse
+        query-anchor reasoner, and direct start/end grounding heads.
         """
         if not self._qbound_enabled():
             return
@@ -472,6 +473,597 @@ class BasePipeline(object):
         for prefix, count in sorted(prefix_counts.items()):
             print(f"  {prefix}: {count} tensors")
         print("")
+
+    def _check_qbound_v200_components(self, qbound_cfg):
+        """
+        Structural safety check for Q-Bound V2.0.0.
+
+        V2.0.0 is an architectural reset rather than another V1.x patch:
+
+            raw/generic video
+                -> temporal dynamics
+                -> video-only boundary prior
+                -> bounded question-conditioned residual
+                -> query-specific soft cut field
+                -> boundary-gated local reasoning + sparse query anchors
+                -> direct start/end grounding
+                -> local boundary-equilibrium supervision
+
+        Core invariants checked here:
+          1) no fixed event partition and no event-count capacity/target;
+          2) no exhaustive temporal-hypothesis bank / teacher distillation;
+          3) Q-Bound inference is video + question only;
+          4) answer-aware KEEP/MERGE and equilibrium verifiers are
+             parameter-free, stop-gradient training consumers;
+          5) every trainable V2 mechanism is present and lives in the single
+             ``qbound`` optimizer group;
+          6) shared CRA ``decoder.video_proj`` remains a base-model parameter.
+
+        Temporal GT is never a training input in this contract.
+        """
+        model_cfg = self.cfgs.get("model", {})
+        optim_cfg = self.cfgs.get("optim", {})
+
+        if str(model_cfg.get("baseline", "")) != "refine":
+            raise RuntimeError(
+                "Q-Bound V2.0.0 requires model.baseline='refine'."
+            )
+
+        if bool(model_cfg.get("do", False)):
+            raise RuntimeError(
+                "Controlled Q-Bound V2.0.0 requires model.do=false. "
+                "CRA VisualIntervention would confound the functional "
+                "KEEP/MERGE and boundary-equilibrium verifier signals."
+            )
+
+        if not bool(qbound_cfg.get("require_question_only", True)):
+            raise RuntimeError(
+                "Q-Bound V2.0.0 requires question-only grounding semantics. "
+                "Candidate answers may be used by detached training verifiers "
+                "but must not enter QBoundCore."
+            )
+
+        if not bool(qbound_cfg.get("detach_backbone_inputs", True)):
+            raise RuntimeError(
+                "Controlled Q-Bound V2.0.0 expects "
+                "model.qbound.detach_backbone_inputs=true."
+            )
+
+        if not bool(qbound_cfg.get("use_generic_input_adapter", True)):
+            raise RuntimeError(
+                "Q-Bound V2.0.0 requires the Q-Bound-owned generic input "
+                "adapter."
+            )
+
+        if not bool(qbound_cfg.get("input_adapter_use_position", True)):
+            raise RuntimeError(
+                "Controlled Q-Bound V2.0.0 expects positional encoding in "
+                "the reasoning stream of the generic input adapter."
+            )
+
+        # --------------------------------------------------------------
+        # Reject stale V1.x architecture knobs rather than silently ignoring
+        # them.  In V2 event count is emergent from the cut field.
+        # --------------------------------------------------------------
+        forbidden_config_keys = (
+            "max_events",
+            "proposal_candidates",
+            "use_temporal_prior",
+            "question_modulation_scale",
+            "boundary_temperature",
+            "boundary_radius",
+            "boundary_bias_init",
+            "min_event_mass",
+            "decomposition",
+            "reasoning",
+            "hypothesis_teacher",
+            "weak_align_weight",
+            "weak_align_temperature",
+            "composer",
+            "refinement",
+            "counterfactual",
+            "counterfactual_evidence_interface",
+        )
+        stale_keys = [
+            key for key in forbidden_config_keys
+            if key in qbound_cfg and qbound_cfg.get(key) not in (None, {}, False)
+        ]
+        if stale_keys:
+            raise RuntimeError(
+                "Q-Bound V2.0.0 YAML still contains V1.x configuration "
+                "keys that must be removed: " + ", ".join(stale_keys)
+            )
+
+        hidden_dim = int(qbound_cfg.get("hidden_dim", 256))
+        dropout = float(qbound_cfg.get("dropout", model_cfg.get("dropout", 0.1)))
+        input_adapter_dropout = float(
+            qbound_cfg.get("input_adapter_dropout", dropout)
+        )
+        cut_temperature = float(qbound_cfg.get("cut_temperature", 1.0))
+        cut_threshold = float(qbound_cfg.get("cut_threshold", 0.5))
+        question_residual_scale = float(
+            qbound_cfg.get("question_residual_scale", 1.0)
+        )
+        num_anchor_heads = int(qbound_cfg.get("num_anchor_heads", 4))
+        num_local_reasoning_layers = int(
+            qbound_cfg.get("num_local_reasoning_layers", 2)
+        )
+
+        if hidden_dim < 1:
+            raise ValueError("Q-Bound V2.0.0 hidden_dim must be positive.")
+        if not (0.0 <= dropout < 1.0):
+            raise ValueError("Q-Bound V2.0.0 dropout must be in [0,1).")
+        if not (0.0 <= input_adapter_dropout < 1.0):
+            raise ValueError(
+                "Q-Bound V2.0.0 input_adapter_dropout must be in [0,1)."
+            )
+        if not math.isfinite(cut_temperature) or cut_temperature <= 0.0:
+            raise ValueError(
+                "Q-Bound V2.0.0 cut_temperature must be finite and > 0."
+            )
+        if not (0.0 < cut_threshold < 1.0):
+            raise ValueError(
+                "Q-Bound V2.0.0 cut_threshold must be in (0,1)."
+            )
+        if (
+            not math.isfinite(question_residual_scale)
+            or question_residual_scale <= 0.0
+            or question_residual_scale > 1.0
+        ):
+            raise ValueError(
+                "Controlled Q-Bound V2.0.0 requires "
+                "0 < question_residual_scale <= 1 so the question can "
+                "adjust, but not arbitrarily dominate, the video prior."
+            )
+        if num_anchor_heads < 1:
+            raise ValueError(
+                "Q-Bound V2.0.0 num_anchor_heads must be >= 1."
+            )
+        if num_local_reasoning_layers < 1:
+            raise ValueError(
+                "Q-Bound V2.0.0 num_local_reasoning_layers must be >= 1."
+            )
+
+        # Training objectives are intentionally compact.  These are objective
+        # coefficients, not architectural event-count controls.
+        comp_cfg = qbound_cfg.get("functional_composition", {})
+        if not isinstance(comp_cfg, dict):
+            raise TypeError(
+                "model.qbound.functional_composition must be a mapping/dict."
+            )
+        eq_cfg = qbound_cfg.get("boundary_equilibrium", {})
+        if not isinstance(eq_cfg, dict):
+            raise TypeError(
+                "model.qbound.boundary_equilibrium must be a mapping/dict."
+            )
+
+        comp_weight = float(comp_cfg.get("loss_weight", 0.10))
+        comp_confidence_scale = float(comp_cfg.get("confidence_scale", 0.25))
+        eq_weight = float(eq_cfg.get("loss_weight", 0.10))
+        eq_confidence_scale = float(eq_cfg.get("confidence_scale", 0.25))
+
+        for name, value in (
+            ("functional_composition.loss_weight", comp_weight),
+            ("boundary_equilibrium.loss_weight", eq_weight),
+        ):
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(
+                    f"Q-Bound V2.0.0 {name} must be finite and >= 0."
+                )
+        for name, value in (
+            ("functional_composition.confidence_scale", comp_confidence_scale),
+            ("boundary_equilibrium.confidence_scale", eq_confidence_scale),
+        ):
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(
+                    f"Q-Bound V2.0.0 {name} must be finite and > 0."
+                )
+        if comp_weight <= 0.0:
+            raise RuntimeError(
+                "The controlled V2.0.0 run requires a positive functional "
+                "composition loss weight."
+            )
+        if eq_weight <= 0.0:
+            raise RuntimeError(
+                "The controlled V2.0.0 run requires a positive boundary "
+                "equilibrium loss weight."
+            )
+
+        # --------------------------------------------------------------
+        # Cross-file V2.0.0 contract.
+        # --------------------------------------------------------------
+        model_core = (
+            self.model.module
+            if hasattr(self.model, "module")
+            else self.model
+        )
+        version = "2.0.0"
+
+        model_version = str(getattr(model_core, "qbound_version", ""))
+        if model_version != version:
+            raise RuntimeError(
+                "BasePipeline/model Q-Bound version mismatch: "
+                f"config={version!r}, model={model_version!r}."
+            )
+
+        decoder = getattr(model_core, "decoder", None)
+        decoder_version = str(getattr(decoder, "qbound_version", ""))
+        if decoder_version != version:
+            raise RuntimeError(
+                "BasePipeline/RefineDecoder Q-Bound version mismatch: "
+                f"config={version!r}, decoder={decoder_version!r}."
+            )
+
+        qbound_core = getattr(decoder, "qbound", None)
+        if qbound_core is None:
+            raise RuntimeError(
+                "Q-Bound V2.0.0 is enabled but RefineDecoder.qbound is missing."
+            )
+        core_version = str(getattr(qbound_core, "qbound_version", ""))
+        if core_version != version:
+            raise RuntimeError(
+                "BasePipeline/QBoundCore version mismatch: "
+                f"config={version!r}, core={core_version!r}."
+            )
+
+        # V2 uses two detached, answer-space consequence scorers.  They are
+        # methods on the CRA decoder, not trainable Q-Bound modules.
+        for method_name in (
+            "score_functional_composition_pairs",
+            "score_boundary_equilibrium_views",
+        ):
+            if not callable(getattr(decoder, method_name, None)):
+                raise RuntimeError(
+                    f"RefineDecoder V2.0.0 must expose {method_name}()."
+                )
+
+        # The old V1.12 teacher interface must not survive the reset.
+        if callable(getattr(decoder, "score_privileged_hypothesis_bank", None)):
+            raise RuntimeError(
+                "RefineDecoder V2.0.0 still exposes the V1.12 privileged "
+                "hypothesis-bank teacher interface. Remove it."
+            )
+
+        expected_core_settings = {
+            "hidden_dim": hidden_dim,
+            "cut_temperature": cut_temperature,
+            "cut_threshold": cut_threshold,
+            "question_residual_scale": question_residual_scale,
+            "num_anchor_heads": num_anchor_heads,
+            "num_local_reasoning_layers": num_local_reasoning_layers,
+        }
+        for attribute_name, expected_value in expected_core_settings.items():
+            actual_value = getattr(qbound_core, attribute_name, None)
+            if actual_value is None:
+                raise RuntimeError(
+                    f"QBoundCore V2.0.0 is missing attribute {attribute_name!r}."
+                )
+            if isinstance(expected_value, float):
+                if not math.isclose(
+                    float(actual_value),
+                    float(expected_value),
+                    rel_tol=1e-9,
+                    abs_tol=1e-12,
+                ):
+                    raise RuntimeError(
+                        "QBoundCore V2.0.0 setting mismatch for "
+                        f"{attribute_name}: config={expected_value}, "
+                        f"core={actual_value}."
+                    )
+            elif int(actual_value) != int(expected_value):
+                raise RuntimeError(
+                    "QBoundCore V2.0.0 setting mismatch for "
+                    f"{attribute_name}: config={expected_value}, "
+                    f"core={actual_value}."
+                )
+
+        if not bool(getattr(qbound_core, "use_generic_input_adapter", False)):
+            raise RuntimeError(
+                "QBoundCore V2.0.0 generic input adapter is not active."
+            )
+        if bool(getattr(qbound_core, "input_adapter_use_position", False)) != bool(
+            qbound_cfg.get("input_adapter_use_position", True)
+        ):
+            raise RuntimeError(
+                "QBoundCore V2.0.0 positional-input setting does not match "
+                "the YAML configuration."
+            )
+
+        # No fixed K, partition bank, event-list reasoner, or 528-hypothesis
+        # scorer may remain in the V2 core.
+        forbidden_core_attributes = (
+            "max_events",
+            "proposal_candidates",
+            "partition_patterns",
+            "partition_split_count",
+            "hypothesis_feature_encoder",
+            "hypothesis_score",
+            "ordered_relation_score",
+            "event_encoder",
+        )
+        surviving_attributes = [
+            name for name in forbidden_core_attributes
+            if hasattr(qbound_core, name)
+        ]
+        if surviving_attributes:
+            raise RuntimeError(
+                "QBoundCore V2.0.0 still contains V1.x architecture state: "
+                + ", ".join(surviving_attributes)
+            )
+
+        # --------------------------------------------------------------
+        # Trainable-module / optimizer contract.
+        # --------------------------------------------------------------
+        trainable_named_parameters = [
+            (name, parameter)
+            for name, parameter in self.model.named_parameters()
+            if parameter.requires_grad
+        ]
+        qbound_named_parameters = [
+            (name, parameter)
+            for name, parameter in trainable_named_parameters
+            if self._is_qbound_parameter_name(name)
+        ]
+        if not qbound_named_parameters:
+            raise RuntimeError(
+                "Q-Bound V2.0.0 has no trainable Q-Bound parameters."
+            )
+
+        qbound_group = next(
+            (
+                group
+                for group in self.optimizer.param_groups
+                if group.get("name") == "qbound"
+            ),
+            None,
+        )
+        if qbound_group is None:
+            raise RuntimeError(
+                "Q-Bound V2.0.0 optimizer group 'qbound' is missing."
+            )
+        qbound_group_ids = {
+            id(parameter) for parameter in qbound_group["params"]
+        }
+
+        required_component_tokens = {
+            "GENERIC_INPUT": (
+                "generic_input_proj",
+                "generic_input_norm",
+            ),
+            "TEMPORAL_DYNAMICS": (
+                "state_proj",
+                "delta_proj",
+                "accel_proj",
+                "dynamics_fuse",
+            ),
+            "VIDEO_BOUNDARY_PRIOR": (
+                "video_boundary_encoder",
+                "video_boundary_score",
+            ),
+            "FUNCTIONAL_COMPOSITION": (
+                "question_proj",
+                "functional_composer",
+                "question_cut_residual",
+            ),
+            "LOCAL_BOUNDARY_GATED_REASONING": (
+                "forward_scan_updates",
+                "forward_scan_gates",
+                "backward_scan_updates",
+                "backward_scan_gates",
+                "local_reasoning_fuse",
+            ),
+            "SPARSE_QUERY_ANCHORS": (
+                "anchor_score",
+                "anchor_query_proj",
+                "anchor_key_proj",
+                "anchor_value_proj",
+                "anchor_update",
+                "anchor_update_gate",
+                "reasoning_norm",
+            ),
+            "DIRECT_GROUNDING": (
+                "endpoint_encoder",
+                "start_score",
+                "end_score",
+                "frame_evidence_score",
+            ),
+        }
+
+        missing_tokens = []
+        misplaced_parameters = []
+        component_summary = {}
+
+        for component_name, tokens in required_component_tokens.items():
+            component_parameter_ids = set()
+            component_tensor_names = set()
+
+            for token in tokens:
+                matched = [
+                    (name, parameter)
+                    for name, parameter in qbound_named_parameters
+                    if token in name
+                ]
+                if not matched:
+                    missing_tokens.append(
+                        f"{component_name}: missing trainable token {token!r}"
+                    )
+                    continue
+
+                for name, parameter in matched:
+                    component_parameter_ids.add(id(parameter))
+                    component_tensor_names.add(name)
+                    if id(parameter) not in qbound_group_ids:
+                        misplaced_parameters.append(name)
+
+            component_summary[component_name] = {
+                "tensors": len(component_tensor_names),
+                "parameters": sum(
+                    parameter.numel()
+                    for _, parameter in qbound_named_parameters
+                    if id(parameter) in component_parameter_ids
+                ),
+            }
+
+        if missing_tokens:
+            raise RuntimeError(
+                "Q-Bound V2.0.0 expected trainable components are missing:\n"
+                + "\n".join(missing_tokens)
+            )
+        if misplaced_parameters:
+            raise RuntimeError(
+                "Q-Bound V2.0.0 trainable tensors were found outside the "
+                "'qbound' optimizer group:\n"
+                + "\n".join(sorted(set(misplaced_parameters)))
+            )
+
+        # Reject trainable remnants of the V1.x event-partition, hypothesis,
+        # calibration, teacher, or answer-input machinery.  Functional verifier
+        # methods themselves are parameter-free and therefore do not appear here.
+        forbidden_qbound_tokens = (
+            "decomp_question_gate",
+            "topology_proj",
+            "topology_qa_proj",
+            "boundary_feature_encoder",
+            "boundary_classifier",
+            "event_encoder",
+            "ordered_relation",
+            "event_evidence",
+            "hypothesis_",
+            "span_composer",
+            "refiner_",
+            "calibration_",
+            "reliability_",
+            "counterfactual_",
+            "donor_",
+            "teacher_",
+            "critic_",
+            "answer_proj",
+            "answer_encoder",
+            "answer_feature",
+        )
+        unexpected_parameters = [
+            name
+            for name, _ in qbound_named_parameters
+            if any(
+                token in name.lower()
+                for token in forbidden_qbound_tokens
+            )
+        ]
+        if unexpected_parameters:
+            raise RuntimeError(
+                "Q-Bound V2.0.0 contains trainable V1.x/privileged "
+                "parameters that should not exist:\n"
+                + "\n".join(unexpected_parameters)
+            )
+
+        expected_qbound_lr = float(optim_cfg.get("qbound_lr", 0.0))
+        actual_qbound_lr = float(qbound_group["lr"])
+        if expected_qbound_lr <= 0.0:
+            raise ValueError(
+                "Q-Bound V2.0.0 requires optim.qbound_lr > 0."
+            )
+        if not math.isclose(
+            actual_qbound_lr,
+            expected_qbound_lr,
+            rel_tol=1e-9,
+            abs_tol=0.0,
+        ):
+            raise RuntimeError(
+                "Q-Bound V2.0.0 component-group LR mismatch: "
+                f"expected {expected_qbound_lr}, got {actual_qbound_lr}."
+            )
+
+        shared_video_proj_in_qbound_group = []
+        for name, parameter in trainable_named_parameters:
+            normalized_name = (
+                name[len("module."):]
+                if name.startswith("module.")
+                else name
+            )
+            if (
+                "decoder.video_proj" in normalized_name
+                and ".qbound." not in normalized_name
+                and id(parameter) in qbound_group_ids
+            ):
+                shared_video_proj_in_qbound_group.append(name)
+        if shared_video_proj_in_qbound_group:
+            raise RuntimeError(
+                "Shared CRA video_proj must remain in the base optimizer "
+                "group, but these tensors were found in Q-Bound:\n"
+                + "\n".join(shared_video_proj_in_qbound_group)
+            )
+
+        # There must be no separately trainable verifier/teacher module outside
+        # QBoundCore.  The verifier is a detached consumer of CRA answer space.
+        forbidden_global_trainable_tokens = (
+            "functional_verifier",
+            "equilibrium_verifier",
+            "hypothesis_teacher",
+            "privileged_hypothesis",
+        )
+        unexpected_global = [
+            name for name, _ in trainable_named_parameters
+            if any(token in name.lower() for token in forbidden_global_trainable_tokens)
+        ]
+        if unexpected_global:
+            raise RuntimeError(
+                "V2.0.0 verifier/teacher logic must be parameter-free, but "
+                "trainable tensors were found:\n" + "\n".join(unexpected_global)
+            )
+
+        max_feats = int(self.cfgs.get("dataset", {}).get("max_feats", 0))
+        print("[Q-Bound V2.0.0 Component Check]")
+        print("  fixed event partition: NO")
+        print("  event-count cap / target: NO")
+        print("  exhaustive hypothesis bank: NO")
+        print("  teacher distribution / KL distillation: NO")
+        print("  answer features inside QBoundCore: NO")
+        print("  temporal GT training supervision: NO")
+        print(
+            "  video-only prior -> bounded question residual -> soft cut field: YES"
+        )
+        print(
+            "  functional KEEP/MERGE verifier: YES (parameter-free, stop-gradient)"
+        )
+        print(
+            "  boundary-equilibrium verifier: YES (parameter-free, stop-gradient)"
+        )
+        print(
+            "  local composition complexity: O(T); sparse global reasoning: "
+            f"O(T*R), R={num_anchor_heads}"
+        )
+        if max_feats > 0:
+            print(
+                "  dataset temporal resolution: "
+                f"T<={max_feats}; semantic event count remains emergent"
+            )
+        print(
+            "  question_residual_scale: "
+            f"{question_residual_scale}"
+        )
+        print(
+            "  cut_temperature / threshold: "
+            f"{cut_temperature} / {cut_threshold}"
+        )
+        print(
+            "  functional composition loss weight / confidence scale: "
+            f"{comp_weight} / {comp_confidence_scale}"
+        )
+        print(
+            "  boundary equilibrium loss weight / confidence scale: "
+            f"{eq_weight} / {eq_confidence_scale}"
+        )
+        for component_name, summary in component_summary.items():
+            print(
+                f"  {component_name}: "
+                f"{summary['tensors']} tensors, "
+                f"{summary['parameters']:,} parameters"
+            )
+        print("  shared CRA video_proj remains in base optimizer group: YES")
+        print(
+            "  all V2.0.0 Q-Bound trainable components use qbound_lr: "
+            f"{actual_qbound_lr}\n"
+        )
 
     def _check_qbound_v112_components(self, qbound_cfg):
         """
@@ -1001,9 +1593,9 @@ class BasePipeline(object):
         """
         Structural safety check for Q-Bound experiments.
 
-        V1.12 has its own clean architecture contract and is dispatched to
-        ``_check_qbound_v112_components``. Legacy checks are retained below
-        only so older experiment configs remain loadable.
+        V2.0.0 has its own clean architecture contract and is dispatched to
+        ``_check_qbound_v200_components``. V1.12 and older checks are retained
+        below only so historical experiment configs remain loadable.
 
         V1.11 keeps the successful V1.10.2 temporal mechanism:
 
@@ -1033,6 +1625,10 @@ class BasePipeline(object):
             qbound_cfg = {}
 
         version = str(qbound_cfg.get("version", ""))
+
+        if version == "2.0.0":
+            self._check_qbound_v200_components(qbound_cfg)
+            return
 
         if version == "1.12":
             self._check_qbound_v112_components(qbound_cfg)
