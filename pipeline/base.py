@@ -126,7 +126,9 @@ class BasePipeline(object):
 
         The grounding module and shared CRA projection remain base-model
         parameters. Only QBoundCore trainable parameters use the dedicated
-        Q-Bound learning rate.
+        Q-Bound learning rate. In V1.12 this includes the generic input
+        adapter, dynamic DECOMPOSE/Q-OEI modules, local evidence encoders, and
+        the question-only temporal-hypothesis scorer.
         """
         if not self._qbound_enabled():
             return
@@ -471,10 +473,537 @@ class BasePipeline(object):
             print(f"  {prefix}: {count} tensors")
         print("")
 
+    def _check_qbound_v112_components(self, qbound_cfg):
+        """
+        Structural safety check for Q-Bound V1.12.
+
+        V1.12 is a deliberate architectural reset:
+
+            generic visual input
+                -> dynamic DECOMPOSE
+                -> Q-OEI RELATE
+                -> exact frame-level temporal hypothesis bank
+                -> question-only intra-video hypothesis scorer
+                -> hard winning hypothesis
+
+        Candidate-answer semantics are privileged TRAINING-ONLY supervision.
+        They are consumed by RefineDecoder's stop-gradient critic and must not
+        appear as trainable Q-Bound inputs or parameters.
+
+        This check therefore verifies four invariants:
+          1) event count is capacity-bounded but dynamic;
+          2) the hypothesis scorer is present and trainable with qbound_lr;
+          3) legacy COMPOSE/BAPGR/PPBR/PSRC/donor machinery is absent;
+          4) the answer-aware critic is parameter-free and answer information
+             is not part of QBoundCore's inference path.
+        """
+        model_cfg = self.cfgs.get("model", {})
+        optim_cfg = self.cfgs.get("optim", {})
+
+        if str(model_cfg.get("baseline", "")) != "refine":
+            raise RuntimeError(
+                "Q-Bound V1.12 requires model.baseline='refine'."
+            )
+
+        if bool(model_cfg.get("do", False)):
+            raise RuntimeError(
+                "Controlled Q-Bound V1.12 requires model.do=false. "
+                "CRA VisualIntervention would confound the privileged "
+                "hypothesis critic."
+            )
+
+        if not bool(qbound_cfg.get("require_question_only", True)):
+            raise RuntimeError(
+                "Q-Bound V1.12 requires question-only grounding semantics. "
+                "Answer features may supervise the training-only critic but "
+                "must not enter QBoundCore."
+            )
+
+        if bool(qbound_cfg.get("use_temporal_prior", False)):
+            raise RuntimeError(
+                "Q-Bound V1.12 must not consume a CRA temporal prior."
+            )
+
+        if not bool(qbound_cfg.get("detach_backbone_inputs", True)):
+            raise RuntimeError(
+                "Controlled Q-Bound V1.12 expects "
+                "model.qbound.detach_backbone_inputs=true."
+            )
+
+        if not bool(qbound_cfg.get("use_generic_input_adapter", True)):
+            raise RuntimeError(
+                "Q-Bound V1.12 requires the Q-Bound-owned generic input "
+                "adapter."
+            )
+
+        if not bool(qbound_cfg.get("input_adapter_use_position", True)):
+            raise RuntimeError(
+                "Q-Bound V1.12 requires positional encoding in the generic "
+                "input adapter."
+            )
+
+        max_events = int(qbound_cfg.get("max_events", 6))
+        proposal_candidates = int(qbound_cfg.get("proposal_candidates", 8))
+        if max_events < 2:
+            raise ValueError(
+                "Q-Bound V1.12 max_events must be >= 2. It is a capacity "
+                "ceiling, not a forced event count."
+            )
+        if proposal_candidates < max_events - 1:
+            raise ValueError(
+                "Q-Bound V1.12 proposal_candidates must be >= max_events-1 "
+                "so every event count up to the capacity can be represented."
+            )
+
+        decomposition_cfg = qbound_cfg.get("decomposition", {})
+        if not isinstance(decomposition_cfg, dict):
+            raise TypeError(
+                "model.qbound.decomposition must be a mapping/dict."
+            )
+        if not bool(decomposition_cfg.get("enabled", True)):
+            raise RuntimeError(
+                "Q-Bound V1.12 requires dynamic DECOMPOSE to remain enabled."
+            )
+
+        reasoning_cfg = qbound_cfg.get("reasoning", {})
+        if not isinstance(reasoning_cfg, dict):
+            raise TypeError("model.qbound.reasoning must be a mapping/dict.")
+        if not bool(reasoning_cfg.get("enabled", True)):
+            raise RuntimeError(
+                "Q-Bound V1.12 requires Q-OEI RELATE to remain enabled."
+            )
+        reasoning_type = str(
+            reasoning_cfg.get("type", "ordered_event_interaction")
+        )
+        if reasoning_type != "ordered_event_interaction":
+            raise RuntimeError(
+                "Q-Bound V1.12 reasoning.type must be "
+                "'ordered_event_interaction'; got "
+                f"{reasoning_type!r}."
+            )
+
+        teacher_cfg = qbound_cfg.get("hypothesis_teacher", {})
+        if not isinstance(teacher_cfg, dict):
+            raise TypeError(
+                "model.qbound.hypothesis_teacher must be a mapping/dict."
+            )
+        if not bool(teacher_cfg.get("enabled", True)):
+            raise RuntimeError(
+                "The controlled Q-Bound V1.12 run requires the privileged "
+                "answer-aware hypothesis teacher."
+            )
+        teacher_loss_weight = float(teacher_cfg.get("loss_weight", 0.10))
+        if (
+            not math.isfinite(teacher_loss_weight)
+            or teacher_loss_weight <= 0.0
+        ):
+            raise ValueError(
+                "Q-Bound V1.12 hypothesis_teacher.loss_weight must be "
+                "finite and > 0."
+            )
+
+        # V1.12 intentionally removes these V1.11 mechanism blocks.  Reject
+        # stale YAML rather than silently ignoring it.
+        for legacy_block in ("composer", "refinement", "counterfactual"):
+            legacy_value = qbound_cfg.get(legacy_block)
+            if legacy_value not in (None, {}):
+                raise RuntimeError(
+                    "Q-Bound V1.12 YAML still contains legacy block "
+                    f"model.qbound.{legacy_block}. Remove it for a clean "
+                    "V1.12 run."
+                )
+
+        if bool(qbound_cfg.get("counterfactual_evidence_interface", False)):
+            raise RuntimeError(
+                "Q-Bound V1.12 must keep the V1.11 donor-counterfactual "
+                "interface disabled."
+            )
+
+        # --------------------------------------------------------------
+        # Cross-file V1.12 contract.
+        # --------------------------------------------------------------
+        model_core = (
+            self.model.module
+            if hasattr(self.model, "module")
+            else self.model
+        )
+
+        version = "1.12"
+        model_version = str(getattr(model_core, "qbound_version", ""))
+        if model_version != version:
+            raise RuntimeError(
+                "BasePipeline/model Q-Bound version mismatch: "
+                f"config={version!r}, model={model_version!r}."
+            )
+
+        decoder = getattr(model_core, "decoder", None)
+        decoder_version = str(getattr(decoder, "qbound_version", ""))
+        if decoder_version != version:
+            raise RuntimeError(
+                "BasePipeline/RefineDecoder Q-Bound version mismatch: "
+                f"config={version!r}, decoder={decoder_version!r}."
+            )
+
+        qbound_core = getattr(decoder, "qbound", None)
+        if qbound_core is None:
+            raise RuntimeError(
+                "Q-Bound V1.12 is enabled but RefineDecoder.qbound is missing."
+            )
+        core_version = str(getattr(qbound_core, "qbound_version", ""))
+        if core_version != version:
+            raise RuntimeError(
+                "BasePipeline/QBoundCore version mismatch: "
+                f"config={version!r}, core={core_version!r}."
+            )
+
+        if not callable(
+            getattr(decoder, "score_privileged_hypothesis_bank", None)
+        ):
+            raise RuntimeError(
+                "RefineDecoder V1.12 must expose "
+                "score_privileged_hypothesis_bank()."
+            )
+
+        actual_max_events = int(getattr(qbound_core, "max_events", -1))
+        actual_proposals = int(
+            getattr(qbound_core, "proposal_candidates", -1)
+        )
+        if actual_max_events != max_events:
+            raise RuntimeError(
+                "QBoundCore V1.12 max_events mismatch: "
+                f"config={max_events}, core={actual_max_events}."
+            )
+        if actual_proposals != proposal_candidates:
+            raise RuntimeError(
+                "QBoundCore V1.12 proposal_candidates mismatch: "
+                f"config={proposal_candidates}, core={actual_proposals}."
+            )
+        if bool(getattr(qbound_core, "use_temporal_prior", True)):
+            raise RuntimeError(
+                "QBoundCore V1.12 unexpectedly enables a temporal prior."
+            )
+        if not bool(
+            getattr(qbound_core, "use_generic_input_adapter", False)
+        ):
+            raise RuntimeError(
+                "QBoundCore V1.12 generic input adapter is not active."
+            )
+        if bool(
+            getattr(qbound_core, "input_adapter_use_position", False)
+        ) != bool(qbound_cfg.get("input_adapter_use_position", True)):
+            raise RuntimeError(
+                "QBoundCore V1.12 positional-input setting does not match "
+                "the YAML configuration."
+            )
+
+        # The partition bank must contain every split count from 0 to
+        # K_max-1.  This verifies that max_events is a capacity ceiling rather
+        # than a hidden fixed-event assignment.
+        partition_split_count = getattr(
+            qbound_core, "partition_split_count", None
+        )
+        if not torch.is_tensor(partition_split_count):
+            raise RuntimeError(
+                "QBoundCore V1.12 partition_split_count buffer is missing."
+            )
+        observed_split_counts = set(
+            int(value)
+            for value in partition_split_count.detach().cpu().tolist()
+        )
+        expected_split_counts = set(range(max_events))
+        if observed_split_counts != expected_split_counts:
+            raise RuntimeError(
+                "QBoundCore V1.12 does not represent all dynamic event "
+                "counts. Expected split counts "
+                f"{sorted(expected_split_counts)}, got "
+                f"{sorted(observed_split_counts)}."
+            )
+
+        expected_partition_count = sum(
+            math.comb(proposal_candidates, split_count)
+            for split_count in range(max_events)
+        )
+        actual_partition_count = int(partition_split_count.numel())
+        if actual_partition_count != expected_partition_count:
+            raise RuntimeError(
+                "QBoundCore V1.12 partition-bank size mismatch: "
+                f"expected {expected_partition_count}, "
+                f"got {actual_partition_count}."
+            )
+
+        # Numeric decomposition settings must agree with the instantiated core.
+        expected_decomp = {
+            "decomp_complexity_weight": float(
+                decomposition_cfg.get("complexity_weight", 1.25)
+            ),
+            "decomp_boundary_weight": float(
+                decomposition_cfg.get("boundary_weight", 0.50)
+            ),
+            "decomp_temperature": float(
+                decomposition_cfg.get("temperature", 0.20)
+            ),
+        }
+        for attribute_name, expected_value in expected_decomp.items():
+            actual_value = float(
+                getattr(qbound_core, attribute_name, float("nan"))
+            )
+            if not math.isclose(
+                actual_value,
+                expected_value,
+                rel_tol=1e-9,
+                abs_tol=1e-12,
+            ):
+                raise RuntimeError(
+                    "QBoundCore V1.12 decomposition setting mismatch for "
+                    f"{attribute_name}: config={expected_value}, "
+                    f"core={actual_value}."
+                )
+
+        # --------------------------------------------------------------
+        # Trainable-module / optimizer contract.
+        # --------------------------------------------------------------
+        trainable_named_parameters = [
+            (name, parameter)
+            for name, parameter in self.model.named_parameters()
+            if parameter.requires_grad
+        ]
+        qbound_named_parameters = [
+            (name, parameter)
+            for name, parameter in trainable_named_parameters
+            if self._is_qbound_parameter_name(name)
+        ]
+        if not qbound_named_parameters:
+            raise RuntimeError(
+                "Q-Bound V1.12 has no trainable Q-Bound parameters."
+            )
+
+        qbound_group = next(
+            (
+                group
+                for group in self.optimizer.param_groups
+                if group.get("name") == "qbound"
+            ),
+            None,
+        )
+        if qbound_group is None:
+            raise RuntimeError(
+                "Q-Bound V1.12 optimizer group 'qbound' is missing."
+            )
+        qbound_group_ids = {
+            id(parameter) for parameter in qbound_group["params"]
+        }
+
+        # Every named token below represents an intentional V1.12 trainable
+        # mechanism.  Requiring all of them catches partial file replacement.
+        required_component_tokens = {
+            "GENERIC_INPUT": (
+                "generic_input_proj",
+                "generic_input_norm",
+            ),
+            "DECOMPOSE": (
+                "decomp_question_gate",
+                "topology_proj",
+                "topology_qa_proj",
+                "boundary_feature_encoder",
+                "boundary_classifier",
+            ),
+            "EVENT_ENCODING": (
+                "raw_proj",
+                "context_proj",
+                "qa_proj",
+                "qa_film",
+                "event_encoder",
+            ),
+            "RELATE": (
+                "ordered_relation_score",
+                "ordered_value_proj",
+                "ordered_event_update",
+                "ordered_update_gate",
+                "ordered_event_norm",
+            ),
+            "EVIDENCE": (
+                "event_evidence_score",
+                "frame_evidence_encoder",
+                "frame_evidence_score",
+            ),
+            "HYPOTHESIS_SCORER": (
+                "hypothesis_feature_encoder",
+                "hypothesis_score",
+            ),
+        }
+
+        missing_tokens = []
+        misplaced_parameters = []
+        component_summary = {}
+
+        for component_name, tokens in required_component_tokens.items():
+            component_parameter_ids = set()
+            component_tensor_names = set()
+
+            for token in tokens:
+                matched = [
+                    (name, parameter)
+                    for name, parameter in qbound_named_parameters
+                    if token in name
+                ]
+                if not matched:
+                    missing_tokens.append(
+                        f"{component_name}: missing trainable token {token!r}"
+                    )
+                    continue
+
+                for name, parameter in matched:
+                    component_parameter_ids.add(id(parameter))
+                    component_tensor_names.add(name)
+                    if id(parameter) not in qbound_group_ids:
+                        misplaced_parameters.append(name)
+
+            component_summary[component_name] = {
+                "tensors": len(component_tensor_names),
+                "parameters": sum(
+                    parameter.numel()
+                    for _, parameter in qbound_named_parameters
+                    if id(parameter) in component_parameter_ids
+                ),
+            }
+
+        if missing_tokens:
+            raise RuntimeError(
+                "Q-Bound V1.12 expected trainable components are missing:\n"
+                + "\n".join(missing_tokens)
+            )
+        if misplaced_parameters:
+            raise RuntimeError(
+                "Q-Bound V1.12 trainable tensors were found outside the "
+                "'qbound' optimizer group:\n"
+                + "\n".join(sorted(set(misplaced_parameters)))
+            )
+
+        # These names correspond to mechanisms explicitly removed in V1.12,
+        # or to a forbidden trainable privileged critic/answer input.
+        forbidden_qbound_tokens = (
+            "span_composer",
+            "boundary_refine_encoder",
+            "boundary_start_score",
+            "boundary_end_score",
+            "refiner_",
+            "calibration_",
+            "reliability_",
+            "counterfactual_",
+            "donor_",
+            "teacher_",
+            "critic_",
+            "answer_proj",
+            "answer_encoder",
+            "answer_feature",
+        )
+        unexpected_parameters = [
+            name
+            for name, _ in qbound_named_parameters
+            if any(
+                token in name.lower()
+                for token in forbidden_qbound_tokens
+            )
+        ]
+        if unexpected_parameters:
+            raise RuntimeError(
+                "Q-Bound V1.12 contains trainable legacy/privileged "
+                "parameters that should not exist:\n"
+                + "\n".join(unexpected_parameters)
+            )
+
+        expected_qbound_lr = float(optim_cfg.get("qbound_lr", 0.0))
+        actual_qbound_lr = float(qbound_group["lr"])
+        if expected_qbound_lr <= 0.0:
+            raise ValueError(
+                "Q-Bound V1.12 requires optim.qbound_lr > 0."
+            )
+        if not math.isclose(
+            actual_qbound_lr,
+            expected_qbound_lr,
+            rel_tol=1e-9,
+            abs_tol=0.0,
+        ):
+            raise RuntimeError(
+                "Q-Bound V1.12 component-group LR mismatch: "
+                f"expected {expected_qbound_lr}, got {actual_qbound_lr}."
+            )
+
+        shared_video_proj_in_qbound_group = []
+        for name, parameter in trainable_named_parameters:
+            normalized_name = (
+                name[len("module."):]
+                if name.startswith("module.")
+                else name
+            )
+            if (
+                "decoder.video_proj" in normalized_name
+                and ".qbound." not in normalized_name
+                and id(parameter) in qbound_group_ids
+            ):
+                shared_video_proj_in_qbound_group.append(name)
+        if shared_video_proj_in_qbound_group:
+            raise RuntimeError(
+                "Shared CRA video_proj must remain in the base optimizer "
+                "group, but these tensors were found in Q-Bound:\n"
+                + "\n".join(shared_video_proj_in_qbound_group)
+            )
+
+        max_feats = int(self.cfgs.get("dataset", {}).get("max_feats", 0))
+        exact_hypothesis_count = (
+            max_feats * (max_feats + 1) // 2
+            if max_feats > 0
+            else None
+        )
+
+        print("[Q-Bound V1.12 Component Check]")
+        print(
+            "  dynamic event capacity: "
+            f"K_i in [1,{max_events}] (not fixed to K_max)"
+        )
+        print(
+            "  boundary proposal slots: "
+            f"{proposal_candidates}"
+        )
+        print(
+            "  latent partition patterns: "
+            f"{actual_partition_count}"
+        )
+        if exact_hypothesis_count is not None:
+            print(
+                "  frame-exact contiguous hypotheses at dataset max_feats="
+                f"{max_feats}: {exact_hypothesis_count}"
+            )
+        for component_name, summary in component_summary.items():
+            print(
+                f"  {component_name}: "
+                f"{summary['tensors']} tensors, "
+                f"{summary['parameters']:,} parameters"
+            )
+        print(
+            "  privileged answer-aware critic trainable parameters: 0 "
+            "(stop-gradient consumer)"
+        )
+        print("  answer features inside QBoundCore: NO")
+        print("  legacy COMPOSE/BAPGR/PPBR/PSRC/donor path: DISABLED")
+        print("  shared CRA video_proj remains in base optimizer group: YES")
+        print(
+            "  hypothesis teacher: enabled, "
+            f"loss_weight={teacher_loss_weight}, "
+            f"correct_only={bool(teacher_cfg.get('correct_only', True))}"
+        )
+        print(
+            "  all V1.12 Q-Bound trainable components use qbound_lr: "
+            f"{actual_qbound_lr}\n"
+        )
+
     def _check_qbound_components(self):
         """
-        Structural safety check for controlled
-        Q-Bound V1.8/V1.9/V1.10.1/V1.10.2/V1.11 runs.
+        Structural safety check for Q-Bound experiments.
+
+        V1.12 has its own clean architecture contract and is dispatched to
+        ``_check_qbound_v112_components``. Legacy checks are retained below
+        only so older experiment configs remain loadable.
 
         V1.11 keeps the successful V1.10.2 temporal mechanism:
 
@@ -504,6 +1033,11 @@ class BasePipeline(object):
             qbound_cfg = {}
 
         version = str(qbound_cfg.get("version", ""))
+
+        if version == "1.12":
+            self._check_qbound_v112_components(qbound_cfg)
+            return
+
         refinement_cfg = qbound_cfg.get("refinement", {})
         if not isinstance(refinement_cfg, dict):
             refinement_cfg = {}
@@ -1373,7 +1907,7 @@ class BasePipeline(object):
             f"{actual_qbound_lr}\n"
         )
 
-    # Backward-compatible alias for older V1.8-era debug code.
+    # Backward-compatible alias for older debug code.
     def _check_qbound_v18_components(self):
         return self._check_qbound_components()
 

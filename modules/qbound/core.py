@@ -8,127 +8,116 @@ import torch.nn.functional as F
 
 class QBoundCore(nn.Module):
     """
-    Q-Bound Version 1.11 core.
+    Q-Bound Version 1.12 core.
 
-    V1.11 keeps the validated temporal reasoning stack from V1.10.3:
+    V1.12 is an architecture-level reset rather than another incremental
+    Composer/Refiner patch.  It keeps the parts that remained stable across the
+    V1.4--V1.11 experiments:
 
-        DECOMPOSE -> RELATE -> COMPOSE
-        -> detached BAPGR prior
-        -> PPBR Refiner
-        -> posterior-stable reliability calibration
-        -> MAIN temporal support
+        generic visual input -> dynamic DECOMPOSE -> Q-OEI RELATE
 
-    and makes the first architecture-level step toward a CRA-independent
-    Q-Bound interface.
+    and replaces the historical
 
-    Principal V1.11 change #1: Generic Q-Bound-owned visual input adapter
-    --------------------------------------------------------------------
-    Q-Bound no longer assumes that its ``video_tokens`` have already passed
-    through CRA's ``VideoEmbedding``.  The intended input is a generic frozen
-    visual sequence, e.g. uniformly sampled CLIP-L features [B,T,768].
+        COMPOSE -> BAPGR -> PPBR -> PSRC -> counterfactual donor
 
-    The core owns a lightweight frame-wise adapter:
+    decision chain with:
 
-        generic visual token
-          -> Linear(input_dim,input_dim)
-          -> GELU
-          -> LayerNorm
-          -> fixed sinusoidal temporal position
-          -> Dropout
+        exact temporal hypothesis bank
+            -> question-only intra-video hypothesis scorer
+            -> hard winning hypothesis
+            -> temporal grounding
 
-    The adapter has no temporal self-attention and therefore does not replace
-    DECOMPOSE/RELATE.  Its projection is identity-initialized when square so
-    the first V1.11 run starts from the original visual channel geometry rather
-    than from a randomly rotated feature space.  The adapter parameters belong
-    to Q-Bound and are not shared with CRA.
+    Core scientific hypothesis
+    --------------------------
+    The persistent Q-Bound failure is not simply insufficient sharpening or
+    span-length calibration.  The model lacks a strong mechanism for deciding
+    which of several plausible temporal explanations *inside the same video*
+    best explains the current question.  V1.12 therefore turns grounding into
+    temporal-hypothesis discrimination instead of probability sharpening.
 
-    Principal V1.11 change #2: Counterfactual evidence interface
-    -------------------------------------------------------------
-    The core exposes differentiable soft keep/remove supports derived from the
-    reliability-calibrated MAIN support:
+    Dynamic event contract
+    ----------------------
+    ``max_events`` is only an event-capacity ceiling K_max.  The selected
+    partition may contain any K_i in [1, K_max] for each video/question pair.
+    There is no event-count target and no requirement to fill the capacity.
+    Events guide semantic reasoning, but final grounding boundaries are not
+    constrained to event boundaries.
 
-        raw_keep(t)       = MAIN soft temporal support in [0,1]
-        raw_remove(t)     = 1 - raw_keep(t) on valid frames
+    Exact frame-level hypothesis bank
+    ---------------------------------
+    For the short sampled VideoQA sequence (e.g. T=32 in NExT-GQA), V1.12
+    enumerates every valid contiguous frame interval [s,e].  Hence event
+    boundary errors cannot impose an oracle ceiling on final temporal
+    precision.  Event semantics still guide hypothesis scoring through the
+    reasoned event field pooled inside each interval.
 
-    V1.11-B uses a mass-preserving gradient view with identical forward values:
+    For every hypothesis H_k the core exposes:
+      * exact start/end frames and frame mask;
+      * normalized selected-evidence and complement weights;
+      * one-frame trim/expand neighbour indices;
+      * a question-only hypothesis logit p_theta(H_k | V,Q).
 
-        cf_keep = raw_keep + stopgrad(mean_valid(raw_keep)) - mean_valid(raw_keep)
-        cf_remove = 1 - cf_keep
+    This interface is intentionally designed for a training-only privileged
+    answer-aware critic in the downstream pipeline.  The core itself NEVER
+    receives answer candidates or the ground-truth answer.  At inference,
+    grounding depends only on V and Q.
 
-    This blocks the trivial all-video support solution for CF training without
-    introducing minimality, sparsity, or target-duration supervision.
+    Answer-aware learning, answer-free grounding
+    --------------------------------------------
+    A later pipeline component may use frozen answer semantics during training
+    to evaluate competing hypotheses (sufficiency, trim, expand, complement)
+    and distil a soft/listwise ranking into ``hypothesis_logits``.  Teacher
+    utilities must be detached.  This preserves a generic Q-Bound inference
+    interface while exploiting answer supervision as privileged information.
 
-    This is only an interface.  The core does NOT compute answer logits or add
-    a counterfactual loss.  A downstream consumer can later construct, e.g.:
+    Important removals from the V1.12 main path
+    --------------------------------------------
+      * no latent Composer posterior as final span selector;
+      * no BAPGR pair prior;
+      * no PPBR correction cap/temperature;
+      * no PSRC reliability fusion;
+      * no donor counterfactual support;
+      * no minimality/sparsity/duration target;
+      * no temporal GT, IoU, or IoP training loss;
+      * no answer features inside Q-Bound core.
 
-        X_suff = keep*X + remove*X_perm
-        X_nec  = remove*X + keep*X_perm
-
-    and apply answer-level sufficiency/necessity objectives.  Keeping that loss
-    outside the temporal core prevents Q-Bound from becoming tied to CRA's
-    answer head and lets V1.11-A (generic input only) and V1.11-B
-    (generic input + counterfactual evidence training) share one core.
-
-    Controlled-mechanism contract
-    -----------------------------
-    V1.11 intentionally does NOT change BAPGR, PPBR, PSRC, Composer
-    temperature, Refiner temperature, correction cap, duration behavior, or
-    event topology.  It introduces no temporal GT, IoU/IoP loss, span-length
-    target, minimality/sparsity loss, event-count forcing, CRA temporal prior,
-    or direct reasoned-event residual into the answer representation.
-
-    Gradient contract
-    -----------------
-      * Generic input-adapter parameters are trainable Q-Bound parameters.
-      * External visual/question encoders may still be detached by the caller.
-      * Composer -> MAIN coarse component remains differentiable.
-      * Composer posterior -> BAPGR prior remains stop-gradient.
-      * Refiner -> MAIN fine component remains differentiable.
-      * Reliability remains detached before coarse/fine fusion.
-      * Counterfactual keep/remove support remains differentiable when a
-        downstream V1.11-B consumer elects to use it.
-
-    V1.10.x diagnostic/output names are retained wherever possible so the
-    migration of refine.py, CRA wrapper, pipeline, and logging can be performed
-    incrementally and compared directly with V1.10.3.
+    The full hypothesis bank is also exposed for an oracle-coverage diagnostic
+    on validation data.  Ground-truth temporal spans remain evaluation-only.
     """
 
     def __init__(
         self,
         input_dim: int = 768,
         hidden_dim: int = 256,
-        max_events: int = 4,
+        max_events: int = 6,
         use_temporal_prior: bool = False,
         dropout: float = 0.1,
         boundary_temperature: float = 0.7,
         boundary_threshold: float = 0.5,
         boundary_radius: int = 2,
         boundary_bias_init: float = -0.5,
-        proposal_candidates: int = 6,
+        proposal_candidates: int = 8,
         decomp_complexity_weight: float = 1.25,
         decomp_boundary_weight: float = 0.50,
         decomp_temperature: float = 0.20,
         question_modulation_scale: float = 0.10,
         min_event_mass: float = 0.25,
-        composer_temperature: float = 0.35,
-        refiner_temperature: float = 0.30,
-        refiner_boundary_anchor_power: float = 2.0,
-        refiner_correction_cap: float = 2.0,
         use_generic_input_adapter: bool = True,
         input_adapter_dropout: Optional[float] = None,
         input_adapter_use_position: bool = True,
-        counterfactual_evidence_interface: bool = False,
     ) -> None:
         super().__init__()
 
         if max_events < 2:
-            raise ValueError("Version 1.11 requires max_events >= 2.")
+            raise ValueError(
+                "Version 1.12 requires max_events >= 2 as a capacity ceiling."
+            )
         if proposal_candidates < 1:
             raise ValueError("proposal_candidates must be >= 1.")
         if proposal_candidates < max_events - 1:
             raise ValueError(
-                "proposal_candidates should be >= max_events - 1 so every "
-                "allowed event count can be represented."
+                "proposal_candidates must be >= max_events - 1 so all "
+                "event counts up to the capacity can be represented."
             )
         if not 0.0 <= dropout < 1.0:
             raise ValueError("dropout must be in [0, 1).")
@@ -148,18 +137,6 @@ class QBoundCore(nn.Module):
             raise ValueError("question_modulation_scale must be in (0, 1).")
         if min_event_mass <= 0.0:
             raise ValueError("min_event_mass must be positive.")
-        if composer_temperature <= 0.0:
-            raise ValueError("composer_temperature must be positive.")
-        if refiner_temperature <= 0.0:
-            raise ValueError("refiner_temperature must be positive.")
-        if refiner_boundary_anchor_power <= 0.0:
-            raise ValueError(
-                "refiner_boundary_anchor_power must be positive."
-            )
-        if refiner_correction_cap <= 0.0:
-            raise ValueError(
-                "refiner_correction_cap must be positive."
-            )
 
         if input_adapter_dropout is None:
             input_adapter_dropout = dropout
@@ -168,18 +145,15 @@ class QBoundCore(nn.Module):
 
         self.input_dim = int(input_dim)
         self.hidden_dim = int(hidden_dim)
+        # IMPORTANT: this is a capacity ceiling, not a forced event count.
         self.max_events = int(max_events)
         self.max_transitions = self.max_events - 1
         self.proposal_candidates = int(proposal_candidates)
-        self.qbound_version = "1.11"
+        self.qbound_version = "1.12"
 
         self.use_generic_input_adapter = bool(use_generic_input_adapter)
         self.input_adapter_use_position = bool(input_adapter_use_position)
         self.input_adapter_dropout_p = float(input_adapter_dropout)
-        self.counterfactual_evidence_interface = bool(
-            counterfactual_evidence_interface
-        )
-
         self.use_temporal_prior = bool(use_temporal_prior)
         self.boundary_temperature = float(boundary_temperature)
         self.boundary_threshold = float(boundary_threshold)
@@ -189,29 +163,15 @@ class QBoundCore(nn.Module):
         self.decomp_temperature = float(decomp_temperature)
         self.question_modulation_scale = float(question_modulation_scale)
         self.min_event_mass = float(min_event_mass)
-        self.composer_temperature = float(composer_temperature)
-        self.refiner_temperature = float(refiner_temperature)
-        self.refiner_boundary_anchor_power = float(
-            refiner_boundary_anchor_power
-        )
-        self.refiner_correction_cap = float(
-            refiner_correction_cap
-        )
 
         # ------------------------------------------------------------------
-        # 0. V1.11 GENERIC VISUAL INPUT ADAPTER
+        # 0. GENERIC VISUAL INPUT ADAPTER -- retained from V1.11.
         # ------------------------------------------------------------------
-        # Q-Bound owns this adapter.  It intentionally mirrors only the
-        # lightweight per-frame preprocessing that is useful for raw frozen
-        # features; it does not reuse CRA VideoEmbedding parameters.
         self.generic_input_proj = nn.Linear(input_dim, input_dim)
         self.generic_input_gelu = nn.GELU()
         self.generic_input_norm = nn.LayerNorm(input_dim, eps=1e-12)
         self.generic_input_dropout = nn.Dropout(self.input_adapter_dropout_p)
 
-        # Identity initialization makes the visual channel mapping controlled
-        # at the start of V1.11.  GELU/LN/position still provide the intended
-        # adapter normalization without importing CRA-trained weights.
         if self.generic_input_proj.weight.shape[0] == self.generic_input_proj.weight.shape[1]:
             nn.init.eye_(self.generic_input_proj.weight)
         else:
@@ -219,19 +179,12 @@ class QBoundCore(nn.Module):
         nn.init.zeros_(self.generic_input_proj.bias)
 
         # ------------------------------------------------------------------
-        # A. TOPOLOGY / DECOMPOSITION BRANCH
+        # A. DYNAMIC TOPOLOGY / DECOMPOSITION.
         # ------------------------------------------------------------------
-        # The coherence geometry is measured directly on detached backbone
-        # features. The question can only modulate each channel within a narrow
-        # range [1-rho, 1+rho], preventing the decomposition objective from
-        # learning a trivial constant representation.
         self.decomp_question_gate = nn.Linear(input_dim, input_dim)
         nn.init.zeros_(self.decomp_question_gate.weight)
         nn.init.zeros_(self.decomp_question_gate.bias)
 
-        # Dedicated topology projections. These are not used by downstream
-        # event semantics / VQA, which limits the V1.3 shortcut in which answer
-        # gradients could reshape the boundary representation itself.
         self.topology_proj = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -241,8 +194,6 @@ class QBoundCore(nn.Module):
             nn.LayerNorm(hidden_dim),
         )
 
-        # left/right topology state, abs change, signed change, interaction,
-        # question, optional prior(left/right/diff), normalized position.
         boundary_input_dim = hidden_dim * 6 + 4
         self.boundary_feature_encoder = nn.Sequential(
             nn.Linear(boundary_input_dim, hidden_dim),
@@ -254,9 +205,8 @@ class QBoundCore(nn.Module):
         nn.init.normal_(self.boundary_classifier.weight, mean=0.0, std=2e-2)
         nn.init.constant_(self.boundary_classifier.bias, boundary_bias_init)
 
-        # Enumerate all subsets of proposal slots with at most max_events-1
-        # selected boundaries. With proposal_candidates=6 and max_events=4 this
-        # is only 42 partitions per sample.
+        # Enumerate every subset of proposal slots that yields at most K_max
+        # events.  The selected split count is free to vary per sample.
         patterns = []
         for n_split in range(self.max_transitions + 1):
             for selected in combinations(range(self.proposal_candidates), n_split):
@@ -302,51 +252,7 @@ class QBoundCore(nn.Module):
         )
 
         # ------------------------------------------------------------------
-        # Latent contiguous event-span candidates used by V1.5 COMPOSE.
-        #
-        # For K=max_events, enumerate:
-        #   [E0], [E1], ..., [E0,E1], [E1,E2], ..., [E0,...,E(K-1)]
-        #
-        # Dynamic samples simply invalidate candidates that touch padded event
-        # slots. With max_events=4 this creates only 10 candidates.
-        # ------------------------------------------------------------------
-        span_patterns = []
-        span_starts = []
-        span_ends = []
-        span_lengths = []
-
-        for start_event in range(self.max_events):
-            for end_event in range(start_event, self.max_events):
-                pattern = torch.zeros(self.max_events, dtype=torch.bool)
-                pattern[start_event : end_event + 1] = True
-                span_patterns.append(pattern)
-                span_starts.append(start_event)
-                span_ends.append(end_event)
-                span_lengths.append(end_event - start_event + 1)
-
-        self.register_buffer(
-            "composer_span_patterns",
-            torch.stack(span_patterns, dim=0),
-            persistent=False,
-        )
-        self.register_buffer(
-            "composer_span_start_events",
-            torch.tensor(span_starts, dtype=torch.long),
-            persistent=False,
-        )
-        self.register_buffer(
-            "composer_span_end_events",
-            torch.tensor(span_ends, dtype=torch.long),
-            persistent=False,
-        )
-        self.register_buffer(
-            "composer_span_event_counts",
-            torch.tensor(span_lengths, dtype=torch.float32),
-            persistent=False,
-        )
-
-        # ------------------------------------------------------------------
-        # B. SEMANTIC EVENT / GROUNDING BRANCH
+        # B. SEMANTIC EVENT / LOCAL EVIDENCE BRANCH -- retained.
         # ------------------------------------------------------------------
         self.raw_proj = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
@@ -362,7 +268,6 @@ class QBoundCore(nn.Module):
         )
         self.qa_film = nn.Linear(hidden_dim, hidden_dim * 2)
 
-        # contextual, raw, dynamics, question, center, duration, prior mass.
         self.event_encoder = nn.Sequential(
             nn.Linear(hidden_dim * 4 + 3, hidden_dim),
             nn.GELU(),
@@ -370,7 +275,7 @@ class QBoundCore(nn.Module):
         )
 
         # ------------------------------------------------------------------
-        # C. RELATE: Question-Conditioned Ordered Event Interaction (Q-OEI)
+        # C. RELATE: Q-OEI retained.
         # ------------------------------------------------------------------
         ordered_pair_dim = hidden_dim * 5 + 4
         self.ordered_relation_score = nn.Sequential(
@@ -408,9 +313,9 @@ class QBoundCore(nn.Module):
         self.ordered_event_norm = nn.LayerNorm(hidden_dim)
 
         # ------------------------------------------------------------------
-        # D. GROUND: evidence composition, no event-level winner selection.
+        # D. LOCAL QUESTION-CONDITIONED EVIDENCE -- retained as features, not
+        #    as the final selector.
         # ------------------------------------------------------------------
-        # Main path uses raw event evidence logits, not sigmoid/softmax gates.
         self.event_evidence_score = nn.Sequential(
             nn.Linear(hidden_dim * 3, hidden_dim),
             nn.GELU(),
@@ -435,68 +340,29 @@ class QBoundCore(nn.Module):
         nn.init.zeros_(self.frame_evidence_score.bias)
 
         # ------------------------------------------------------------------
-        # E. COMPOSE: Latent Event-Span Composer.
+        # E. V1.12 QUESTION-ONLY TEMPORAL HYPOTHESIS SCORER.
         # ------------------------------------------------------------------
-        # Candidate representation:
-        #   start event
-        #   end event
-        #   pooled reasoned span
+        # Hypothesis feature =
+        #   start frame state
+        #   end frame state
+        #   pooled contextual state
+        #   pooled reasoned-event field
         #   question
-        #   pooled span x question
-        #   + center, frame duration, event-count ratio,
-        #     bounded event-evidence mean, bounded frame-evidence mean.
-        #
-        # A bounded mean event-evidence term is also added as a direct prior to
-        # the learned span score. This makes the new composer start from the
-        # useful V1.4 event evidence instead of an arbitrary uniform readout.
-        composer_input_dim = hidden_dim * 5 + 5
-        self.span_composer_score = nn.Sequential(
-            nn.Linear(composer_input_dim, hidden_dim),
-            nn.GELU(),
-            nn.LayerNorm(hidden_dim),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1),
-        )
-        nn.init.normal_(
-            self.span_composer_score[-1].weight,
-            mean=0.0,
-            std=1e-2,
-        )
-        nn.init.zeros_(self.span_composer_score[-1].bias)
-
-        # ------------------------------------------------------------------
-        # F. REFINE: V1.10.2 BAPGR + PPBR + PSRC retained in V1.11
-        # ------------------------------------------------------------------
-        # The trainable boundary scorer is intentionally unchanged from V1.9.
-        # V1.10.1 changes only the detached Composer -> pair geometry: legal
-        # frames inside the first/last event are softly anchored toward the
-        # semantic span endpoints before the Refiner logits update the prior.
-        refiner_input_dim = hidden_dim * 6 + 2
-        self.boundary_refine_encoder = nn.Sequential(
-            nn.Linear(refiner_input_dim, hidden_dim),
+        #   pooled reasoned-event x question
+        #   + center, duration, local evidence mean, frame evidence mean,
+        #     left boundary evidence, right boundary evidence,
+        #     touched-event ratio.
+        hypothesis_input_dim = hidden_dim * 6 + 7
+        self.hypothesis_feature_encoder = nn.Sequential(
+            nn.Linear(hypothesis_input_dim, hidden_dim),
             nn.GELU(),
             nn.LayerNorm(hidden_dim),
             nn.Dropout(dropout),
         )
-        self.boundary_start_score = nn.Linear(hidden_dim, 1)
-        self.boundary_end_score = nn.Linear(hidden_dim, 1)
+        self.hypothesis_score = nn.Linear(hidden_dim, 1)
+        nn.init.normal_(self.hypothesis_score.weight, mean=0.0, std=1e-2)
+        nn.init.zeros_(self.hypothesis_score.bias)
 
-        nn.init.normal_(
-            self.boundary_start_score.weight,
-            mean=0.0,
-            std=1e-2,
-        )
-        nn.init.zeros_(self.boundary_start_score.bias)
-        nn.init.normal_(
-            self.boundary_end_score.weight,
-            mean=0.0,
-            std=1e-2,
-        )
-        nn.init.zeros_(self.boundary_end_score.bias)
-
-    # ----------------------------------------------------------------------
-    # Generic helpers
-    # ----------------------------------------------------------------------
     @staticmethod
     def _sinusoidal_position_encoding(
         time_steps: int,
@@ -1520,1688 +1386,422 @@ class QBoundCore(nn.Module):
     # ----------------------------------------------------------------------
     # COMPOSE: latent contiguous event-span composition
     # ----------------------------------------------------------------------
-    def _compose_event_spans(
+
+    # ----------------------------------------------------------------------
+    # V1.12 TEMPORAL HYPOTHESIS BANK
+    # ----------------------------------------------------------------------
+    def _enumerate_temporal_hypotheses(
         self,
-        reasoned_event_tokens: torch.Tensor,
-        event_valid_mask: torch.Tensor,
-        event_assignment: torch.Tensor,
-        event_evidence_logits: torch.Tensor,
-        local_temporal_logits: torch.Tensor,
-        qa_state: torch.Tensor,
         video_mask: torch.Tensor,
+        dtype: torch.dtype,
     ) -> Dict[str, torch.Tensor]:
         """
-        Compose adaptive temporal support from contiguous chains of latent events.
+        Enumerate every valid contiguous frame interval [s,e].
 
-        The V1.4 local temporal evidence remains useful, but it no longer has to
-        be converted into a fixed 3/5-frame CRA window. Instead, this method:
-
-          1) enumerates all valid contiguous event chains;
-          2) scores them with question-conditioned reasoned event semantics;
-          3) forms a differentiable posterior over candidate chains;
-          4) converts that posterior into a soft frame-support prior;
-          5) combines the support prior with local frame/event logits;
-          6) applies ONE final frame-level temporal softmax.
-
-        The hard selected chain is detached and used only as an adaptive support
-        interface / diagnostic. Gradients from the main composed probability flow
-        through the soft span posterior and the span scorer.
+        At T=32 this gives 528 hypotheses.  This deliberate frame-level bank
+        removes event-boundary oracle limitations while event semantics remain
+        available to the scorer.  The bank also exposes one-frame neighbour
+        indices so a downstream answer-aware critic can compare H with
+        trim-left/right and expand-left/right alternatives without temporal GT.
         """
-        if reasoned_event_tokens.ndim != 3:
-            raise ValueError(
-                "reasoned_event_tokens must be [B,K,H], got "
-                f"{tuple(reasoned_event_tokens.shape)}."
-            )
+        if video_mask.ndim != 2:
+            raise ValueError("video_mask must be [B,T].")
 
-        batch_size, event_slots, hidden_dim = reasoned_event_tokens.shape
-        if event_slots != self.max_events or hidden_dim != self.hidden_dim:
-            raise ValueError(
-                "reasoned_event_tokens shape mismatch: expected "
-                f"[B,{self.max_events},{self.hidden_dim}], got "
-                f"{tuple(reasoned_event_tokens.shape)}."
-            )
+        batch_size, time_steps = video_mask.shape
+        device = video_mask.device
 
-        if event_assignment.shape[:2] != video_mask.shape:
-            raise ValueError(
-                "event_assignment/video_mask temporal shape mismatch."
-            )
-        if event_assignment.size(-1) != self.max_events:
-            raise ValueError(
-                "event_assignment must end with max_events slots."
-            )
-        if event_evidence_logits.shape != (batch_size, self.max_events):
-            raise ValueError(
-                "event_evidence_logits must be [B,max_events]."
-            )
-        if local_temporal_logits.shape != video_mask.shape:
-            raise ValueError(
-                "local_temporal_logits and video_mask must both be [B,T]."
-            )
-
-        event_valid_mask = event_valid_mask.bool()
-        video_mask = video_mask.bool()
-
-        span_patterns = self.composer_span_patterns.to(
-            device=reasoned_event_tokens.device
-        )
-        span_patterns_f = span_patterns.to(reasoned_event_tokens.dtype)
-        num_spans = span_patterns.size(0)
-
-        span_event_count = self.composer_span_event_counts.to(
-            device=reasoned_event_tokens.device,
-            dtype=reasoned_event_tokens.dtype,
-        )
-
-        # Candidate valid iff all event slots in the chain exist.
-        valid_selected_events = torch.einsum(
-            "bk,sk->bs",
-            event_valid_mask.to(reasoned_event_tokens.dtype),
-            span_patterns_f,
-        )
-        span_valid_mask = (
-            valid_selected_events
-            >= (span_event_count.view(1, -1) - 1e-6)
-        )
-
-        # [B,S,T]: exact hard frame support for every contiguous event chain.
-        span_frame_membership = torch.einsum(
-            "btk,sk->bst",
-            event_assignment.detach(),
-            span_patterns_f,
-        )
-        span_frame_mask = (
-            span_frame_membership > 0.5
-        ) & video_mask.unsqueeze(1)
-
-        span_frame_length = span_frame_mask.sum(dim=-1).to(
-            reasoned_event_tokens.dtype
-        )
-        span_valid_mask = span_valid_mask & (span_frame_length > 0)
-
-        # Pooled reasoned event semantics at the event level.
-        span_event_pool = torch.einsum(
-            "sk,bkh->bsh",
-            span_patterns_f,
-            reasoned_event_tokens,
-        )
-        span_event_pool = (
-            span_event_pool
-            / span_event_count.view(1, num_spans, 1).clamp_min(1.0)
-        )
-
-        start_event_tokens = reasoned_event_tokens[
-            :,
-            self.composer_span_start_events,
-            :,
-        ]
-        end_event_tokens = reasoned_event_tokens[
-            :,
-            self.composer_span_end_events,
-            :,
-        ]
-        qa_spans = qa_state.unsqueeze(1).expand(-1, num_spans, -1)
-
-        span_event_evidence_mean = torch.einsum(
-            "sk,bk->bs",
-            span_patterns_f,
-            event_evidence_logits,
-        ) / span_event_count.view(1, num_spans).clamp_min(1.0)
-
-        frame_mask_f = span_frame_mask.to(local_temporal_logits.dtype)
-        span_frame_evidence_mean = torch.einsum(
-            "bst,bt->bs",
-            frame_mask_f,
-            local_temporal_logits,
-        ) / span_frame_length.clamp_min(1.0)
-
-        time_steps = video_mask.size(1)
-        valid_length = video_mask.sum(dim=-1).to(
-            reasoned_event_tokens.dtype
-        ).clamp_min(1.0)
-
-        positions = torch.linspace(
-            0.0,
-            1.0,
-            steps=time_steps,
-            dtype=reasoned_event_tokens.dtype,
-            device=reasoned_event_tokens.device,
-        ).view(1, 1, time_steps)
-
-        span_center = (
-            frame_mask_f * positions
-        ).sum(dim=-1) / span_frame_length.clamp_min(1.0)
-
-        span_duration = (
-            span_frame_length
-            / valid_length.unsqueeze(1)
-        )
-        span_event_count_ratio = (
-            span_event_count.view(1, -1)
-            / float(max(self.max_events, 1))
-        ).expand(batch_size, -1)
-
-        scalar_features = torch.stack(
-            [
-                span_center,
-                span_duration,
-                span_event_count_ratio,
-                torch.tanh(span_event_evidence_mean),
-                torch.tanh(span_frame_evidence_mean),
-            ],
-            dim=-1,
-        )
-
-        composer_input = torch.cat(
-            [
-                start_event_tokens,
-                end_event_tokens,
-                span_event_pool,
-                qa_spans,
-                span_event_pool * qa_spans,
-                scalar_features,
-            ],
-            dim=-1,
-        )
-
-        learned_span_logits = self.span_composer_score(
-            composer_input
-        ).squeeze(-1)
-
-        # Existing V1.4 event evidence is a bounded prior, not a teacher.
-        # The learned composer can override it through task gradients.
-        span_evidence_prior = torch.tanh(span_event_evidence_mean)
-        span_logits_raw = learned_span_logits + span_evidence_prior
-
-        span_posterior = self._masked_softmax(
-            span_logits_raw / self.composer_temperature,
-            span_valid_mask,
-            dim=-1,
-        )
-
-        span_entropy = -torch.sum(
-            span_posterior
-            * torch.log(span_posterior.clamp_min(1e-8)),
-            dim=-1,
-        )
-        span_effective_count = torch.exp(span_entropy)
-        span_top1_posterior = span_posterior.max(dim=-1).values
-
-        # Differentiable event-membership probabilities: useful both for
-        # diagnostics and a future frozen-LLM event-token adapter.
-        soft_selected_event_weights = torch.einsum(
-            "bs,sk->bk",
-            span_posterior,
-            span_patterns_f,
-        )
-        soft_selected_event_weights = (
-            soft_selected_event_weights
-            * event_valid_mask.to(soft_selected_event_weights.dtype)
-        )
-
-        soft_event_denominator = soft_selected_event_weights.sum(
-            dim=-1,
-            keepdim=True,
-        ).clamp_min(1e-6)
-        composed_reasoned_event_repr = torch.einsum(
-            "bk,bkh->bh",
-            soft_selected_event_weights / soft_event_denominator,
-            reasoned_event_tokens,
-        )
-
-        # Span membership probability at every frame. It is intentionally not
-        # length-normalized: it represents P(frame is inside relevant support).
-        soft_span_support = torch.einsum(
-            "bs,bst->bt",
-            span_posterior,
-            frame_mask_f,
-        )
-        soft_span_support = (
-            soft_span_support * video_mask.to(soft_span_support.dtype)
-        )
-
-        # Coarse-to-fine composition:
-        #   coarse = latent event-span support
-        #   fine   = V1.4 local event/frame evidence
-        #
-        # Adding log(support) to local logits is a probabilistically natural
-        # product-of-evidence composition. A per-sample normalization constant
-        # would cancel in the final softmax, so support need not sum to one.
-        span_support_log_bias = torch.log(
-            soft_span_support.clamp_min(1e-6)
-        )
-        composed_temporal_logits = (
-            local_temporal_logits + span_support_log_bias
-        )
-        composed_temporal_logits = (
-            composed_temporal_logits
-            * video_mask.to(composed_temporal_logits.dtype)
-        )
-
-        composed_temporal_prob = self._masked_softmax(
-            composed_temporal_logits,
-            video_mask,
-            dim=-1,
-        )
-
-        # ------------------------------------------------------------------
-        # Hard adaptive span: detached interface for start/end extraction and
-        # future selected-event-token routing.
-        # ------------------------------------------------------------------
-        selected_span_index = span_posterior.detach().argmax(dim=-1)
-        batch_index = torch.arange(
-            batch_size,
-            device=reasoned_event_tokens.device,
-        )
-
-        selected_event_mask = span_patterns[
-            selected_span_index
-        ].detach()
-        selected_event_mask = (
-            selected_event_mask
-            & event_valid_mask
-        )
-
-        selected_frame_mask = span_frame_mask[
-            batch_index,
-            selected_span_index,
-        ].detach()
-
-        frame_indices = torch.arange(
+        pair = torch.triu_indices(
             time_steps,
-            device=reasoned_event_tokens.device,
+            time_steps,
+            offset=0,
+            device=device,
+        )
+        start = pair[0].long()
+        end = pair[1].long()
+        num_hypotheses = int(start.numel())
+
+        frame_index = torch.arange(
+            time_steps,
+            device=device,
             dtype=torch.long,
-        ).view(1, time_steps).expand(batch_size, -1)
-
-        selected_span_start_frame = torch.where(
-            selected_frame_mask,
-            frame_indices,
-            torch.full_like(frame_indices, time_steps),
-        ).min(dim=-1).values
-        selected_span_end_frame = torch.where(
-            selected_frame_mask,
-            frame_indices,
-            torch.full_like(frame_indices, -1),
-        ).max(dim=-1).values
-
-        # Defensive fallback; a valid E0 span should make this unnecessary.
-        fallback_start = torch.zeros_like(selected_span_start_frame)
-        fallback_end = (
-            video_mask.sum(dim=-1).clamp_min(1).long() - 1
+        ).view(1, 1, time_steps)
+        interval_mask = (
+            (frame_index >= start.view(1, num_hypotheses, 1))
+            & (frame_index <= end.view(1, num_hypotheses, 1))
         )
-        invalid_selected_span = (
-            selected_span_start_frame >= time_steps
-        ) | (selected_span_end_frame < 0)
+        hypothesis_frame_mask = interval_mask & video_mask[:, None, :]
 
-        selected_span_start_frame = torch.where(
-            invalid_selected_span,
-            fallback_start,
-            selected_span_start_frame,
-        )
-        selected_span_end_frame = torch.where(
-            invalid_selected_span,
-            fallback_end,
-            selected_span_end_frame,
+        nominal_length = (end - start + 1).to(dtype)
+        valid_frame_count = hypothesis_frame_mask.sum(dim=-1).to(dtype)
+        hypothesis_valid_mask = (
+            valid_frame_count >= nominal_length.view(1, -1) - 1e-6
+        ) & (valid_frame_count > 0)
+
+        frame_weights = (
+            hypothesis_frame_mask.to(dtype)
+            / valid_frame_count.clamp_min(1.0).unsqueeze(-1)
         )
 
-        selected_span_frame_length = selected_frame_mask.sum(
-            dim=-1
-        ).to(reasoned_event_tokens.dtype)
-        selected_span_fraction = (
-            selected_span_frame_length
-            / valid_length.clamp_min(1.0)
+        complement_frame_mask = (
+            video_mask[:, None, :] & (~hypothesis_frame_mask)
+        )
+        complement_frame_count = complement_frame_mask.sum(dim=-1).to(dtype)
+        complement_valid_mask = complement_frame_count > 0
+        complement_frame_weights = (
+            complement_frame_mask.to(dtype)
+            / complement_frame_count.clamp_min(1.0).unsqueeze(-1)
         )
 
-        selected_span_event_count = selected_event_mask.sum(
-            dim=-1
-        ).to(reasoned_event_tokens.dtype)
-
-        selected_span_start_event = (
-            self.composer_span_start_events[
-                selected_span_index
-            ].detach()
+        # Pair -> candidate index lookup for local temporal alternatives.
+        pair_to_index = torch.full(
+            (time_steps, time_steps),
+            -1,
+            dtype=torch.long,
+            device=device,
         )
-        selected_span_end_event = (
-            self.composer_span_end_events[
-                selected_span_index
-            ].detach()
-        )
-        selected_span_posterior = span_posterior[
-            batch_index,
-            selected_span_index,
-        ]
-
-        selected_reasoned_event_tokens = (
-            reasoned_event_tokens
-            * selected_event_mask.to(reasoned_event_tokens.dtype).unsqueeze(-1)
+        pair_to_index[start, end] = torch.arange(
+            num_hypotheses,
+            device=device,
+            dtype=torch.long,
         )
 
-        # Fine probability restricted to the selected hard support. Diagnostic
-        # / optional adapter output; the main differentiable path stays soft.
-        selected_span_temporal_prob = self._masked_softmax(
-            local_temporal_logits,
-            selected_frame_mask,
-            dim=-1,
+        neg_one = torch.full_like(start, -1)
+        trim_left_index = torch.where(
+            start < end,
+            pair_to_index[(start + 1).clamp(max=time_steps - 1), end],
+            neg_one,
+        )
+        trim_right_index = torch.where(
+            start < end,
+            pair_to_index[start, (end - 1).clamp(min=0)],
+            neg_one,
+        )
+        expand_left_index = torch.where(
+            start > 0,
+            pair_to_index[(start - 1).clamp(min=0), end],
+            neg_one,
+        )
+        expand_right_index = torch.where(
+            end < (time_steps - 1),
+            pair_to_index[start, (end + 1).clamp(max=time_steps - 1)],
+            neg_one,
         )
 
-        # Human-readable normalized boundaries. Grounding adapters may use the
-        # exact integer frame indices instead.
-        frame_denominator = (
-            valid_length - 1.0
-        ).clamp_min(1.0)
-        selected_span_start = (
-            selected_span_start_frame.to(reasoned_event_tokens.dtype)
-            / frame_denominator
-        )
-        selected_span_end = (
-            selected_span_end_frame.to(reasoned_event_tokens.dtype)
-            / frame_denominator
-        )
-        selected_span_start = selected_span_start.clamp(0.0, 1.0)
-        selected_span_end = selected_span_end.clamp(0.0, 1.0)
+        def _neighbor_valid(index: torch.Tensor) -> torch.Tensor:
+            has_neighbor = index >= 0
+            safe_index = index.clamp(min=0)
+            gathered = hypothesis_valid_mask[:, safe_index]
+            return gathered & has_neighbor.unsqueeze(0)
 
         return {
-            "span_candidate_event_mask": span_patterns,
-            "span_candidate_start_event": self.composer_span_start_events,
-            "span_candidate_end_event": self.composer_span_end_events,
-            "span_candidate_event_count": span_event_count,
-            "span_candidate_valid_mask": span_valid_mask,
-            "span_candidate_frame_mask": span_frame_mask,
-            "span_candidate_frame_length": span_frame_length,
-            "span_candidate_center": span_center,
-            "span_candidate_duration": span_duration,
-            "span_event_evidence_mean": span_event_evidence_mean,
-            "span_frame_evidence_mean": span_frame_evidence_mean,
-            "span_learned_logits": learned_span_logits,
-            "span_evidence_prior": span_evidence_prior,
-            "span_logits": torch.where(
-                span_valid_mask,
-                span_logits_raw,
-                torch.zeros_like(span_logits_raw),
-            ),
-            "span_posterior": span_posterior,
-            "span_entropy": span_entropy,
-            "span_effective_count": span_effective_count,
-            "span_top1_posterior": span_top1_posterior,
-            "soft_selected_event_weights": soft_selected_event_weights,
-            "composed_reasoned_event_repr": composed_reasoned_event_repr,
-            "soft_span_support": soft_span_support,
-            "span_support_log_bias": span_support_log_bias,
-            "composed_temporal_logits": composed_temporal_logits,
-            "composed_temporal_prob": composed_temporal_prob,
-            "selected_span_index": selected_span_index,
-            "selected_event_mask": selected_event_mask,
-            "selected_reasoned_event_tokens": selected_reasoned_event_tokens,
-            "selected_frame_mask": selected_frame_mask,
-            "selected_span_start_event": selected_span_start_event,
-            "selected_span_end_event": selected_span_end_event,
-            "selected_span_event_count": selected_span_event_count,
-            "selected_span_start_frame": selected_span_start_frame,
-            "selected_span_end_frame": selected_span_end_frame,
-            "selected_span_frame_length": selected_span_frame_length,
-            "selected_span_fraction": selected_span_fraction,
-            "selected_span_posterior": selected_span_posterior,
-            "selected_span_temporal_prob": selected_span_temporal_prob,
-            "selected_span_start": selected_span_start,
-            "selected_span_end": selected_span_end,
+            "hypothesis_start_frame": start,
+            "hypothesis_end_frame": end,
+            "hypothesis_nominal_length": nominal_length,
+            "hypothesis_valid_mask": hypothesis_valid_mask,
+            "hypothesis_frame_mask": hypothesis_frame_mask,
+            "hypothesis_frame_weights": frame_weights,
+            "hypothesis_complement_frame_mask": complement_frame_mask,
+            "hypothesis_complement_frame_weights": complement_frame_weights,
+            "hypothesis_complement_valid_mask": complement_valid_mask,
+            "hypothesis_trim_left_index": trim_left_index,
+            "hypothesis_trim_right_index": trim_right_index,
+            "hypothesis_expand_left_index": expand_left_index,
+            "hypothesis_expand_right_index": expand_right_index,
+            "hypothesis_trim_left_valid_mask": _neighbor_valid(trim_left_index),
+            "hypothesis_trim_right_valid_mask": _neighbor_valid(trim_right_index),
+            "hypothesis_expand_left_valid_mask": _neighbor_valid(expand_left_index),
+            "hypothesis_expand_right_valid_mask": _neighbor_valid(expand_right_index),
         }
 
-    # ----------------------------------------------------------------------
-    # REFINE: hierarchical frame-level boundary localization
-    # ----------------------------------------------------------------------
-    def _refine_selected_span(
+    def _score_temporal_hypotheses(
         self,
         raw_states: torch.Tensor,
         contextual_states: torch.Tensor,
         qa_state: torch.Tensor,
-        reasoned_event_tokens: torch.Tensor,
-        event_assignment: torch.Tensor,
-        local_temporal_logits: torch.Tensor,
-        composition: Dict[str, torch.Tensor],
+        boundary_prob: torch.Tensor,
+        grounding: Dict[str, torch.Tensor],
+        bank: Dict[str, torch.Tensor],
         video_mask: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         """
-        V1.10.2 Boundary-Anchored + Prior-Preserving Bounded Refinement.
+        Score frame-exact temporal hypotheses with V+Q only.
 
-        V1.9 already used all valid detached Composer spans, but each candidate
-        assigned UNIFORM mass to every legal pair formed by frames in its first
-        and last events.  This made one-event candidates especially vulnerable
-        to tiny interior-pair shortcuts.
-
-        V1.10.1 preserves the detached multi-span route while replacing that
-        uniform conditional pair distribution with a smooth endpoint-anchored
-        distribution.  Start positions are biased toward the left edge of the
-        candidate's first event and end positions toward the right edge of its
-        last event.  Every legal boundary-event frame remains reachable.
-
-        PSRC is deliberately unchanged so this run isolates pair geometry:
-
-            information_gain
-                Relative entropy reduction from the anchored Composer pair
-                prior to the Refiner pair posterior.
-
-            semantic_retention
-                Coarse temporal probability still covered by the Refiner soft
-                interval support.
-
-            reliability
-                = exp(-normalized_refiner_entropy)
-                  * semantic_retention
-                  * 0.5 * (1 + information_gain)
-
-        No temporal GT, span-length target, minimality loss, or IoU/IoP loss is
-        introduced.
+        Event decomposition is used as semantic guidance, never as a hard
+        boundary constraint.  A training-only answer-aware critic will later
+        supervise these logits outside the core.
         """
-        batch_size, time_steps, hidden_dim = raw_states.shape
-
-        if contextual_states.shape != raw_states.shape:
-            raise ValueError("raw_states and contextual_states must match.")
+        batch_size, time_steps, hidden_dim = contextual_states.shape
+        if raw_states.shape != contextual_states.shape:
+            raise ValueError("raw_states/contextual_states must match.")
         if hidden_dim != self.hidden_dim:
-            raise ValueError("Unexpected hidden dimension in REFINE.")
-        if qa_state.shape != (batch_size, self.hidden_dim):
-            raise ValueError("qa_state must be [B,H].")
-        if reasoned_event_tokens.shape != (
-            batch_size,
-            self.max_events,
-            self.hidden_dim,
-        ):
-            raise ValueError("reasoned_event_tokens must be [B,K,H].")
-        if event_assignment.shape != (
-            batch_size,
-            time_steps,
-            self.max_events,
-        ):
-            raise ValueError("event_assignment must be [B,T,K].")
-        if local_temporal_logits.shape != (batch_size, time_steps):
-            raise ValueError("local_temporal_logits must be [B,T].")
-        if video_mask.shape != (batch_size, time_steps):
-            raise ValueError("video_mask must be [B,T].")
+            raise ValueError("Unexpected hidden dimension.")
 
-        video_mask = video_mask.bool()
-        event_assignment = event_assignment.detach()
+        start = bank["hypothesis_start_frame"]
+        end = bank["hypothesis_end_frame"]
+        valid = bank["hypothesis_valid_mask"].bool()
+        weights = bank["hypothesis_frame_weights"]
+        frame_mask = bank["hypothesis_frame_mask"].bool()
+        num_hypotheses = int(start.numel())
 
-        coarse_temporal_prob = composition.get("composed_temporal_prob")
-        if not torch.is_tensor(coarse_temporal_prob):
-            raise KeyError(
-                "V1.10.1 requires composition['composed_temporal_prob']."
-            )
-        if coarse_temporal_prob.shape != (batch_size, time_steps):
-            raise ValueError("composed_temporal_prob must be [B,T].")
-
-        span_posterior = composition.get("span_posterior")
-        span_valid_mask = composition.get("span_candidate_valid_mask")
-        span_start_events = composition.get("span_candidate_start_event")
-        span_end_events = composition.get("span_candidate_end_event")
-
-        if not torch.is_tensor(span_posterior) or span_posterior.ndim != 2:
-            raise KeyError("V1.10.1 requires composition['span_posterior'] [B,S].")
-        if not torch.is_tensor(span_valid_mask):
-            raise KeyError(
-                "V1.10.1 requires composition['span_candidate_valid_mask']."
-            )
-        if not torch.is_tensor(span_start_events) or not torch.is_tensor(
-            span_end_events
-        ):
-            raise KeyError(
-                "V1.10.1 requires Composer candidate start/end event indices."
-            )
-
-        num_spans = span_posterior.size(1)
-        if span_valid_mask.shape != (batch_size, num_spans):
-            raise ValueError("span_candidate_valid_mask must be [B,S].")
-        if span_start_events.numel() != num_spans:
-            raise ValueError("span_candidate_start_event must have S entries.")
-        if span_end_events.numel() != num_spans:
-            raise ValueError("span_candidate_end_event must have S entries.")
-
-        # --------------------------------------------------------------
-        # Keep V1.8 hard top-1 Composer outputs as diagnostics only.
-        # They no longer define the V1.10.1 Refiner search region.
-        # --------------------------------------------------------------
-        selected_span_index = composition["selected_span_index"].detach().long()
-        coarse_start_frame = composition["selected_span_start_frame"].detach().long()
-        coarse_end_frame = composition["selected_span_end_frame"].detach().long()
-        coarse_frame_mask = composition["selected_frame_mask"].detach().bool()
-        coarse_span_frame_length = composition[
-            "selected_span_frame_length"
-        ].detach().to(raw_states.dtype)
-        coarse_span_fraction = composition["selected_span_fraction"].detach().to(
-            raw_states.dtype
-        )
-
-        batch_index = torch.arange(batch_size, device=raw_states.device)
-        mask_f = video_mask.to(local_temporal_logits.dtype)
-        valid_length = mask_f.sum(dim=-1).clamp_min(1.0)
-
-        # --------------------------------------------------------------
-        # Frame-level boundary scorer (same trainable scorer as V1.8).
-        # --------------------------------------------------------------
-        qa_frames = qa_state.unsqueeze(1).expand(-1, time_steps, -1)
+        # Frame-level reasoned event field.  Hard event membership is detached
+        # by the decomposition branch; reasoned event semantics remain trainable.
         frame_reasoned_event = torch.einsum(
             "btk,bkh->bth",
-            event_assignment,
-            reasoned_event_tokens,
+            grounding["event_assignment"],
+            grounding["reasoned_event_tokens"],
         )
 
-        local_mean = (
-            local_temporal_logits * mask_f
-        ).sum(dim=-1) / valid_length
-        centered_local = local_temporal_logits - local_mean.unsqueeze(-1)
-        local_var = (
-            centered_local.pow(2) * mask_f
-        ).sum(dim=-1) / valid_length
-        local_std = torch.sqrt(local_var + 1e-6)
-        local_z = centered_local / local_std.unsqueeze(-1).clamp_min(1e-4)
-        local_z = local_z * mask_f
+        contextual_pool = torch.einsum(
+            "bst,bth->bsh",
+            weights,
+            contextual_states,
+        )
+        reasoned_pool = torch.einsum(
+            "bst,bth->bsh",
+            weights,
+            frame_reasoned_event,
+        )
 
-        frame_index_float = torch.arange(
-            time_steps,
-            dtype=raw_states.dtype,
-            device=raw_states.device,
-        ).view(1, time_steps).expand(batch_size, -1)
+        start_state = contextual_states[:, start, :]
+        end_state = contextual_states[:, end, :]
+        qa_h = qa_state.unsqueeze(1).expand(-1, num_hypotheses, -1)
 
-        global_position = (
-            frame_index_float
-            / (valid_length.unsqueeze(-1) - 1.0).clamp_min(1.0)
-        ).clamp(0.0, 1.0) * mask_f
+        local_temporal_logits = grounding["event_temporal_logits"]
+        frame_semantic_logits = grounding["frame_semantic_logits"]
+        local_mean = torch.einsum(
+            "bst,bt->bs",
+            weights,
+            local_temporal_logits,
+        )
+        frame_semantic_mean = torch.einsum(
+            "bst,bt->bs",
+            weights,
+            frame_semantic_logits,
+        )
 
-        refine_frame_input = torch.cat(
+        valid_length = video_mask.sum(dim=-1).to(
+            contextual_states.dtype
+        ).clamp_min(1.0)
+        denom = (valid_length - 1.0).clamp_min(1.0)
+        center = (
+            (start.to(contextual_states.dtype).view(1, -1)
+             + end.to(contextual_states.dtype).view(1, -1))
+            * 0.5
+        ) / denom.unsqueeze(-1)
+        duration = (
+            bank["hypothesis_nominal_length"].view(1, -1)
+            / valid_length.unsqueeze(-1)
+        )
+
+        # Video edges are valid natural boundaries and receive confidence 1.
+        if time_steps > 1:
+            start_boundary_index = (start - 1).clamp(min=0, max=time_steps - 2)
+            end_boundary_index = end.clamp(min=0, max=time_steps - 2)
+            left_boundary = boundary_prob[:, start_boundary_index]
+            right_boundary = boundary_prob[:, end_boundary_index]
+            left_boundary = torch.where(
+                (start == 0).unsqueeze(0),
+                torch.ones_like(left_boundary),
+                left_boundary,
+            )
+            right_boundary = torch.where(
+                (end == time_steps - 1).unsqueeze(0),
+                torch.ones_like(right_boundary),
+                right_boundary,
+            )
+        else:
+            left_boundary = torch.ones(
+                batch_size,
+                num_hypotheses,
+                dtype=contextual_states.dtype,
+                device=contextual_states.device,
+            )
+            right_boundary = left_boundary
+
+        # How many of the dynamically discovered events does H touch?  This is
+        # descriptive guidance only; there is no penalty for using many/few.
+        event_overlap = torch.einsum(
+            "bst,btk->bsk",
+            frame_mask.to(contextual_states.dtype),
+            grounding["event_assignment"],
+        )
+        touched_events = (event_overlap > 0.0) & grounding[
+            "event_valid_mask"
+        ].unsqueeze(1)
+        touched_event_count = touched_events.sum(dim=-1).to(
+            contextual_states.dtype
+        )
+        event_count = grounding["event_count"].clamp_min(1.0).unsqueeze(-1)
+        touched_event_ratio = touched_event_count / event_count
+
+        scalar_features = torch.stack(
             [
-                contextual_states,
-                raw_states,
-                qa_frames,
-                contextual_states * qa_frames,
-                frame_reasoned_event,
-                frame_reasoned_event * qa_frames,
-                local_z.unsqueeze(-1),
-                global_position.unsqueeze(-1),
+                center,
+                duration,
+                torch.tanh(local_mean),
+                torch.tanh(frame_semantic_mean),
+                left_boundary,
+                right_boundary,
+                touched_event_ratio,
             ],
             dim=-1,
         )
-        refine_hidden = self.boundary_refine_encoder(refine_frame_input)
-        start_logits_raw = self.boundary_start_score(refine_hidden).squeeze(-1)
-        end_logits_raw = self.boundary_end_score(refine_hidden).squeeze(-1)
-        start_logits_raw = start_logits_raw * mask_f
-        end_logits_raw = end_logits_raw * mask_f
 
-        # --------------------------------------------------------------
-        # V1.10.1 Boundary-Anchored Posterior-Guided Refinement (BAPGR).
-        #
-        # V1.9 already restricted start frames to the first event and end
-        # frames to the last event of each Composer candidate.  Its remaining
-        # weakness was UNIFORM probability inside those boundary events.  In a
-        # one-event candidate that makes tiny interior intervals just as likely
-        # a priori as the event's semantic endpoints.
-        #
-        # Here we keep the same legal support but impose a smooth geometric
-        # anchor:
-        #   start: maximum at the LEFT edge of the first event;
-        #   end:   maximum at the RIGHT edge of the last event.
-        #
-        # No pair is removed solely because of the anchor; it only changes
-        # prior mass.  Composer span weights remain detached exactly as in V1.9.
-        # --------------------------------------------------------------
-        span_start_events = span_start_events.to(
-            device=raw_states.device,
-            dtype=torch.long,
-        )
-        span_end_events = span_end_events.to(
-            device=raw_states.device,
-            dtype=torch.long,
-        )
-        span_valid_mask = span_valid_mask.to(raw_states.device).bool()
-
-        start_event_one_hot = F.one_hot(
-            span_start_events.clamp(0, self.max_events - 1),
-            num_classes=self.max_events,
-        ).to(event_assignment.dtype)
-        end_event_one_hot = F.one_hot(
-            span_end_events.clamp(0, self.max_events - 1),
-            num_classes=self.max_events,
-        ).to(event_assignment.dtype)
-
-        # [B,S,T]: all frames belonging to the candidate's first/last event.
-        span_start_candidate_mask = (
-            torch.einsum(
-                "btk,sk->bst",
-                event_assignment,
-                start_event_one_hot,
-            )
-            > 0.5
-        )
-        span_end_candidate_mask = (
-            torch.einsum(
-                "btk,sk->bst",
-                event_assignment,
-                end_event_one_hot,
-            )
-            > 0.5
-        )
-
-        span_start_candidate_mask = (
-            span_start_candidate_mask
-            & video_mask.unsqueeze(1)
-            & span_valid_mask.unsqueeze(-1)
-        )
-        span_end_candidate_mask = (
-            span_end_candidate_mask
-            & video_mask.unsqueeze(1)
-            & span_valid_mask.unsqueeze(-1)
-        )
-
-        start_grid = torch.arange(
-            time_steps,
-            device=raw_states.device,
-        ).view(1, 1, time_steps, 1)
-        end_grid = torch.arange(
-            time_steps,
-            device=raw_states.device,
-        ).view(1, 1, 1, time_steps)
-        ordered_pair_mask = start_grid <= end_grid
-
-        # [B,S,T,T] legal pair support retained from V1.9.
-        span_pair_valid_mask = (
-            span_start_candidate_mask.unsqueeze(-1)
-            & span_end_candidate_mask.unsqueeze(-2)
-            & ordered_pair_mask
-        )
-        span_pair_count = span_pair_valid_mask.sum(dim=(-2, -1)).to(
-            raw_states.dtype
-        )
-        span_has_pair = span_pair_count > 0
-
-        # ----------------------------------------------------------
-        # Counterfactual V1.9 prior (diagnostic only): uniform over all
-        # legal pairs inside the boundary events.
-        # ----------------------------------------------------------
-        span_uniform_pair_distribution = (
-            span_pair_valid_mask.to(raw_states.dtype)
-            / span_pair_count.clamp_min(1.0).unsqueeze(-1).unsqueeze(-1)
-        )
-
-        # ----------------------------------------------------------
-        # Boundary anchor weights.
-        #
-        # For a boundary event of length L:
-        #   start_anchor(t) = ((right - t + 1) / L)^p
-        #   end_anchor(t)   = ((t - left + 1) / L)^p
-        #
-        # Thus the semantic full-event endpoints receive weight 1 while
-        # interior frames remain legal with smoothly smaller prior mass.
-        # ----------------------------------------------------------
-        span_frame_index = torch.arange(
-            time_steps,
-            device=raw_states.device,
-            dtype=torch.long,
-        ).view(1, 1, time_steps)
-
-        start_event_left = torch.where(
-            span_start_candidate_mask,
-            span_frame_index,
-            torch.full_like(span_frame_index, time_steps),
-        ).min(dim=-1).values
-        start_event_right = torch.where(
-            span_start_candidate_mask,
-            span_frame_index,
-            torch.full_like(span_frame_index, -1),
-        ).max(dim=-1).values
-        end_event_left = torch.where(
-            span_end_candidate_mask,
-            span_frame_index,
-            torch.full_like(span_frame_index, time_steps),
-        ).min(dim=-1).values
-        end_event_right = torch.where(
-            span_end_candidate_mask,
-            span_frame_index,
-            torch.full_like(span_frame_index, -1),
-        ).max(dim=-1).values
-
-        start_event_length = (
-            start_event_right - start_event_left + 1
-        ).clamp_min(1).to(raw_states.dtype)
-        end_event_length = (
-            end_event_right - end_event_left + 1
-        ).clamp_min(1).to(raw_states.dtype)
-
-        frame_pos = span_frame_index.to(raw_states.dtype)
-        start_anchor = (
-            (
-                start_event_right.to(raw_states.dtype).unsqueeze(-1)
-                - frame_pos
-                + 1.0
-            )
-            / start_event_length.unsqueeze(-1)
-        ).clamp(min=0.0, max=1.0)
-        end_anchor = (
-            (
-                frame_pos
-                - end_event_left.to(raw_states.dtype).unsqueeze(-1)
-                + 1.0
-            )
-            / end_event_length.unsqueeze(-1)
-        ).clamp(min=0.0, max=1.0)
-
-        anchor_power = self.refiner_boundary_anchor_power
-        start_anchor = (
-            start_anchor.pow(anchor_power)
-            * span_start_candidate_mask.to(raw_states.dtype)
-        )
-        end_anchor = (
-            end_anchor.pow(anchor_power)
-            * span_end_candidate_mask.to(raw_states.dtype)
-        )
-
-        span_pair_anchor_weight = (
-            start_anchor.unsqueeze(-1)
-            * end_anchor.unsqueeze(-2)
-            * span_pair_valid_mask.to(raw_states.dtype)
-        )
-        span_pair_anchor_mass = span_pair_anchor_weight.sum(
-            dim=(-2, -1),
-            keepdim=True,
-        )
-        span_pair_distribution = torch.where(
-            span_pair_anchor_mass > 1e-8,
-            span_pair_anchor_weight / span_pair_anchor_mass.clamp_min(1e-8),
-            span_uniform_pair_distribution,
-        )
-
-        detached_span_weights = (
-            span_posterior.detach()
-            * span_valid_mask.to(span_posterior.dtype)
-            * span_has_pair.to(span_posterior.dtype)
-        )
-        span_weight_mass = detached_span_weights.sum(
+        hypothesis_input = torch.cat(
+            [
+                start_state,
+                end_state,
+                contextual_pool,
+                reasoned_pool,
+                qa_h,
+                reasoned_pool * qa_h,
+                scalar_features,
+            ],
             dim=-1,
-            keepdim=True,
+        )
+        hypothesis_hidden = self.hypothesis_feature_encoder(hypothesis_input)
+        hypothesis_logits_raw = self.hypothesis_score(
+            hypothesis_hidden
+        ).squeeze(-1)
+        hypothesis_posterior = self._masked_softmax(
+            hypothesis_logits_raw,
+            valid,
+            dim=-1,
         )
 
-        # Defensive fallback to the already-valid detached top-1 span if a
-        # malformed sample produced no legal pair in the soft route.
-        top1_fallback = F.one_hot(
-            selected_span_index.clamp(0, num_spans - 1),
-            num_classes=num_spans,
-        ).to(detached_span_weights.dtype)
-        detached_span_weights = torch.where(
-            span_weight_mass > 1e-8,
-            detached_span_weights / span_weight_mass.clamp_min(1e-8),
-            top1_fallback,
+        posterior_entropy = -torch.sum(
+            hypothesis_posterior
+            * torch.log(hypothesis_posterior.clamp_min(1e-8)),
+            dim=-1,
+        )
+        posterior_effective_count = torch.exp(posterior_entropy)
+        posterior_top1 = hypothesis_posterior.max(dim=-1).values
+
+        # Soft support is diagnostic only.  The V1.12 MAIN output is the hard
+        # winning hypothesis to avoid recreating V1.6 all-span diffusion.
+        soft_hypothesis_support = torch.einsum(
+            "bs,bst->bt",
+            hypothesis_posterior,
+            frame_mask.to(hypothesis_posterior.dtype),
+        )
+        soft_hypothesis_support = (
+            soft_hypothesis_support
+            * video_mask.to(soft_hypothesis_support.dtype)
         )
 
-        # V1.9 counterfactual prior retained only for diagnostics.  It uses
-        # the same detached Composer weights but the old uniform conditional
-        # pair distribution, allowing an apples-to-apples routing comparison.
-        composer_uniform_pair_prior = torch.einsum(
-            "bs,bsij->bij",
-            detached_span_weights,
-            span_uniform_pair_distribution,
+        masked_logits = hypothesis_logits_raw.masked_fill(~valid, -1e4)
+        selected_index = masked_logits.detach().argmax(dim=-1)
+        batch_index = torch.arange(
+            batch_size,
+            device=contextual_states.device,
         )
-        composer_uniform_pair_mass = composer_uniform_pair_prior.sum(
-            dim=(-2, -1),
-            keepdim=True,
-        )
-        composer_uniform_pair_prior = (
-            composer_uniform_pair_prior
-            / composer_uniform_pair_mass.clamp_min(1e-8)
-        ).detach()
-
-        # V1.10.1 boundary-anchored search prior used by REFINE.
-        composer_pair_prior = torch.einsum(
-            "bs,bsij->bij",
-            detached_span_weights,
-            span_pair_distribution,
-        )
-
-        # If the top-1 fallback itself was malformed, use the legacy coarse
-        # start/end pair.  This path should never trigger on valid Composer
-        # outputs but makes the interface robust.
-        composer_pair_mass = composer_pair_prior.sum(
-            dim=(-2, -1),
-            keepdim=True,
-        )
-        fallback_pair = torch.zeros_like(composer_pair_prior)
-        fallback_pair[
+        selected_start = start[selected_index]
+        selected_end = end[selected_index]
+        selected_frame_mask = frame_mask[
             batch_index,
-            coarse_start_frame.clamp(0, time_steps - 1),
-            coarse_end_frame.clamp(0, time_steps - 1),
+            selected_index,
+        ].detach()
+        selected_frame_weights = weights[
+            batch_index,
+            selected_index,
+        ]
+        selected_hypothesis_logit = hypothesis_logits_raw[
+            batch_index,
+            selected_index,
+        ]
+        selected_hypothesis_posterior = hypothesis_posterior[
+            batch_index,
+            selected_index,
+        ]
+        selected_hypothesis_repr = hypothesis_hidden[
+            batch_index,
+            selected_index,
+        ]
+        selected_reasoned_event_repr = reasoned_pool[
+            batch_index,
+            selected_index,
+        ]
+
+        main_temporal_prob = self._masked_softmax(
+            local_temporal_logits,
+            selected_frame_mask,
+            dim=-1,
+        )
+        main_temporal_logits = torch.log(
+            main_temporal_prob.clamp_min(1e-8)
+        ) * video_mask.to(main_temporal_prob.dtype)
+        main_soft_support = selected_frame_mask.to(main_temporal_prob.dtype)
+
+        selected_length = selected_frame_mask.sum(dim=-1).to(
+            contextual_states.dtype
+        )
+        selected_fraction = selected_length / valid_length
+        expected_length = torch.sum(
+            hypothesis_posterior
+            * bank["hypothesis_nominal_length"].view(1, -1),
+            dim=-1,
+        )
+
+        # Exact one-hot endpoint posterior retained as a generic boundary
+        # interface for downstream wrappers/metrics.
+        main_pair_posterior = torch.zeros(
+            batch_size,
+            time_steps,
+            time_steps,
+            dtype=main_temporal_prob.dtype,
+            device=main_temporal_prob.device,
+        )
+        main_pair_posterior[
+            batch_index,
+            selected_start,
+            selected_end,
         ] = 1.0
-        composer_pair_prior = torch.where(
-            composer_pair_mass > 1e-8,
-            composer_pair_prior / composer_pair_mass.clamp_min(1e-8),
-            fallback_pair,
-        ).detach()
-
-        composer_pair_valid_mask = composer_pair_prior > 0.0
-        pair_candidate_count = composer_pair_valid_mask.sum(
-            dim=(-2, -1)
-        ).to(raw_states.dtype)
-
-        # Union start/end masks retained under legacy output names.
-        start_candidate_mask = composer_pair_valid_mask.any(dim=-1)
-        end_candidate_mask = composer_pair_valid_mask.any(dim=-2)
-
-        pair_logits_raw = (
-            start_logits_raw.unsqueeze(-1)
-            + end_logits_raw.unsqueeze(-2)
-        )
-
-        # ----------------------------------------------------------
-        # V1.10.2 Prior-Preserving Bounded Refinement (PPBR).
-        #
-        # V1.10.1 used an unbounded learned correction:
-        #   delta = pair_logits_raw / temperature
-        # which could eventually dominate the detached BAPGR prior.
-        # PPBR keeps the correction differentiable but bounds its
-        # magnitude with a fixed trust-region cap c:
-        #   delta_hat = c * tanh(delta / c)
-        # No legal pair is removed and no duration target is added.
-        # ----------------------------------------------------------
-        refiner_raw_correction = (
-            pair_logits_raw / self.refiner_temperature
-        )
-        correction_cap = self.refiner_correction_cap
-        refiner_bounded_correction = (
-            correction_cap
-            * torch.tanh(
-                refiner_raw_correction / correction_cap
-            )
-        )
-
-        refiner_pair_logits = (
-            torch.log(composer_pair_prior.clamp_min(1e-8))
-            + refiner_bounded_correction
-        )
-        selected_pair_posterior = self._masked_softmax(
-            refiner_pair_logits.reshape(batch_size, -1),
-            composer_pair_valid_mask.reshape(batch_size, -1),
-            dim=-1,
-        ).reshape(batch_size, time_steps, time_steps)
-
-        pair_valid_f = composer_pair_valid_mask.to(raw_states.dtype)
-        valid_pair_count = pair_valid_f.sum(
-            dim=(-2, -1)
-        ).clamp_min(1.0)
-        refiner_raw_correction_abs = (
-            refiner_raw_correction.abs() * pair_valid_f
-        )
-        refiner_bounded_correction_abs = (
-            refiner_bounded_correction.abs() * pair_valid_f
-        )
-        refiner_raw_correction_abs_mean = (
-            refiner_raw_correction_abs.sum(dim=(-2, -1))
-            / valid_pair_count
-        )
-        refiner_bounded_correction_abs_mean = (
-            refiner_bounded_correction_abs.sum(dim=(-2, -1))
-            / valid_pair_count
-        )
-        neg_large = torch.full_like(
-            refiner_raw_correction, -1e4
-        )
-        refiner_raw_correction_abs_max = torch.where(
-            composer_pair_valid_mask,
-            refiner_raw_correction.abs(),
-            neg_large,
-        ).amax(dim=(-2, -1))
-        refiner_bounded_correction_abs_max = torch.where(
-            composer_pair_valid_mask,
-            refiner_bounded_correction.abs(),
-            neg_large,
-        ).amax(dim=(-2, -1))
-        refiner_correction_saturation_ratio = (
-            (
-                refiner_bounded_correction.abs()
-                >= (0.95 * correction_cap)
-            )
-            & composer_pair_valid_mask
-        ).to(raw_states.dtype).sum(dim=(-2, -1)) / valid_pair_count
-
-        # --------------------------------------------------------------
-        # Pair-posterior diagnostics.
-        # --------------------------------------------------------------
-        composer_pair_entropy = -torch.sum(
-            composer_pair_prior
-            * torch.log(composer_pair_prior.clamp_min(1e-8)),
-            dim=(-2, -1),
-        )
-        selected_pair_entropy = -torch.sum(
-            selected_pair_posterior
-            * torch.log(selected_pair_posterior.clamp_min(1e-8)),
-            dim=(-2, -1),
-        )
-
-        composer_pair_effective_count = torch.exp(composer_pair_entropy)
-        selected_pair_effective_count = torch.exp(selected_pair_entropy)
-
-        prior_safe = composer_pair_prior.clamp_min(1e-8)
-        refined_safe = selected_pair_posterior.clamp_min(1e-8)
-        refiner_vs_prior_kl = torch.sum(
-            selected_pair_posterior
-            * (torch.log(refined_safe) - torch.log(prior_safe)),
-            dim=(-2, -1),
-        )
-        pair_midpoint = 0.5 * (
-            composer_pair_prior + selected_pair_posterior
-        )
-        midpoint_safe = pair_midpoint.clamp_min(1e-8)
-        refiner_vs_prior_js = 0.5 * (
-            torch.sum(
-                selected_pair_posterior
-                * (torch.log(refined_safe) - torch.log(midpoint_safe)),
-                dim=(-2, -1),
-            )
-            + torch.sum(
-                composer_pair_prior
-                * (torch.log(prior_safe) - torch.log(midpoint_safe)),
-                dim=(-2, -1),
-            )
-        )
-
-        composer_pair_top1_posterior = composer_pair_prior.reshape(
-            batch_size, -1
-        ).max(dim=-1).values
-        selected_pair_top1_posterior = selected_pair_posterior.reshape(
-            batch_size, -1
-        ).max(dim=-1).values
-
-        # Counterfactual V1.9 uniform-prior diagnostics.
-        composer_uniform_pair_entropy = -torch.sum(
-            composer_uniform_pair_prior
-            * torch.log(composer_uniform_pair_prior.clamp_min(1e-8)),
-            dim=(-2, -1),
-        )
-        composer_uniform_pair_effective_count = torch.exp(
-            composer_uniform_pair_entropy
-        )
-        composer_uniform_pair_top1_posterior = (
-            composer_uniform_pair_prior.reshape(batch_size, -1)
-            .max(dim=-1)
-            .values
-        )
-
-        pair_max_entropy = torch.log(pair_candidate_count.clamp_min(1.0))
-        composer_pair_entropy_ratio = torch.where(
-            pair_candidate_count > 1.0,
-            composer_pair_entropy / pair_max_entropy.clamp_min(1e-6),
-            torch.zeros_like(composer_pair_entropy),
-        ).clamp(0.0, 1.0)
-        composer_uniform_pair_entropy_ratio = torch.where(
-            pair_candidate_count > 1.0,
-            composer_uniform_pair_entropy / pair_max_entropy.clamp_min(1e-6),
-            torch.zeros_like(composer_uniform_pair_entropy),
-        ).clamp(0.0, 1.0)
-        pair_entropy_ratio = torch.where(
-            pair_candidate_count > 1.0,
-            selected_pair_entropy / pair_max_entropy.clamp_min(1e-6),
-            torch.zeros_like(selected_pair_entropy),
-        ).clamp(0.0, 1.0)
-
-        # --------------------------------------------------------------
-        # Soft interval support induced by Composer prior and Refiner.
-        # support(t) = P(start <= t <= end)
-        # --------------------------------------------------------------
-        def _pair_to_frame_support(pair_probability: torch.Tensor) -> torch.Tensor:
-            start_prefix = torch.cumsum(pair_probability, dim=1)
-            start_prefix_end_suffix = torch.flip(
-                torch.cumsum(
-                    torch.flip(start_prefix, dims=[2]),
-                    dim=2,
-                ),
-                dims=[2],
-            )
-            return torch.diagonal(
-                start_prefix_end_suffix,
-                dim1=1,
-                dim2=2,
-            )
-
-        composer_pair_soft_support = _pair_to_frame_support(
-            composer_pair_prior
-        )
-        refined_soft_support = _pair_to_frame_support(
-            selected_pair_posterior
-        )
-        composer_pair_soft_support = (
-            composer_pair_soft_support * mask_f
-        )
-        refined_soft_support = refined_soft_support * mask_f
-
-        refined_support_log_bias = torch.log(
-            refined_soft_support.clamp_min(1e-6)
-        )
-        refined_temporal_logits = (
-            local_temporal_logits + refined_support_log_bias
-        ) * mask_f
-        refined_temporal_prob = self._masked_softmax(
-            refined_temporal_logits,
-            video_mask,
-            dim=-1,
-        )
-
-        # --------------------------------------------------------------
-        # V1.10.2 keeps V1.9 Posterior-Stable Reliability Calibration (PSRC)
-        # unchanged so the controlled experiment isolates search-prior geometry.
-        #
-        # information_gain asks whether REFINE actually removed ambiguity
-        # beyond the Composer prior. semantic_retention prevents a decisive
-        # but semantically destructive Refiner from receiving high trust.
-        # Both signals are detached before routing.
-        # --------------------------------------------------------------
-        prior_entropy_detached = composer_pair_entropy.detach()
-        refined_entropy_detached = selected_pair_entropy.detach()
-        information_gain = torch.where(
-            prior_entropy_detached > 1e-6,
-            (
-                prior_entropy_detached - refined_entropy_detached
-            ) / prior_entropy_detached.clamp_min(1e-6),
-            torch.zeros_like(prior_entropy_detached),
-        ).clamp(0.0, 1.0)
-
-        coarse_temporal_prob = self._normalize_distribution(
-            coarse_temporal_prob,
-            video_mask,
-            dim=-1,
-        )
-        coarse_semantic_for_reliability = coarse_temporal_prob.detach()
-        semantic_retention = torch.sum(
-            coarse_semantic_for_reliability
-            * refined_soft_support.detach(),
-            dim=-1,
-        ).clamp(0.0, 1.0)
-
-        # Pure information_gain * retention is conceptually clean but nearly
-        # zero at random initialization because p_R initially matches q_C.
-        # That would starve the Refiner of MAIN-task gradients in the first
-        # controlled run.  Keep V1.9 parameter-free while preserving a small
-        # bootstrap signal by retaining the V1.8 entropy confidence as a base,
-        # then gate it by semantic retention and modulate it by relative gain.
-        #
-        #   base_confidence = exp(-u_R)
-        #   gain_factor     = 0.5 * (1 + information_gain)  in [0.5, 1]
-        #   reliability     = base_confidence * retention * gain_factor
-        #
-        # Unlike V1.8, a decisive-but-semantically-destructive Refiner can now
-        # receive arbitrarily low trust because retention can approach zero.
-        base_refiner_confidence = torch.exp(
-            -pair_entropy_ratio.detach()
-        ).clamp(0.0, 1.0)
-        reliability_gain_factor = (
-            0.5 * (1.0 + information_gain)
-        ).clamp(0.5, 1.0)
-        calibration_reliability = (
-            base_refiner_confidence
-            * semantic_retention
-            * reliability_gain_factor
-        ).clamp(0.0, 1.0).detach()
-
-        # Legacy aliases are intentionally mapped to V1.9 semantics.
-        calibration_uncertainty = pair_entropy_ratio.detach()
-        calibration_information = information_gain
-        calibration_confidence = calibration_reliability
-
-        # --------------------------------------------------------------
-        # MAIN soft temporal distribution.
-        # --------------------------------------------------------------
-        confidence_frame = calibration_confidence.unsqueeze(-1)
-        calibrated_temporal_prob = (
-            (1.0 - confidence_frame) * coarse_temporal_prob
-            + confidence_frame * refined_temporal_prob
-        )
-        calibrated_temporal_prob = self._normalize_distribution(
-            calibrated_temporal_prob,
-            video_mask,
-            dim=-1,
-        )
-        calibrated_temporal_logits = (
-            torch.log(calibrated_temporal_prob.clamp_min(1e-8)) * mask_f
-        )
-
-        coarse_soft_support = composition.get("soft_span_support")
-        if torch.is_tensor(coarse_soft_support):
-            calibrated_soft_support = (
-                (1.0 - confidence_frame) * coarse_soft_support
-                + confidence_frame * refined_soft_support
-            )
-        else:
-            calibrated_soft_support = (
-                (1.0 - confidence_frame) * composer_pair_soft_support
-                + confidence_frame * refined_soft_support
-            )
-        calibrated_soft_support = calibrated_soft_support * mask_f
-
-        # --------------------------------------------------------------
-        # Boundary-pair statistics and hard readouts.
-        # --------------------------------------------------------------
-        frame_indices = torch.arange(
-            time_steps,
-            device=raw_states.device,
-        ).view(1, time_steps).expand(batch_size, -1)
-        pair_length = (
-            end_grid.squeeze(1) - start_grid.squeeze(1) + 1
-        ).to(raw_states.dtype).expand(batch_size, -1, -1)
-
-        # Search-prior geometry diagnostics.  These directly quantify whether
-        # BAPGR preserves more Composer boundary extent than the V1.9 uniform
-        # pair prior before any trainable Refiner logits are applied.
-        composer_pair_prior_expected_span_length = torch.sum(
-            composer_pair_prior * pair_length,
-            dim=(-2, -1),
-        )
-        composer_uniform_pair_prior_expected_span_length = torch.sum(
-            composer_uniform_pair_prior * pair_length,
-            dim=(-2, -1),
-        )
-        composer_pair_prior_length_gain = (
-            composer_pair_prior_expected_span_length
-            / composer_uniform_pair_prior_expected_span_length.clamp_min(1.0)
-        )
-
-        # Raw Refiner expectations / MAP interval.
-        expected_refined_span_length = torch.sum(
-            selected_pair_posterior * pair_length,
-            dim=(-2, -1),
-        )
-        raw_vs_prior_expected_length_ratio = (
-            expected_refined_span_length
-            / composer_pair_prior_expected_span_length.clamp_min(1.0)
-        )
-        start_marginal = selected_pair_posterior.sum(dim=-1)
-        end_marginal = selected_pair_posterior.sum(dim=-2)
-        expected_start_frame = (
-            start_marginal * frame_index_float
-        ).sum(dim=-1)
-        expected_end_frame = (
-            end_marginal * frame_index_float
-        ).sum(dim=-1)
-
-        pair_flat_index = selected_pair_posterior.detach().reshape(
-            batch_size, -1
-        ).argmax(dim=-1)
-        refined_start_frame = (pair_flat_index // time_steps).long()
-        refined_end_frame = (pair_flat_index % time_steps).long()
-        refined_frame_mask = (
-            (frame_indices >= refined_start_frame.unsqueeze(-1))
-            & (frame_indices <= refined_end_frame.unsqueeze(-1))
-            & video_mask
-        ).detach()
-        refined_span_frame_length = refined_frame_mask.sum(dim=-1).to(
-            raw_states.dtype
-        )
-        refined_span_fraction = (
-            refined_span_frame_length / valid_length.clamp_min(1.0)
-        )
-
-        # --------------------------------------------------------------
-        # Composer endpoint prior for hard MAIN readout.
-        #
-        # The search prior above is boundary-anchored over legal boundary-event
-        # pairs.  Using that same distribution for
-        # the coarse side of the final hard readout would shrink boundaries
-        # toward event interiors even when reliability=0.  Instead, preserve
-        # the actual semantic coverage of each Composer span by placing its
-        # detached posterior mass on that span's full-event endpoints.
-        # --------------------------------------------------------------
-        span_frame_mask_all = composition.get("span_candidate_frame_mask")
-        if not torch.is_tensor(span_frame_mask_all):
-            raise KeyError(
-                "V1.10.1 requires composition['span_candidate_frame_mask']."
-            )
-        span_frame_mask_all = (
-            span_frame_mask_all.detach().bool()
-            & video_mask.unsqueeze(1)
-        )
-
-        span_frame_index = torch.arange(
-            time_steps,
-            device=raw_states.device,
-            dtype=torch.long,
-        ).view(1, 1, time_steps)
-        span_start_frame_all = torch.where(
-            span_frame_mask_all,
-            span_frame_index,
-            torch.full_like(span_frame_index, time_steps),
-        ).min(dim=-1).values
-        span_end_frame_all = torch.where(
-            span_frame_mask_all,
-            span_frame_index,
-            torch.full_like(span_frame_index, -1),
-        ).max(dim=-1).values
-        span_has_endpoint = (
-            span_start_frame_all < time_steps
-        ) & (span_end_frame_all >= span_start_frame_all)
-
-        endpoint_span_weights = (
-            detached_span_weights
-            * span_has_endpoint.to(detached_span_weights.dtype)
-        )
-        endpoint_weight_mass = endpoint_span_weights.sum(
-            dim=-1,
-            keepdim=True,
-        )
-        endpoint_span_weights = torch.where(
-            endpoint_weight_mass > 1e-8,
-            endpoint_span_weights / endpoint_weight_mass.clamp_min(1e-8),
-            top1_fallback,
-        )
-
-        endpoint_start_oh = F.one_hot(
-            span_start_frame_all.clamp(0, time_steps - 1),
-            num_classes=time_steps,
-        ).to(raw_states.dtype)
-        endpoint_end_oh = F.one_hot(
-            span_end_frame_all.clamp(0, time_steps - 1),
-            num_classes=time_steps,
-        ).to(raw_states.dtype)
-        span_endpoint_pair = (
-            endpoint_start_oh.unsqueeze(-1)
-            * endpoint_end_oh.unsqueeze(-2)
-            * span_has_endpoint.to(raw_states.dtype).unsqueeze(-1).unsqueeze(-1)
-        )
-        composer_endpoint_pair_prior = torch.einsum(
-            "bs,bsij->bij",
-            endpoint_span_weights,
-            span_endpoint_pair,
-        )
-        endpoint_mass = composer_endpoint_pair_prior.sum(
-            dim=(-2, -1),
-            keepdim=True,
-        )
-        composer_endpoint_pair_prior = torch.where(
-            endpoint_mass > 1e-8,
-            composer_endpoint_pair_prior / endpoint_mass.clamp_min(1e-8),
-            fallback_pair,
-        ).detach()
-
-        # Composer-posterior expected full-coverage boundary statistics.
-        composer_start_marginal = composer_endpoint_pair_prior.sum(dim=-1)
-        composer_end_marginal = composer_endpoint_pair_prior.sum(dim=-2)
-        composer_expected_start_frame = (
-            composer_start_marginal * frame_index_float
-        ).sum(dim=-1)
-        composer_expected_end_frame = (
-            composer_end_marginal * frame_index_float
-        ).sum(dim=-1)
-        composer_expected_span_length = torch.sum(
-            composer_endpoint_pair_prior * pair_length,
-            dim=(-2, -1),
-        )
-
-        # MAIN hard boundaries mix semantic full-span endpoints with the fine
-        # Refiner posterior using the same detached reliability as the soft
-        # temporal branch.
-        confidence_pair = calibration_confidence.view(
-            batch_size, 1, 1
-        )
-        main_pair_posterior = (
-            (1.0 - confidence_pair) * composer_endpoint_pair_prior
-            + confidence_pair * selected_pair_posterior
-        )
-        main_pair_posterior = main_pair_posterior / main_pair_posterior.sum(
-            dim=(-2, -1),
-            keepdim=True,
-        ).clamp_min(1e-8)
-
-        main_start_marginal = main_pair_posterior.sum(dim=-1)
-        main_end_marginal = main_pair_posterior.sum(dim=-2)
-        calibrated_start_float = (
-            main_start_marginal * frame_index_float
-        ).sum(dim=-1)
-        calibrated_end_float = (
-            main_end_marginal * frame_index_float
-        ).sum(dim=-1)
-        calibrated_end_float = torch.maximum(
-            calibrated_end_float,
-            calibrated_start_float,
-        )
-
-        calibrated_expected_span_length = torch.sum(
-            main_pair_posterior * pair_length,
-            dim=(-2, -1),
-        ).clamp_min(1.0)
-
-        calibrated_start_frame = torch.floor(
-            calibrated_start_float.detach()
-        ).long()
-        calibrated_end_frame = torch.ceil(
-            calibrated_end_float.detach()
-        ).long()
-
-        last_valid_index = (
-            video_mask.sum(dim=-1).clamp_min(1).long() - 1
-        )
-        calibrated_start_frame = torch.maximum(
-            calibrated_start_frame,
-            torch.zeros_like(calibrated_start_frame),
-        )
-        calibrated_start_frame = torch.minimum(
-            calibrated_start_frame,
-            last_valid_index,
-        )
-        calibrated_end_frame = torch.maximum(
-            calibrated_end_frame,
-            calibrated_start_frame,
-        )
-        calibrated_end_frame = torch.minimum(
-            calibrated_end_frame,
-            last_valid_index,
-        )
-
-        # Preserve a positive-length interval whenever the posterior prior has
-        # non-point expected support. This is a structural readout guard only;
-        # it is not a span-length target or optimization term.
-        prior_has_positive_extent = composer_expected_span_length > 1.0 + 1e-6
-        needs_positive_interval = (
-            prior_has_positive_extent
-            & (calibrated_end_frame <= calibrated_start_frame)
-        )
-        can_expand_right = calibrated_start_frame < last_valid_index
-        expanded_end = torch.minimum(
-            calibrated_start_frame + 1,
-            last_valid_index,
-        )
-        expanded_start = torch.maximum(
-            calibrated_start_frame - 1,
-            torch.zeros_like(calibrated_start_frame),
-        )
-        calibrated_end_frame = torch.where(
-            needs_positive_interval & can_expand_right,
-            expanded_end,
-            calibrated_end_frame,
-        )
-        calibrated_start_frame = torch.where(
-            needs_positive_interval & (~can_expand_right),
-            expanded_start,
-            calibrated_start_frame,
-        )
-
-        calibrated_frame_mask = (
-            (frame_indices >= calibrated_start_frame.unsqueeze(-1))
-            & (frame_indices <= calibrated_end_frame.unsqueeze(-1))
-            & video_mask
-        ).detach()
-        calibrated_span_frame_length = calibrated_frame_mask.sum(dim=-1).to(
-            raw_states.dtype
-        )
-        calibrated_span_fraction = (
-            calibrated_span_frame_length / valid_length.clamp_min(1.0)
-        )
 
         frame_denominator = (valid_length - 1.0).clamp_min(1.0)
-        refined_span_start = (
-            refined_start_frame.to(raw_states.dtype) / frame_denominator
+        selected_start_norm = (
+            selected_start.to(contextual_states.dtype) / frame_denominator
         ).clamp(0.0, 1.0)
-        refined_span_end = (
-            refined_end_frame.to(raw_states.dtype) / frame_denominator
+        selected_end_norm = (
+            selected_end.to(contextual_states.dtype) / frame_denominator
         ).clamp(0.0, 1.0)
-        calibrated_span_start = (
-            calibrated_start_frame.to(raw_states.dtype) / frame_denominator
-        ).clamp(0.0, 1.0)
-        calibrated_span_end = (
-            calibrated_end_frame.to(raw_states.dtype) / frame_denominator
-        ).clamp(0.0, 1.0)
-
-        refined_span_temporal_prob = self._masked_softmax(
-            local_temporal_logits,
-            refined_frame_mask,
-            dim=-1,
-        )
-        calibrated_span_temporal_prob = self._masked_softmax(
-            local_temporal_logits,
-            calibrated_frame_mask,
-            dim=-1,
-        )
-
-        # Legacy top-1-relative diagnostics are retained only for comparison
-        # with V1.8.  V1.10.1 MAIN is allowed to extend outside the top-1 span
-        # because it represents the detached Composer posterior, not one chain.
-        expected_refined_length_ratio = (
-            expected_refined_span_length
-            / coarse_span_frame_length.clamp_min(1.0)
-        )
-        expected_refined_span_fraction = (
-            expected_refined_span_length / valid_length.clamp_min(1.0)
-        )
-        expected_refine_trim_fraction = (
-            1.0 - expected_refined_length_ratio
-        ).clamp(0.0, 1.0)
-
-        trim_left_frames = (
-            refined_start_frame - coarse_start_frame
-        ).clamp_min(0).to(raw_states.dtype)
-        trim_right_frames = (
-            coarse_end_frame - refined_end_frame
-        ).clamp_min(0).to(raw_states.dtype)
-        trim_total_frames = trim_left_frames + trim_right_frames
-        refined_retained_fraction = (
-            refined_span_frame_length
-            / coarse_span_frame_length.clamp_min(1.0)
-        )
-
-        calibrated_expected_length_ratio = (
-            calibrated_expected_span_length
-            / coarse_span_frame_length.clamp_min(1.0)
-        )
-        calibrated_retained_fraction = (
-            calibrated_span_frame_length
-            / coarse_span_frame_length.clamp_min(1.0)
-        )
-        calibrated_trim_left_frames = (
-            calibrated_start_frame - coarse_start_frame
-        ).clamp_min(0).to(raw_states.dtype)
-        calibrated_trim_right_frames = (
-            coarse_end_frame - calibrated_end_frame
-        ).clamp_min(0).to(raw_states.dtype)
-        calibrated_trim_total_frames = (
-            calibrated_trim_left_frames + calibrated_trim_right_frames
-        )
-
-        selected_start_candidate_count = start_candidate_mask.sum(dim=-1).to(
-            raw_states.dtype
-        )
-        selected_end_candidate_count = end_candidate_mask.sum(dim=-1).to(
-            raw_states.dtype
-        )
-
-        refined_inside_coarse = (
-            (refined_start_frame >= coarse_start_frame)
-            & (refined_end_frame <= coarse_end_frame)
-            & (refined_start_frame <= refined_end_frame)
-        ).to(raw_states.dtype)
-        calibrated_inside_coarse = (
-            (calibrated_start_frame >= coarse_start_frame)
-            & (calibrated_end_frame <= coarse_end_frame)
-            & (calibrated_start_frame <= calibrated_end_frame)
-        ).to(raw_states.dtype)
-
-        main_pair_entropy = -torch.sum(
-            main_pair_posterior
-            * torch.log(main_pair_posterior.clamp_min(1e-8)),
-            dim=(-2, -1),
-        )
-        main_pair_effective_count = torch.exp(main_pair_entropy)
-        main_pair_top1_posterior = main_pair_posterior.reshape(
-            batch_size, -1
-        ).max(dim=-1).values
 
         return {
-            # ----------------------------------------------------------
-            # V1.10.1 routing contract.
-            # ----------------------------------------------------------
-            "posterior_guided_refinement_enabled": torch.ones(
-                (), dtype=raw_states.dtype, device=raw_states.device
+            "hypothesis_logits": torch.where(
+                valid,
+                hypothesis_logits_raw,
+                torch.zeros_like(hypothesis_logits_raw),
             ),
-            "boundary_structured_refinement_enabled": torch.ones(
-                (), dtype=raw_states.dtype, device=raw_states.device
-            ),
-            "prior_preserving_bounded_refinement_enabled": torch.ones(
-                (), dtype=raw_states.dtype, device=raw_states.device
-            ),
-            "posterior_stable_reliability_enabled": torch.ones(
-                (), dtype=raw_states.dtype, device=raw_states.device
-            ),
-            "refine_hard_coarse_route": torch.zeros(
-                (), dtype=raw_states.dtype, device=raw_states.device
-            ),
-            "refine_coarse_detached": torch.ones(
-                (), dtype=raw_states.dtype, device=raw_states.device
-            ),
-            "refine_boundary_anchor_power": torch.as_tensor(
-                self.refiner_boundary_anchor_power,
-                dtype=raw_states.dtype,
-                device=raw_states.device,
-            ),
-            "refine_correction_cap": torch.as_tensor(
-                self.refiner_correction_cap,
-                dtype=raw_states.dtype,
-                device=raw_states.device,
-            ),
-            # Top-1 span survives only as a diagnostic identifier.
-            "refine_selected_span_index": selected_span_index,
-
-            # ----------------------------------------------------------
-            # Boundary scorer / pair prior / posterior.
-            # ----------------------------------------------------------
-            "refine_start_logits": start_logits_raw,
-            "refine_end_logits": end_logits_raw,
-            "refine_start_candidate_mask": start_candidate_mask,
-            "refine_end_candidate_mask": end_candidate_mask,
-            "refine_selected_pair_valid_mask": composer_pair_valid_mask,
-            "refine_selected_pair_posterior": selected_pair_posterior,
-            "refine_selected_pair_entropy": selected_pair_entropy,
-            "refine_selected_pair_effective_count": selected_pair_effective_count,
-            "refine_selected_pair_top1_posterior": selected_pair_top1_posterior,
-            "refine_selected_pair_candidate_count": pair_candidate_count,
-            "refine_selected_pair_entropy_ratio": pair_entropy_ratio,
-            "refine_selected_start_candidate_count": selected_start_candidate_count,
-            "refine_selected_end_candidate_count": selected_end_candidate_count,
-            "refine_expected_pair_entropy": selected_pair_entropy,
-
-            # V1.10.2 PPBR diagnostics.
-            "refiner_raw_correction": refiner_raw_correction,
-            "refiner_bounded_correction": refiner_bounded_correction,
-            "refiner_raw_correction_abs_mean": refiner_raw_correction_abs_mean,
-            "refiner_raw_correction_abs_max": refiner_raw_correction_abs_max,
-            "refiner_bounded_correction_abs_mean": refiner_bounded_correction_abs_mean,
-            "refiner_bounded_correction_abs_max": refiner_bounded_correction_abs_max,
-            "refiner_correction_saturation_ratio": refiner_correction_saturation_ratio,
-            "refiner_vs_prior_kl": refiner_vs_prior_kl,
-            "refiner_vs_prior_js": refiner_vs_prior_js,
-
-            # V1.10.1 anchored Composer search-prior diagnostics retained.
-            "composer_pair_prior": composer_pair_prior,
-            "composer_uniform_pair_prior": composer_uniform_pair_prior,
-            "composer_endpoint_pair_prior": composer_endpoint_pair_prior,
-            "composer_pair_prior_valid_mask": composer_pair_valid_mask,
-            "composer_pair_prior_entropy": composer_pair_entropy,
-            "composer_pair_prior_entropy_ratio": composer_pair_entropy_ratio,
-            "composer_pair_prior_effective_count": composer_pair_effective_count,
-            "composer_pair_prior_top1_posterior": composer_pair_top1_posterior,
-            "composer_pair_prior_candidate_count": pair_candidate_count,
-            "composer_uniform_pair_prior_entropy": composer_uniform_pair_entropy,
-            "composer_uniform_pair_prior_entropy_ratio": (
-                composer_uniform_pair_entropy_ratio
-            ),
-            "composer_uniform_pair_prior_effective_count": (
-                composer_uniform_pair_effective_count
-            ),
-            "composer_uniform_pair_prior_top1_posterior": (
-                composer_uniform_pair_top1_posterior
-            ),
-            "composer_pair_prior_expected_span_length": (
-                composer_pair_prior_expected_span_length
-            ),
-            "composer_uniform_pair_prior_expected_span_length": (
-                composer_uniform_pair_prior_expected_span_length
-            ),
-            "composer_pair_prior_length_gain": composer_pair_prior_length_gain,
-            "composer_pair_soft_support": composer_pair_soft_support,
-            "composer_expected_start_frame": composer_expected_start_frame,
-            "composer_expected_end_frame": composer_expected_end_frame,
-            "composer_expected_span_length": composer_expected_span_length,
-
-            # Reliability calibration.
-            "refiner_information_gain": information_gain,
-            "refined_semantic_retention": semantic_retention,
-            "base_refiner_confidence": base_refiner_confidence,
-            "reliability_gain_factor": reliability_gain_factor,
-            "calibration_reliability": calibration_reliability,
-            # Legacy V1.8 names mapped to V1.10.1 quantities.
-            "calibration_uncertainty": calibration_uncertainty,
-            "calibration_information": calibration_information,
-            "calibration_confidence": calibration_confidence,
-            "calibration_confidence_detached": torch.ones(
-                (), dtype=raw_states.dtype, device=raw_states.device
-            ),
-
-            # Soft Refiner / MAIN evidence.
-            "refine_conditional_support": refined_soft_support,
-            "refined_soft_support": refined_soft_support,
-            "refined_support_log_bias": refined_support_log_bias,
-            "refined_temporal_logits": refined_temporal_logits,
-            "refined_temporal_prob": refined_temporal_prob,
-            "raw_refined_temporal_logits": refined_temporal_logits,
-            "raw_refined_temporal_prob": refined_temporal_prob,
-            "calibrated_soft_support": calibrated_soft_support,
-            "calibrated_temporal_logits": calibrated_temporal_logits,
-            "calibrated_temporal_prob": calibrated_temporal_prob,
-
-            # Raw Refiner expected interval statistics.
-            "expected_refined_span_length": expected_refined_span_length,
-            "raw_vs_prior_expected_length_ratio": raw_vs_prior_expected_length_ratio,
-            "expected_refined_length_ratio": expected_refined_length_ratio,
-            "expected_refined_span_fraction": expected_refined_span_fraction,
-            "expected_refine_trim_fraction": expected_refine_trim_fraction,
-            "expected_refined_start_frame": expected_start_frame,
-            "expected_refined_end_frame": expected_end_frame,
-
-            # Legacy top-1 Composer interval: diagnostics only in V1.9.
-            "coarse_span_start_frame": coarse_start_frame,
-            "coarse_span_end_frame": coarse_end_frame,
-            "coarse_span_frame_length": coarse_span_frame_length,
-            "coarse_span_fraction": coarse_span_fraction,
-            "coarse_frame_mask": coarse_frame_mask,
-
-            # Raw Refiner MAP interval.
-            "refined_span_start_frame": refined_start_frame.detach(),
-            "refined_span_end_frame": refined_end_frame.detach(),
-            "refined_frame_mask": refined_frame_mask,
-            "refined_span_frame_length": refined_span_frame_length,
-            "refined_span_fraction": refined_span_fraction,
-            "refined_span_start": refined_span_start,
-            "refined_span_end": refined_span_end,
-            "refined_span_temporal_prob": refined_span_temporal_prob,
-            "refine_trim_left_frames": trim_left_frames,
-            "refine_trim_right_frames": trim_right_frames,
-            "refine_trim_total_frames": trim_total_frames,
-            "refine_retained_fraction": refined_retained_fraction,
-            "refined_inside_coarse": refined_inside_coarse,
-
-            # V1.9 calibrated MAIN pair posterior / hard interval.
+            "hypothesis_posterior": hypothesis_posterior,
+            "hypothesis_entropy": posterior_entropy,
+            "hypothesis_effective_count": posterior_effective_count,
+            "hypothesis_top1_posterior": posterior_top1,
+            "hypothesis_soft_support": soft_hypothesis_support,
+            "hypothesis_expected_span_length": expected_length,
+            "hypothesis_contextual_pool": contextual_pool,
+            "hypothesis_reasoned_event_pool": reasoned_pool,
+            "hypothesis_touched_event_count": touched_event_count,
+            "hypothesis_touched_event_ratio": touched_event_ratio,
+            "hypothesis_local_evidence_mean": local_mean,
+            "hypothesis_frame_evidence_mean": frame_semantic_mean,
+            "hypothesis_left_boundary_evidence": left_boundary,
+            "hypothesis_right_boundary_evidence": right_boundary,
+            "selected_hypothesis_index": selected_index,
+            "selected_hypothesis_start_frame": selected_start.detach(),
+            "selected_hypothesis_end_frame": selected_end.detach(),
+            "selected_hypothesis_frame_mask": selected_frame_mask,
+            "selected_hypothesis_frame_weights": selected_frame_weights,
+            "selected_hypothesis_logit": selected_hypothesis_logit,
+            "selected_hypothesis_posterior": selected_hypothesis_posterior,
+            "selected_hypothesis_repr": selected_hypothesis_repr,
+            "selected_reasoned_event_repr": selected_reasoned_event_repr,
+            "selected_hypothesis_span_length": selected_length,
+            "selected_hypothesis_span_fraction": selected_fraction,
+            "selected_hypothesis_start": selected_start_norm,
+            "selected_hypothesis_end": selected_end_norm,
+            "main_temporal_prob": main_temporal_prob,
+            "main_temporal_logits": main_temporal_logits,
+            "main_soft_support": main_soft_support,
             "main_pair_posterior": main_pair_posterior,
-            "main_pair_entropy": main_pair_entropy,
-            "main_pair_effective_count": main_pair_effective_count,
-            "main_pair_top1_posterior": main_pair_top1_posterior,
-            "calibrated_start_frame_float": calibrated_start_float,
-            "calibrated_end_frame_float": calibrated_end_float,
-            "calibrated_expected_span_length": calibrated_expected_span_length,
-            "calibrated_expected_length_ratio": calibrated_expected_length_ratio,
-            "calibrated_span_start_frame": calibrated_start_frame.detach(),
-            "calibrated_span_end_frame": calibrated_end_frame.detach(),
-            "calibrated_frame_mask": calibrated_frame_mask,
-            "calibrated_span_frame_length": calibrated_span_frame_length,
-            "calibrated_span_fraction": calibrated_span_fraction,
-            "calibrated_retained_fraction": calibrated_retained_fraction,
-            "calibrated_trim_left_frames": calibrated_trim_left_frames,
-            "calibrated_trim_right_frames": calibrated_trim_right_frames,
-            "calibrated_trim_total_frames": calibrated_trim_total_frames,
-            "calibrated_span_start": calibrated_span_start,
-            "calibrated_span_end": calibrated_span_end,
-            "calibrated_span_temporal_prob": calibrated_span_temporal_prob,
-            "calibrated_inside_coarse": calibrated_inside_coarse,
-            "refiner_temperature": torch.as_tensor(
-                self.refiner_temperature,
-                dtype=raw_states.dtype,
-                device=raw_states.device,
-            ),
         }
 
     # ----------------------------------------------------------------------
@@ -3231,7 +1831,7 @@ class QBoundCore(nn.Module):
                 f"Expected input_dim={self.input_dim}, got {feature_dim}."
             )
         if time_steps < 2:
-            raise ValueError("Version 1.11 requires at least 2 timesteps.")
+            raise ValueError("Version 1.12 requires at least 2 timesteps.")
 
         video_mask = self._normalize_mask(
             video_mask,
@@ -3240,21 +1840,14 @@ class QBoundCore(nn.Module):
             video_tokens.device,
         )
 
-        # --------------------------------------------------------------
-        # V1.11 generic visual input contract.  ``video_tokens`` is intended
-        # to be the raw/frozen feature sequence (e.g. CLIP-L), not CRA's
-        # VideoEmbedding output.  The caller may detach the external encoder;
-        # this private adapter remains trainable inside Q-Bound.
-        # --------------------------------------------------------------
+        # Generic Q-Bound input.  The external visual encoder may be detached by
+        # the caller; this private adapter remains trainable.
         raw_external_video_tokens = video_tokens
         video_tokens, input_adapter_diag = self._adapt_generic_video_tokens(
             raw_external_video_tokens,
             video_mask,
         )
 
-        # When no distinct contextual stream is provided (the controlled
-        # V1.11 path), reuse the exact same adapted tensor and dropout draw.
-        # A truly separate generic contextual stream is still supported.
         context_reuses_raw = (
             external_contextual_tokens is None
             or external_contextual_tokens is raw_external_video_tokens
@@ -3276,24 +1869,21 @@ class QBoundCore(nn.Module):
             )
 
         boundary_mask = video_mask[:, :-1] & video_mask[:, 1:]
-
         temporal_prior_used = self._prepare_temporal_prior(
             temporal_prior,
             video_mask,
             video_tokens.dtype,
         )
-
         qa_summary = self._summarize_qa(question_features)
 
         # ------------------------------------------------------------------
-        # A. DECOMPOSE
+        # A. DYNAMIC DECOMPOSE -- K_i is selected per sample; K_max is capacity.
         # ------------------------------------------------------------------
         decomp_features = self._build_decomposition_features(
             video_tokens=video_tokens,
             qa_summary=qa_summary,
             video_mask=video_mask,
         )
-
         topology_states = self.topology_proj(decomp_features)
         topology_qa = self.topology_qa_proj(qa_summary.detach())
 
@@ -3312,7 +1902,6 @@ class QBoundCore(nn.Module):
             [prior_left, prior_right, prior_change],
             dim=-1,
         )
-
         boundary_position = torch.linspace(
             0.0,
             1.0,
@@ -3345,7 +1934,6 @@ class QBoundCore(nn.Module):
             boundary_prob=boundary_prob,
             boundary_mask=boundary_mask,
         )
-
         decomposition = self._enumerate_partitions(
             candidate_indicator=proposals["candidate_indicator"],
             candidate_probs=proposals["candidate_probs"],
@@ -3355,9 +1943,7 @@ class QBoundCore(nn.Module):
         )
 
         # ------------------------------------------------------------------
-        # B. SEMANTIC STATES used by RELATE/GROUND. These are separate from the
-        # topology branch so downstream task gradients do not directly optimize
-        # the boundary representation.
+        # B. SEMANTIC STATES + RELATE.
         # ------------------------------------------------------------------
         raw_visual_states = self.raw_proj(video_tokens)
         contextual_visual_states = self.context_proj(contextual_tokens)
@@ -3366,7 +1952,6 @@ class QBoundCore(nn.Module):
         gamma, beta = self.qa_film(qa_state).chunk(2, dim=-1)
         gamma = 0.1 * torch.tanh(gamma)
         beta = 0.1 * torch.tanh(beta)
-
         raw_states = (
             raw_visual_states * (1.0 + gamma.unsqueeze(1))
             + beta.unsqueeze(1)
@@ -3377,7 +1962,8 @@ class QBoundCore(nn.Module):
         )
         raw_states = raw_states * video_mask.to(raw_states.dtype).unsqueeze(-1)
         contextual_states = (
-            contextual_states * video_mask.to(contextual_states.dtype).unsqueeze(-1)
+            contextual_states
+            * video_mask.to(contextual_states.dtype).unsqueeze(-1)
         )
 
         qa_frames = qa_state.unsqueeze(1).expand(-1, time_steps, -1)
@@ -3392,7 +1978,9 @@ class QBoundCore(nn.Module):
                 dim=-1,
             )
         )
-        frame_semantic_logits = self.frame_evidence_score(frame_hidden).squeeze(-1)
+        frame_semantic_logits = self.frame_evidence_score(
+            frame_hidden
+        ).squeeze(-1)
         frame_semantic_logits = (
             frame_semantic_logits * video_mask.to(frame_semantic_logits.dtype)
         )
@@ -3411,105 +1999,25 @@ class QBoundCore(nn.Module):
         )
 
         # ------------------------------------------------------------------
-        # C. COMPOSE (V1.5 mechanism retained in V1.10.1)
+        # C. V1.12 EXACT TEMPORAL HYPOTHESIS BANK + QUESTION-ONLY COMPETITION.
         # ------------------------------------------------------------------
-        composition = self._compose_event_spans(
-            reasoned_event_tokens=grounding["reasoned_event_tokens"],
-            event_valid_mask=grounding["event_valid_mask"],
-            event_assignment=grounding["event_assignment"],
-            event_evidence_logits=grounding["event_evidence_logits"],
-            local_temporal_logits=grounding["event_temporal_logits"],
-            qa_state=qa_state,
+        bank = self._enumerate_temporal_hypotheses(
             video_mask=video_mask,
+            dtype=video_tokens.dtype,
         )
-
-        # --------------------------------------------------------------
-        # D. BAPGR + PRIOR-PRESERVING BOUNDED REFINE + PSRC (retained in V1.11)
-        # --------------------------------------------------------------
-        refinement = self._refine_selected_span(
+        hypotheses = self._score_temporal_hypotheses(
             raw_states=raw_states,
             contextual_states=contextual_states,
             qa_state=qa_state,
-            reasoned_event_tokens=grounding["reasoned_event_tokens"],
-            event_assignment=grounding["event_assignment"],
-            local_temporal_logits=grounding["event_temporal_logits"],
-            composition=composition,
+            boundary_prob=boundary_prob,
+            grounding=grounding,
+            bank=bank,
             video_mask=video_mask,
-        )
-
-        # --------------------------------------------------------------
-        # E. V1.11-B COUNTERFACTUAL EVIDENCE INTERFACE (no loss in core).
-        # --------------------------------------------------------------
-        # Start from the official reliability-calibrated MAIN soft support.
-        # This is an interval-membership support in [0,1], not a unit-sum
-        # temporal probability.
-        mask_f_cf = video_mask.to(
-            refinement["calibrated_soft_support"].dtype
-        )
-        counterfactual_raw_keep_support = refinement[
-            "calibrated_soft_support"
-        ].clamp(0.0, 1.0)
-        counterfactual_raw_keep_support = (
-            counterfactual_raw_keep_support * mask_f_cf
-        )
-        counterfactual_raw_remove_support = (
-            mask_f_cf - counterfactual_raw_keep_support
-        ).clamp(0.0, 1.0)
-
-        cf_valid_length = video_mask.sum(dim=-1).to(
-            counterfactual_raw_keep_support.dtype
-        ).clamp_min(1.0)
-        counterfactual_raw_keep_fraction = (
-            counterfactual_raw_keep_support.sum(dim=-1)
-            / cf_valid_length
-        )
-
-        # Mass-preserving counterfactual gradient view.
-        # Forward values are unchanged, but the CF objective cannot win by
-        # globally expanding/shrinking all frame supports together:
-        #   cf_keep = raw_keep + stopgrad(mean_keep) - mean_keep
-        if self.counterfactual_evidence_interface:
-            mean_keep = counterfactual_raw_keep_fraction
-            mean_correction = (
-                mean_keep.detach() - mean_keep
-            ).unsqueeze(-1)
-            counterfactual_keep_support = (
-                counterfactual_raw_keep_support
-                + mean_correction * mask_f_cf
-            )
-        else:
-            counterfactual_keep_support = counterfactual_raw_keep_support
-
-        # Do not clamp again: the correction is numerically zero in forward,
-        # while an extra clamp could unnecessarily alter gradients at 0/1.
-        counterfactual_remove_support = (
-            mask_f_cf - counterfactual_keep_support
-        )
-
-        counterfactual_keep_fraction = (
-            counterfactual_keep_support.sum(dim=-1) / cf_valid_length
-        )
-        counterfactual_remove_fraction = (
-            counterfactual_remove_support.sum(dim=-1) / cf_valid_length
-        )
-
-        # Forward-equivalence / complement diagnostics.
-        counterfactual_support_forward_error = (
-            counterfactual_keep_support.detach()
-            - counterfactual_raw_keep_support.detach()
-        ).abs().amax(dim=-1)
-        counterfactual_support_complement_error = (
-            (
-                counterfactual_keep_support.detach()
-                + counterfactual_remove_support.detach()
-                - mask_f_cf.detach()
-            ).abs().amax(dim=-1)
         )
 
         boundary_hard = decomposition["hard_boundary"]
         boundary_count = boundary_hard.sum(dim=-1)
         event_count = boundary_count + 1.0
-
         selected_boundary_prob_sum = (
             boundary_prob * boundary_hard
         ).sum(dim=-1)
@@ -3522,25 +2030,45 @@ class QBoundCore(nn.Module):
             selected_boundary_prob_mean,
             torch.zeros_like(selected_boundary_prob_mean),
         )
-
         boundary_prob_mean = (
             boundary_prob.sum(dim=-1)
             / boundary_mask.sum(dim=-1).clamp_min(1).to(boundary_prob.dtype)
         )
 
-        # Compatibility aliases from V1.3 are intentionally retained where they
-        # do not alter the V1.4 method. In particular, event_relevance_* below
-        # are diagnostic aliases for event evidence; the main path does not use
-        # event-level gates.
         event_evidence_logits = grounding["event_evidence_logits"]
         event_evidence_weights = grounding["event_evidence_weights"]
         event_evidence_gates = grounding["event_evidence_gates"]
 
         return {
             # ----------------------------------------------------------
-            # V1.11 generic-input / counterfactual interface contract.
+            # V1.12 architecture contract.
             # ----------------------------------------------------------
             "qbound_version": self.qbound_version,
+            "dynamic_event_count_enabled": torch.ones(
+                (), dtype=video_tokens.dtype, device=video_tokens.device
+            ),
+            "event_capacity": torch.as_tensor(
+                float(self.max_events),
+                dtype=video_tokens.dtype,
+                device=video_tokens.device,
+            ),
+            "hypothesis_competition_enabled": torch.ones(
+                (), dtype=video_tokens.dtype, device=video_tokens.device
+            ),
+            "answer_features_used_in_core": torch.zeros(
+                (), dtype=video_tokens.dtype, device=video_tokens.device
+            ),
+            "legacy_composer_enabled": torch.zeros(
+                (), dtype=video_tokens.dtype, device=video_tokens.device
+            ),
+            "legacy_refiner_enabled": torch.zeros(
+                (), dtype=video_tokens.dtype, device=video_tokens.device
+            ),
+            "legacy_counterfactual_donor_enabled": torch.zeros(
+                (), dtype=video_tokens.dtype, device=video_tokens.device
+            ),
+
+            # Generic input diagnostics.
             "generic_input_adapter_enabled": torch.as_tensor(
                 float(self.use_generic_input_adapter),
                 dtype=video_tokens.dtype,
@@ -3574,37 +2102,13 @@ class QBoundCore(nn.Module):
             "generic_context_adapted_rms": contextual_adapter_diag[
                 "generic_input_adapted_rms"
             ],
-            "counterfactual_evidence_interface_enabled": torch.as_tensor(
-                float(self.counterfactual_evidence_interface),
-                dtype=video_tokens.dtype,
-                device=video_tokens.device,
-            ),
-            "counterfactual_mass_preserving_gradient_enabled": torch.as_tensor(
-                float(self.counterfactual_evidence_interface),
-                dtype=video_tokens.dtype,
-                device=video_tokens.device,
-            ),
-            # Raw MAIN support retained for diagnostics.
-            "counterfactual_raw_keep_support": counterfactual_raw_keep_support,
-            "counterfactual_raw_remove_support": counterfactual_raw_remove_support,
-            "counterfactual_raw_keep_fraction": counterfactual_raw_keep_fraction,
-            # Differentiable V1.11-B CF training view. Forward values are
-            # identical to the raw support; only the backward path is guarded.
-            "counterfactual_keep_support": counterfactual_keep_support,
-            "counterfactual_remove_support": counterfactual_remove_support,
-            "counterfactual_keep_fraction": counterfactual_keep_fraction,
-            "counterfactual_remove_fraction": counterfactual_remove_fraction,
-            "counterfactual_support_forward_error": (
-                counterfactual_support_forward_error
-            ),
-            "counterfactual_support_complement_error": (
-                counterfactual_support_complement_error
-            ),
 
             # Core states.
             "qa_state": qa_state,
             "topology_qa_state": topology_qa,
             "decomp_features": decomp_features,
+            "raw_states": raw_states,
+            "contextual_states": contextual_states,
 
             # Boundary proposal diagnostics.
             "boundary_logits": boundary_logits,
@@ -3615,16 +2119,20 @@ class QBoundCore(nn.Module):
             "boundary_candidate_mask": proposals["threshold_candidate_mask"],
             "boundary_candidate_indices": proposals["candidate_indices"],
             "boundary_candidate_probs": proposals["candidate_probs"],
-            "boundary_candidate_valid_mask": proposals["candidate_valid_mask"],
+            "boundary_candidate_valid_mask": proposals[
+                "candidate_valid_mask"
+            ],
             "boundary_hard": boundary_hard,
-            "boundary_mass": boundary_hard,  # compatibility: final selected topology
-            "boundary_soft_marginal": decomposition["boundary_soft_marginal"],
+            "boundary_mass": boundary_hard,
+            "boundary_soft_marginal": decomposition[
+                "boundary_soft_marginal"
+            ],
             "boundary_count": boundary_count,
             "event_count": event_count,
             "boundary_prob_mean": boundary_prob_mean,
             "selected_boundary_prob_mean": selected_boundary_prob_mean,
 
-            # Latent decomposition outputs.
+            # Dynamic decomposition outputs.
             "partition_energy": decomposition["partition_energy"],
             "partition_valid_mask": decomposition["partition_valid_mask"],
             "partition_posterior": decomposition["partition_posterior"],
@@ -3632,7 +2140,9 @@ class QBoundCore(nn.Module):
             "best_partition_index": decomposition["best_partition_index"],
             "best_partition_pattern": decomposition["hard_pattern"],
             "decomp_loss": decomposition["decomp_loss"],
-            "decomp_expected_energy": decomposition["decomp_expected_energy"],
+            "decomp_expected_energy": decomposition[
+                "decomp_expected_energy"
+            ],
             "decomp_selected_coherence": decomposition[
                 "decomp_selected_coherence"
             ],
@@ -3658,7 +2168,7 @@ class QBoundCore(nn.Module):
             "accepted_split_gain": decomposition["accepted_split_gain"],
             "rejected_split_gain": decomposition["rejected_split_gain"],
 
-            # Hard dynamic events.
+            # Dynamic hard events + RELATE.
             "hard_event_index": grounding["hard_event_index"],
             "event_assignment": grounding["event_assignment"],
             "active_assignment": grounding["event_assignment"],
@@ -3680,8 +2190,6 @@ class QBoundCore(nn.Module):
                 "soft_effective_event_count"
             ],
             "assignment_entropy": grounding["assignment_entropy"],
-
-            # RELATE / Q-OEI.
             "ordered_relation_logits": grounding["ordered_relation_logits"],
             "ordered_relation_gates": grounding["ordered_relation_gates"],
             "ordered_relation_valid_mask": grounding[
@@ -3707,7 +2215,8 @@ class QBoundCore(nn.Module):
                 "reasoned_event_token_delta_norm"
             ],
 
-            # Local V1.4 event/frame evidence retained inside V1.5.
+            # Local evidence features retained for the hypothesis scorer and
+            # weak-alignment branch.
             "event_evidence_logits": event_evidence_logits,
             "event_evidence_weights": event_evidence_weights,
             "event_evidence_gates": event_evidence_gates,
@@ -3731,350 +2240,48 @@ class QBoundCore(nn.Module):
             "frame_event_logits": grounding["frame_event_logits"],
             "frame_semantic_logits": grounding["frame_semantic_logits"],
             "event_temporal_logits": grounding["event_temporal_logits"],
-
-            # V1.5 COMPOSE: latent contiguous event-chain readout.
-            "span_candidate_event_mask": composition[
-                "span_candidate_event_mask"
-            ],
-            "span_candidate_start_event": composition[
-                "span_candidate_start_event"
-            ],
-            "span_candidate_end_event": composition[
-                "span_candidate_end_event"
-            ],
-            "span_candidate_event_count": composition[
-                "span_candidate_event_count"
-            ],
-            "span_candidate_valid_mask": composition[
-                "span_candidate_valid_mask"
-            ],
-            "span_candidate_frame_mask": composition[
-                "span_candidate_frame_mask"
-            ],
-            "span_candidate_frame_length": composition[
-                "span_candidate_frame_length"
-            ],
-            "span_candidate_center": composition[
-                "span_candidate_center"
-            ],
-            "span_candidate_duration": composition[
-                "span_candidate_duration"
-            ],
-            "span_event_evidence_mean": composition[
-                "span_event_evidence_mean"
-            ],
-            "span_frame_evidence_mean": composition[
-                "span_frame_evidence_mean"
-            ],
-            "span_learned_logits": composition["span_learned_logits"],
-            "span_evidence_prior": composition["span_evidence_prior"],
-            "span_logits": composition["span_logits"],
-            "span_posterior": composition["span_posterior"],
-            "span_entropy": composition["span_entropy"],
-            "span_effective_count": composition["span_effective_count"],
-            "span_top1_posterior": composition["span_top1_posterior"],
-            "soft_selected_event_weights": composition[
-                "soft_selected_event_weights"
-            ],
-            "composed_reasoned_event_repr": composition[
-                "composed_reasoned_event_repr"
-            ],
-            "soft_span_support": composition["soft_span_support"],
-            "span_support_log_bias": composition["span_support_log_bias"],
-            "composed_temporal_logits": composition[
-                "composed_temporal_logits"
-            ],
-            "composed_temporal_prob": composition[
-                "composed_temporal_prob"
-            ],
-            "legacy_v15_composed_temporal_logits": composition[
-                "composed_temporal_logits"
-            ],
-            "composer_enabled": torch.as_tensor(
-                1.0,
-                dtype=video_tokens.dtype,
-                device=video_tokens.device,
-            ),
-            "span_candidate_count": torch.as_tensor(
-                float(self.composer_span_patterns.size(0)),
-                dtype=video_tokens.dtype,
-                device=video_tokens.device,
-            ),
-            "selected_span_index": composition["selected_span_index"],
-            "selected_event_mask": composition["selected_event_mask"],
-            "selected_reasoned_event_tokens": composition[
-                "selected_reasoned_event_tokens"
-            ],
-            "selected_frame_mask": composition["selected_frame_mask"],
-            "selected_span_start_event": composition[
-                "selected_span_start_event"
-            ],
-            "selected_span_end_event": composition[
-                "selected_span_end_event"
-            ],
-            "selected_span_event_count": composition[
-                "selected_span_event_count"
-            ],
-            "selected_span_start_frame": composition[
-                "selected_span_start_frame"
-            ],
-            "selected_span_end_frame": composition[
-                "selected_span_end_frame"
-            ],
-            "selected_span_frame_length": composition[
-                "selected_span_frame_length"
-            ],
-            "selected_span_fraction": composition[
-                "selected_span_fraction"
-            ],
-            "selected_span_posterior": composition[
-                "selected_span_posterior"
-            ],
-            "selected_span_temporal_prob": composition[
-                "selected_span_temporal_prob"
-            ],
-            "selected_span_start": composition["selected_span_start"],
-            "selected_span_end": composition["selected_span_end"],
-
-            # V1.10.2 BAPGR + PPBR REFINE + posterior-stable reliability outputs.
-            "refiner_enabled": torch.as_tensor(1.0,dtype=video_tokens.dtype,device=video_tokens.device),
-            "stable_refiner_enabled": torch.as_tensor(1.0,dtype=video_tokens.dtype,device=video_tokens.device),
-            "uncertainty_calibration_enabled": torch.as_tensor(1.0,dtype=video_tokens.dtype,device=video_tokens.device),
-            "posterior_guided_refinement_enabled": refinement["posterior_guided_refinement_enabled"],
-            "boundary_structured_refinement_enabled": refinement[
-                "boundary_structured_refinement_enabled"
-            ],
-            "prior_preserving_bounded_refinement_enabled": refinement[
-                "prior_preserving_bounded_refinement_enabled"
-            ],
-            "posterior_stable_reliability_enabled": refinement["posterior_stable_reliability_enabled"],
-            "minimal_sufficient_enabled": torch.as_tensor(0.0,dtype=video_tokens.dtype,device=video_tokens.device),
-            "all_span_refine_marginal_enabled": torch.as_tensor(0.0,dtype=video_tokens.dtype,device=video_tokens.device),
-            "refine_start_logits": refinement["refine_start_logits"],
-            "refine_end_logits": refinement["refine_end_logits"],
-            "refine_start_candidate_mask": refinement[
-                "refine_start_candidate_mask"
-            ],
-            "refine_end_candidate_mask": refinement[
-                "refine_end_candidate_mask"
-            ],
-            "refine_conditional_support": refinement[
-                "refine_conditional_support"
-            ],
-            "refined_soft_support": refinement["refined_soft_support"],
-            "refined_support_log_bias": refinement[
-                "refined_support_log_bias"
-            ],
-            "refined_temporal_logits": refinement[
-                "refined_temporal_logits"
-            ],
-            "refined_temporal_prob": refinement[
-                "refined_temporal_prob"
-            ],
-            "raw_refined_temporal_logits": refinement["raw_refined_temporal_logits"],
-            "raw_refined_temporal_prob": refinement["raw_refined_temporal_prob"],
-            "calibrated_soft_support": refinement["calibrated_soft_support"],
-            "calibrated_temporal_logits": refinement["calibrated_temporal_logits"],
-            "calibrated_temporal_prob": refinement["calibrated_temporal_prob"],
-            "refine_expected_pair_entropy": refinement[
-                "refine_expected_pair_entropy"
-            ],
-            "refine_selected_pair_posterior": refinement[
-                "refine_selected_pair_posterior"
-            ],
-            "refine_selected_pair_entropy": refinement[
-                "refine_selected_pair_entropy"
-            ],
-            "refine_selected_pair_effective_count": refinement[
-                "refine_selected_pair_effective_count"
-            ],
-            "refine_selected_pair_top1_posterior": refinement[
-                "refine_selected_pair_top1_posterior"
-            ],
-            "refine_selected_pair_candidate_count": refinement[
-                "refine_selected_pair_candidate_count"
-            ],
-            "refine_selected_pair_entropy_ratio": refinement[
-                "refine_selected_pair_entropy_ratio"
-            ],
-            "refiner_raw_correction": refinement["refiner_raw_correction"],
-            "refiner_bounded_correction": refinement["refiner_bounded_correction"],
-            "refiner_raw_correction_abs_mean": refinement["refiner_raw_correction_abs_mean"],
-            "refiner_raw_correction_abs_max": refinement["refiner_raw_correction_abs_max"],
-            "refiner_bounded_correction_abs_mean": refinement["refiner_bounded_correction_abs_mean"],
-            "refiner_bounded_correction_abs_max": refinement["refiner_bounded_correction_abs_max"],
-            "refiner_correction_saturation_ratio": refinement["refiner_correction_saturation_ratio"],
-            "refiner_vs_prior_kl": refinement["refiner_vs_prior_kl"],
-            "refiner_vs_prior_js": refinement["refiner_vs_prior_js"],
-            "calibration_uncertainty": refinement["calibration_uncertainty"],
-            "calibration_information": refinement["calibration_information"],
-            "calibration_confidence": refinement["calibration_confidence"],
-            "calibration_confidence_detached": refinement["calibration_confidence_detached"],
-            "calibration_reliability": refinement["calibration_reliability"],
-            "refiner_information_gain": refinement["refiner_information_gain"],
-            "refined_semantic_retention": refinement["refined_semantic_retention"],
-            "base_refiner_confidence": refinement["base_refiner_confidence"],
-            "reliability_gain_factor": refinement["reliability_gain_factor"],
-            "composer_pair_prior": refinement["composer_pair_prior"],
-            "composer_uniform_pair_prior": refinement[
-                "composer_uniform_pair_prior"
-            ],
-            "composer_endpoint_pair_prior": refinement["composer_endpoint_pair_prior"],
-            "composer_pair_prior_valid_mask": refinement["composer_pair_prior_valid_mask"],
-            "composer_pair_prior_entropy": refinement["composer_pair_prior_entropy"],
-            "composer_pair_prior_entropy_ratio": refinement["composer_pair_prior_entropy_ratio"],
-            "composer_pair_prior_effective_count": refinement["composer_pair_prior_effective_count"],
-            "composer_pair_prior_top1_posterior": refinement["composer_pair_prior_top1_posterior"],
-            "composer_pair_prior_candidate_count": refinement["composer_pair_prior_candidate_count"],
-            "composer_uniform_pair_prior_entropy": refinement[
-                "composer_uniform_pair_prior_entropy"
-            ],
-            "composer_uniform_pair_prior_entropy_ratio": refinement[
-                "composer_uniform_pair_prior_entropy_ratio"
-            ],
-            "composer_uniform_pair_prior_effective_count": refinement[
-                "composer_uniform_pair_prior_effective_count"
-            ],
-            "composer_uniform_pair_prior_top1_posterior": refinement[
-                "composer_uniform_pair_prior_top1_posterior"
-            ],
-            "composer_pair_prior_expected_span_length": refinement[
-                "composer_pair_prior_expected_span_length"
-            ],
-            "composer_uniform_pair_prior_expected_span_length": refinement[
-                "composer_uniform_pair_prior_expected_span_length"
-            ],
-            "composer_pair_prior_length_gain": refinement[
-                "composer_pair_prior_length_gain"
-            ],
-            "composer_pair_soft_support": refinement["composer_pair_soft_support"],
-            "composer_expected_start_frame": refinement["composer_expected_start_frame"],
-            "composer_expected_end_frame": refinement["composer_expected_end_frame"],
-            "composer_expected_span_length": refinement["composer_expected_span_length"],
-            "main_pair_posterior": refinement["main_pair_posterior"],
-            "main_pair_entropy": refinement["main_pair_entropy"],
-            "main_pair_effective_count": refinement["main_pair_effective_count"],
-            "main_pair_top1_posterior": refinement["main_pair_top1_posterior"],
-            "refine_selected_pair_valid_mask": refinement[
-                "refine_selected_pair_valid_mask"
-            ],
-            "refine_hard_coarse_route": refinement[
-                "refine_hard_coarse_route"
-            ],
-            "refine_coarse_detached": refinement[
-                "refine_coarse_detached"
-            ],
-            "refine_boundary_anchor_power": refinement[
-                "refine_boundary_anchor_power"
-            ],
-            "refine_correction_cap": refinement["refine_correction_cap"],
-            "refine_selected_span_index": refinement[
-                "refine_selected_span_index"
-            ],
-            "expected_refined_span_length": refinement[
-                "expected_refined_span_length"
-            ],
-            "raw_vs_prior_expected_length_ratio": refinement[
-                "raw_vs_prior_expected_length_ratio"
-            ],
-            "expected_refined_length_ratio": refinement[
-                "expected_refined_length_ratio"
-            ],
-            "expected_refined_span_fraction": refinement[
-                "expected_refined_span_fraction"
-            ],
-            "expected_refine_trim_fraction": refinement[
-                "expected_refine_trim_fraction"
-            ],
-            "expected_refined_start_frame": refinement[
-                "expected_refined_start_frame"
-            ],
-            "expected_refined_end_frame": refinement[
-                "expected_refined_end_frame"
-            ],
-            "refine_selected_start_candidate_count": refinement[
-                "refine_selected_start_candidate_count"
-            ],
-            "refine_selected_end_candidate_count": refinement[
-                "refine_selected_end_candidate_count"
-            ],
-            "coarse_span_start_frame": refinement[
-                "coarse_span_start_frame"
-            ],
-            "coarse_span_end_frame": refinement[
-                "coarse_span_end_frame"
-            ],
-            "coarse_span_frame_length": refinement[
-                "coarse_span_frame_length"
-            ],
-            "coarse_span_fraction": refinement[
-                "coarse_span_fraction"
-            ],
-            "coarse_frame_mask": refinement["coarse_frame_mask"],
-            "refined_span_start_frame": refinement[
-                "refined_span_start_frame"
-            ],
-            "refined_span_end_frame": refinement[
-                "refined_span_end_frame"
-            ],
-            "refined_frame_mask": refinement["refined_frame_mask"],
-            "refined_span_frame_length": refinement[
-                "refined_span_frame_length"
-            ],
-            "refined_span_fraction": refinement[
-                "refined_span_fraction"
-            ],
-            "refined_span_start": refinement["refined_span_start"],
-            "refined_span_end": refinement["refined_span_end"],
-            "refined_span_temporal_prob": refinement[
-                "refined_span_temporal_prob"
-            ],
-            "refine_trim_left_frames": refinement[
-                "refine_trim_left_frames"
-            ],
-            "refine_trim_right_frames": refinement[
-                "refine_trim_right_frames"
-            ],
-            "refine_trim_total_frames": refinement[
-                "refine_trim_total_frames"
-            ],
-            "refine_retained_fraction": refinement[
-                "refine_retained_fraction"
-            ],
-            "refined_inside_coarse": refinement["refined_inside_coarse"],
-            "calibrated_start_frame_float": refinement["calibrated_start_frame_float"],
-            "calibrated_end_frame_float": refinement["calibrated_end_frame_float"],
-            "calibrated_expected_span_length": refinement["calibrated_expected_span_length"],
-            "calibrated_expected_length_ratio": refinement["calibrated_expected_length_ratio"],
-            "calibrated_span_start_frame": refinement["calibrated_span_start_frame"],
-            "calibrated_span_end_frame": refinement["calibrated_span_end_frame"],
-            "calibrated_frame_mask": refinement["calibrated_frame_mask"],
-            "calibrated_span_frame_length": refinement["calibrated_span_frame_length"],
-            "calibrated_span_fraction": refinement["calibrated_span_fraction"],
-            "calibrated_retained_fraction": refinement["calibrated_retained_fraction"],
-            "calibrated_trim_left_frames": refinement["calibrated_trim_left_frames"],
-            "calibrated_trim_right_frames": refinement["calibrated_trim_right_frames"],
-            "calibrated_trim_total_frames": refinement["calibrated_trim_total_frames"],
-            "calibrated_span_start": refinement["calibrated_span_start"],
-            "calibrated_span_end": refinement["calibrated_span_end"],
-            "calibrated_span_temporal_prob": refinement["calibrated_span_temporal_prob"],
-            "calibrated_inside_coarse": refinement["calibrated_inside_coarse"],
-            "refiner_temperature": refinement["refiner_temperature"],
-
-            # Main V1.11 temporal output: V1.10.2 reliability-calibrated fusion retained.
-            "event_temporal_prob": refinement["calibrated_temporal_prob"],
-            "main_temporal_prob": refinement["calibrated_temporal_prob"],
-            "main_temporal_logits": refinement["calibrated_temporal_logits"],
-            "legacy_v15_composed_temporal_prob": composition[
-                "composed_temporal_prob"
-            ],
-            "legacy_v14_event_temporal_prob": grounding[
-                "frame_event_relevance"
-            ],
             "frame_event_relevance": grounding["frame_event_relevance"],
 
-            # Compatibility aliases for old V1.3 loggers. These must NOT be used
-            # to reintroduce the direct reasoning residual in refine.py.
+            # ----------------------------------------------------------
+            # V1.12 hypothesis bank -- training-time critic interface.
+            # ----------------------------------------------------------
+            **bank,
+            "hypothesis_candidate_count": torch.as_tensor(
+                float(bank["hypothesis_start_frame"].numel()),
+                dtype=video_tokens.dtype,
+                device=video_tokens.device,
+            ),
+            **hypotheses,
+
+            # MAIN V1.12 grounding aliases.
+            "event_temporal_prob": hypotheses["main_temporal_prob"],
+            "calibrated_temporal_prob": hypotheses["main_temporal_prob"],
+            "calibrated_temporal_logits": hypotheses["main_temporal_logits"],
+            "calibrated_soft_support": hypotheses["main_soft_support"],
+            "calibrated_span_start_frame": hypotheses[
+                "selected_hypothesis_start_frame"
+            ],
+            "calibrated_span_end_frame": hypotheses[
+                "selected_hypothesis_end_frame"
+            ],
+            "calibrated_frame_mask": hypotheses[
+                "selected_hypothesis_frame_mask"
+            ],
+            "calibrated_span_frame_length": hypotheses[
+                "selected_hypothesis_span_length"
+            ],
+            "calibrated_span_fraction": hypotheses[
+                "selected_hypothesis_span_fraction"
+            ],
+            "calibrated_span_start": hypotheses[
+                "selected_hypothesis_start"
+            ],
+            "calibrated_span_end": hypotheses[
+                "selected_hypothesis_end"
+            ],
+
+            # Old names retained only where semantically safe for logger
+            # migration.  They do not re-enable historical V1.5--V1.11 logic.
             "event_relevance_logits": event_evidence_logits,
             "event_relevance_weights": event_evidence_weights,
             "event_relevance_gates": event_evidence_gates,
@@ -4097,3 +2304,4 @@ class QBoundCore(nn.Module):
                 device=video_tokens.device,
             ),
         }
+
