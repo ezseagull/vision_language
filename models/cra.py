@@ -9,58 +9,41 @@ from modules.m_cra.refine import Decoder as RefineDecoder
 from modules.m_cra.causal_module import LinguisticInterventionGraph
 
 
+
 class CRA(nn.Module):
     """
-    CRA wrapper used as the downstream VideoQA testbed for Q-Bound V2.0.0.
+    CRA wrapper used as the downstream VideoQA testbed for Q-Bound V2.1.0.
 
-    V2.0.0 is a representation-level reset from the V1.x family.  Q-Bound no
-    longer consumes a fixed event partition, enumerates 528 temporal spans, or
-    learns from a CRA teacher distribution.  Its controlled path is:
+    V2.1 scientific contract
+    ------------------------
+    Q-Bound itself is answer-free and receives only:
 
-        generic video + question-only semantics
-            -> temporal dynamics
-            -> video-only transition prior
-            -> bounded query-adaptive functional cut field
-            -> boundary-gated temporal reasoning
-            -> direct start/end grounding
-            -> exact hard span H*
+        local/generic video features + question-only TOKEN features
 
-    CRA has two deliberately separated roles.
+    It constructs one query-specific latent contiguous evidence event from
+    local temporal primitives with one shared segment energy E(s,e).
 
-    1) Downstream factual consumer / benchmark testbed
-       ------------------------------------------------
-       Q-Bound's selected temporal evidence pools CRA ``x_bar`` and is scored
-       against the ordinary candidate answer embeddings.  This preserves a
-       comparable NExT-GQA / CRA answer-space testbed without feeding CRA
-       temporal representations back into Q-Bound.
+    CRA is deliberately kept as a downstream answer-space testbed/reference:
 
-    2) Training-only stop-gradient functional verifier
-       ------------------------------------------------
-       Candidate-answer semantics are permitted to measure *local functional
-       consequences* after Q-Bound has already produced its V+Q grounding:
+      1) CRA temporal grounding is detached when Q-Bound is active.
+      2) Q-Bound NEVER receives CRA x_bar as temporal input.
+      3) Active Q-Bound answer evidence is pooled from temporally LOCAL
+         Q-Bound content tokens, not globally contextualized CRA x_bar.
+      4) Existing CRA QA candidates [Question SEP Answer] remain unchanged for
+         the ordinary benchmark answer branch.
+      5) V2.1 additionally accepts ANSWER-ONLY candidates. They are used only
+         after Q-Bound has already produced V+Q evidence, providing a cleaner
+         training signal for temporal evidence without feeding the GT answer or
+         candidate answer semantics into the segment scorer.
+      6) Answer-only embeddings are stop-gradient in this auxiliary path so the
+         auxiliary objective must improve visual/temporal evidence rather than
+         co-adapt the language target.
+      7) V2.0 KEEP/MERGE and boundary-equilibrium verifiers are removed.
 
-         * KEEP vs MERGE for each adjacent temporal pair;
-         * H* vs trim-left/right and expand-left/right views.
+    Inference grounding remains:
+        H* = QBound(Video, Question)
 
-       These verifier logits are deterministic and detached.  They are not a
-       teacher distribution and they never select the grounding in the forward
-       path.  The training pipeline will convert GT-answer margin differences
-       into detached functional-composition and boundary-equilibrium targets.
-
-    Controlled V2.0.0 invariants
-    ----------------------------
-      * Q-Bound input is the explicit generic pre-CRA visual sequence.
-      * Q-Bound core is answer-free and question-only at inference.
-      * There is no fixed event partition and no semantic event-count cap.
-      * Event count emerges from the query-specific soft cut field.
-      * Composition is causal: the cut field gates temporal information flow.
-      * There is no exhaustive temporal-hypothesis bank or listwise teacher.
-      * Hard H* is the official inference/evaluation grounding.
-      * A straight-through training key keeps hard forward numerics while
-        allowing weak QA loss to reach the start/end heads.
-      * CRA temporal grounding is reference/diagnostic only when Q-Bound is on.
-      * VisualIntervention is OFF for the controlled V2.0.0 experiment.
-      * Temporal GT / IoU / IoP are never consumed by this wrapper.
+    Temporal GT / IoU / IoP are never consumed by this wrapper.
     """
 
     def __init__(self, cfgs, tokenizer) -> None:
@@ -95,15 +78,15 @@ class CRA(nn.Module):
                 "version",
                 model_cfg.get(
                     "qbound_version",
-                    model_cfg.get("gpeb_version", "2.0.0"),
+                    model_cfg.get("gpeb_version", "2.1.0"),
                 ),
             )
         )
 
-        if self.qbound_enabled and self.qbound_version != "2.0.0":
+        if self.qbound_enabled and self.qbound_version != "2.1.0":
             raise ValueError(
                 "Q-Bound is enabled, but this CRA wrapper expects "
-                f"model.qbound.version='2.0.0'; got {self.qbound_version!r}."
+                f"model.qbound.version='2.1.0'; got {self.qbound_version!r}."
             )
 
         self.qbound_require_question_only = bool(
@@ -114,18 +97,27 @@ class CRA(nn.Module):
         )
         if self.qbound_enabled and not self.qbound_require_question_only:
             raise ValueError(
-                "Controlled Q-Bound V2.0.0 requires "
+                "Controlled Q-Bound V2.1 requires "
                 "model.qbound.require_question_only=true."
+            )
+
+        self.qbound_require_token_question = bool(
+            qbound_cfg.get("require_token_question", True)
+        )
+        if self.qbound_enabled and not self.qbound_require_token_question:
+            raise ValueError(
+                "Controlled Q-Bound V2.1 requires token-level question "
+                "conditioning. Set model.qbound.require_token_question=true."
             )
 
         if self.qbound_enabled and bool(model_cfg.get("do", False)):
             raise ValueError(
-                "Controlled Q-Bound V2.0.0 requires model.do=false. "
-                "VisualIntervention would confound the functional-composition "
+                "Controlled Q-Bound V2.1 requires model.do=false. "
+                "VisualIntervention would confound the temporal-composition "
                 "experiment."
             )
 
-        # Compatibility aliases used elsewhere in the repository.
+        # Repository compatibility aliases.
         self.gpeb_enabled = self.qbound_enabled
         self.gpeb_version = self.qbound_version
         self.gpeb_require_question_only = self.qbound_require_question_only
@@ -139,8 +131,7 @@ class CRA(nn.Module):
         )
         self.video_model = VideoEmbedding(cfgs)
 
-        # Kept only for repository/checkpoint compatibility.  The controlled
-        # V2.0.0 Q-Bound run requires model.do=false.
+        # Kept for repository/checkpoint compatibility only.
         self.do = LinguisticInterventionGraph(cfgs)
 
         if self.baseline == "baseline":
@@ -152,22 +143,15 @@ class CRA(nn.Module):
                 cfgs=cfgs,
             )
             if self.qbound_enabled:
-                decoder_version = str(getattr(self.decoder, "qbound_version", ""))
+                decoder_version = str(
+                    getattr(self.decoder, "qbound_version", "")
+                )
                 if decoder_version != self.qbound_version:
                     raise RuntimeError(
                         "CRA/RefineDecoder Q-Bound version mismatch: "
                         f"CRA={self.qbound_version!r}, "
                         f"decoder={decoder_version!r}."
                     )
-                for required_method in (
-                    "score_functional_composition_pairs",
-                    "score_boundary_equilibrium_views",
-                ):
-                    if not hasattr(self.decoder, required_method):
-                        raise RuntimeError(
-                            "Q-Bound V2.0.0 RefineDecoder must implement "
-                            f"{required_method}()."
-                        )
             self.forward = self.refine_forward
         else:
             raise ValueError(
@@ -179,7 +163,11 @@ class CRA(nn.Module):
     # Language / input helpers
     # ------------------------------------------------------------------
     @staticmethod
-    def _prepare_answer_indices(answer_id, batch_size: int, device: torch.device):
+    def _prepare_answer_indices(
+        answer_id,
+        batch_size: int,
+        device: torch.device,
+    ):
         if answer_id is None:
             return None
 
@@ -191,7 +179,8 @@ class CRA(nn.Module):
         if answer_indices.numel() != batch_size:
             raise ValueError(
                 "answer_id must contain one candidate index per sample. "
-                f"Expected {batch_size} values, got {answer_indices.numel()}."
+                f"Expected {batch_size} values, got "
+                f"{answer_indices.numel()}."
             )
         return answer_indices
 
@@ -217,41 +206,88 @@ class CRA(nn.Module):
         )
         return candidate_features[batch_indices, candidate_indices]
 
-    def _encode_answers(self, answer, device: torch.device):
-        """Encode candidate question-answer sequences: [B,C,L] -> [B,C,D]."""
-        if answer is None:
-            raise ValueError("answer tokens must not be None.")
+    def _encode_candidates(self, tokens, device: torch.device, name: str):
+        if tokens is None:
+            return None, None
 
-        answer = answer.to(device=device, non_blocking=True)
-        if answer.ndim != 3:
+        tokens = tokens.to(device=device, non_blocking=True)
+        if tokens.ndim != 3:
             raise ValueError(
-                "Candidate answer tokens must have shape [B,C,L], got "
-                f"{tuple(answer.shape)}."
+                f"{name} tokens must have shape [B,C,L], got "
+                f"{tuple(tokens.shape)}."
             )
 
         if hasattr(self.lang_model, "encode_candidates"):
-            answer_global, answer_tokens = self.lang_model.encode_candidates(answer)
+            candidate_global, candidate_tokens = (
+                self.lang_model.encode_candidates(tokens)
+            )
         else:
-            answer_global, answer_tokens = self.lang_model(answer)
+            candidate_global, candidate_tokens = self.lang_model(tokens)
 
-        if answer_global.ndim != 3:
+        if candidate_global.ndim != 3:
             raise ValueError(
                 "LanModel must return candidate features [B,C,D], got "
-                f"{tuple(answer_global.shape)}."
+                f"{tuple(candidate_global.shape)} for {name}."
             )
-        return answer_global, answer_tokens
+
+        return candidate_global, candidate_tokens
+
+    def _encode_answers(self, answer, device: torch.device):
+        """
+        Existing CRA candidates:
+            [Question SEP Answer_i]
+        """
+        if answer is None:
+            raise ValueError("answer tokens must not be None.")
+        return self._encode_candidates(
+            answer, device=device, name="answer"
+        )
+
+    def _encode_answer_only(self, answer_only, device: torch.device):
+        """
+        V2.1 auxiliary candidates:
+            [Answer_i]
+
+        The representation is detached before it supervises Q-Bound evidence.
+        """
+        if answer_only is None:
+            return None, None
+        return self._encode_candidates(
+            answer_only, device=device, name="answer_only"
+        )
+
+    @staticmethod
+    def _question_mask_from_padded_ids(question_ids: torch.Tensor):
+        """
+        The repository collate function pads question ids with literal zeros.
+        Mask those padded positions, while keeping the first token valid because
+        some tokenizers also use id=0 for a real BOS/<s> token.
+        """
+        if question_ids.ndim != 2:
+            raise ValueError("question_ids must be [B,L].")
+
+        mask = question_ids.ne(0)
+        if mask.size(1) > 0:
+            mask[:, 0] = True
+
+        if not torch.all(mask.any(dim=-1)):
+            raise ValueError(
+                "Every question must contain at least one valid token."
+            )
+        return mask
 
     def _encode_question(self, question, device: torch.device):
         """
-        Encode question-only tokens.
+        Encode question-only tokens and return the token mask needed by V2.1.
 
-        V2.0.0 deliberately feeds the global question representation to the
-        first functional-composition implementation, keeping language changes
-        controlled.  Token-level outputs are still surfaced for diagnostics and
-        future ablations.
+        Returns
+        -------
+        question_global : [B,D]
+        question_tokens : [B,L,D]
+        question_mask   : [B,L] bool
         """
         if question is None:
-            return None, None
+            return None, None, None
 
         question = question.to(device=device, non_blocking=True)
         if question.ndim == 3 and question.size(1) == 1:
@@ -262,8 +298,12 @@ class CRA(nn.Module):
                 f"{tuple(question.shape)}."
             )
 
+        question_mask = self._question_mask_from_padded_ids(question)
+
         if hasattr(self.lang_model, "encode_question"):
-            question_global, question_tokens = self.lang_model.encode_question(question)
+            question_global, question_tokens = (
+                self.lang_model.encode_question(question)
+            )
         else:
             question_global, question_tokens = self.lang_model(question)
 
@@ -272,7 +312,17 @@ class CRA(nn.Module):
                 "LanModel must return question features [B,D], got "
                 f"{tuple(question_global.shape)}."
             )
-        return question_global, question_tokens
+        if question_tokens.ndim != 3:
+            raise ValueError(
+                "LanModel must return token-level question features [B,L,D], "
+                f"got {tuple(question_tokens.shape)}."
+            )
+        if question_tokens.shape[:2] != question_mask.shape:
+            raise ValueError(
+                "Question token features and question mask do not align."
+            )
+
+        return question_global, question_tokens, question_mask
 
     @staticmethod
     def _move_video_mask(video_mask, device: torch.device):
@@ -293,15 +343,15 @@ class CRA(nn.Module):
 
     def _aggregate_prop_logits(self, logits: torch.Tensor) -> torch.Tensor:
         """
-        Apply the repository's ``prop_num`` candidate aggregation.
+        Preserve the repository's prop_num aggregation when applicable.
 
-        Supported shapes are [B,C_total] and [B,S,C_total].  V2 functional
-        verifier logits therefore live in exactly the same answer space as the
-        factual CRA scoring rule, without defining any teacher distribution.
+        Supported shapes:
+            [B,C_total]
+            [B,S,C_total]
         """
         if logits.ndim not in {2, 3}:
             raise ValueError(
-                "Verifier logits must be [B,C] or [B,S,C], got "
+                "Candidate logits must be [B,C] or [B,S,C], got "
                 f"{tuple(logits.shape)}."
             )
 
@@ -312,7 +362,7 @@ class CRA(nn.Module):
         total_candidates = logits.size(-1)
         if total_candidates % prop_num != 0:
             raise ValueError(
-                "Verifier candidate dimension is not divisible by prop_num: "
+                "Candidate dimension is not divisible by prop_num: "
                 f"{total_candidates} vs {prop_num}."
             )
         if prop_num == 1:
@@ -325,13 +375,54 @@ class CRA(nn.Module):
             ).mean(dim=1)
 
         return logits.reshape(
-            logits.size(0), logits.size(1), prop_num, answer_count
+            logits.size(0),
+            logits.size(1),
+            prop_num,
+            answer_count,
         ).mean(dim=2)
 
+    def _score_answer_only(
+        self,
+        video_feature: torch.Tensor,
+        answer_only_proj: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Score one visual evidence vector against answer-only candidate features.
+
+        Candidate embeddings are expected to be detached by the caller. This
+        makes the auxiliary signal train temporal/visual evidence rather than
+        directly co-adapting the candidate language representation.
+        """
+        if video_feature.ndim != 2:
+            raise ValueError(
+                "video_feature must be [B,D], got "
+                f"{tuple(video_feature.shape)}."
+            )
+        if answer_only_proj.ndim != 3:
+            raise ValueError(
+                "answer_only_proj must be [B,C,D], got "
+                f"{tuple(answer_only_proj.shape)}."
+            )
+        if (
+            video_feature.size(0) != answer_only_proj.size(0)
+            or video_feature.size(-1) != answer_only_proj.size(-1)
+        ):
+            raise ValueError(
+                "Visual evidence and answer-only candidates have incompatible "
+                "batch/feature dimensions."
+            )
+
+        logits = torch.einsum(
+            "bd,bcd->bc",
+            video_feature,
+            answer_only_proj,
+        )
+        return self._aggregate_prop_logits(logits)
+
     # ------------------------------------------------------------------
-    # V2.0.0 contract validation
+    # Q-Bound V2.1 contract validation
     # ------------------------------------------------------------------
-    def _validate_v200_contract(
+    def _validate_v210_contract(
         self,
         time_param,
         qbound_aux,
@@ -340,60 +431,77 @@ class CRA(nn.Module):
         time_steps,
     ):
         if not isinstance(time_param, dict):
-            raise TypeError("RefineDecoder must return time_param as a dict.")
+            raise TypeError(
+                "RefineDecoder must return time_param as a dict."
+            )
         if not isinstance(qbound_aux, dict):
             raise TypeError(
-                "Q-Bound V2.0.0 must expose time_param['qbound_aux'] as a dict."
+                "Q-Bound V2.1 must expose "
+                "time_param['qbound_aux'] as a dict."
             )
 
         required_aux = {
             "qbound_version",
             "qbound_input_is_generic",
             "qbound_input_uses_cra_embedding",
-            "generic_input_adapter_enabled",
-            "functional_composition_enabled",
-            "dynamic_event_count_enabled",
+            "qbound_answer_evidence_uses_local_tokens",
+            "qbound_answer_evidence_uses_cra_context",
+            "functional_verifier_used",
+            "boundary_equilibrium_used",
+            "teacher_distribution_used",
+
+            "latent_segment_composition_enabled",
+            "question_token_interaction_enabled",
+            "segment_energy_enabled",
             "fixed_event_partition_enabled",
+            "dynamic_event_count_enabled",
             "event_count_cap_enabled",
+            "cut_field_enabled",
+            "boundary_gated_reasoning_enabled",
+            "independent_endpoint_heads_enabled",
             "hypothesis_competition_enabled",
             "teacher_distillation_enabled",
             "answer_features_used_in_core",
-            "boundary_equilibrium_interface_enabled",
-            "functional_answer_verifier_ready",
-            "boundary_equilibrium_verifier_ready",
-            "functional_verifier_consumer_stop_gradient",
-            "teacher_distribution_used",
-            "video_boundary_prior_prob",
-            "functional_cut_prob",
-            "functional_merge_gate",
-            "hard_event_count",
-            "soft_effective_event_count",
-            "one_event_indicator",
-            "all_split_indicator",
-            "functional_pair_valid_mask",
-            "start_prob",
-            "end_prob",
+            "temporal_gt_used_in_core",
+
+            "content_tokens",
+            "primitive_states",
+            "query_conditioned_states",
+            "node_relevance",
+            "adjacent_relation",
+            "segment_energy",
+            "segment_prob",
+            "segment_entropy_ratio",
+            "segment_top1_prob",
+            "soft_inside_prob",
+            "soft_temporal_prob",
             "training_temporal_prob",
             "main_temporal_prob",
             "main_temporal_logits",
             "main_soft_support",
+
             "selected_span_start_frame",
             "selected_span_end_frame",
             "selected_span_frame_mask",
             "selected_span_frame_weights",
             "selected_span_length",
             "selected_span_fraction",
-            "trim_left_frame_weights",
-            "trim_right_frame_weights",
-            "expand_left_frame_weights",
-            "expand_right_frame_weights",
-            "trim_left_valid_mask",
-            "trim_right_valid_mask",
-            "expand_left_valid_mask",
-            "expand_right_valid_mask",
+            "soft_expected_span_length",
+            "soft_expected_span_fraction",
+            "single_frame_prob_mass",
+            "short_span_prob_mass",
+            "selected_single_frame_indicator",
+            "selected_full_video_indicator",
+
+            "qbound_hard_video_proj",
+            "qbound_training_video_proj",
+            "qbound_soft_video_proj",
+            "qbound_st_hard_feature_max_abs_diff",
+
             "cra_key",
             "qbound_key",
             "qbound_training_key",
+            "qbound_soft_key",
             "final_key",
             "main_video_proj",
             "qbound_video_proj",
@@ -402,7 +510,7 @@ class CRA(nn.Module):
         missing_aux = sorted(required_aux.difference(qbound_aux))
         if missing_aux:
             raise KeyError(
-                "Q-Bound V2.0.0 auxiliary output is missing: "
+                "Q-Bound V2.1 auxiliary output is missing: "
                 + ", ".join(missing_aux)
             )
 
@@ -412,27 +520,33 @@ class CRA(nn.Module):
             "qbound_temporal_main_feature",
             "qbound_key",
             "qbound_training_key",
+            "qbound_soft_key",
             "qbound_selected_span_start_frame",
             "qbound_selected_span_end_frame",
             "qbound_selected_span_mask",
             "qbound_selected_span_length",
             "qbound_selected_span_fraction",
-            "qbound_functional_composition_enabled",
-            "qbound_dynamic_event_count_enabled",
+            "qbound_soft_expected_span_length",
+            "qbound_soft_expected_span_fraction",
+            "qbound_latent_segment_composition_enabled",
+            "qbound_question_token_interaction_enabled",
+            "qbound_segment_energy_enabled",
             "qbound_fixed_event_partition_enabled",
+            "qbound_dynamic_event_count_enabled",
             "qbound_event_count_cap_enabled",
+            "qbound_cut_field_enabled",
+            "qbound_boundary_gated_reasoning_enabled",
+            "qbound_independent_endpoint_heads_enabled",
             "qbound_hypothesis_competition_enabled",
             "qbound_teacher_distillation_enabled",
             "qbound_answer_features_used_in_core",
-            "qbound_boundary_equilibrium_interface_enabled",
-            "qbound_input_is_generic",
-            "qbound_input_uses_cra_embedding",
+            "qbound_temporal_gt_used_in_core",
             "qbound_smoothing_applied",
         }
         missing_time = sorted(required_time.difference(time_param))
         if missing_time:
             raise KeyError(
-                "RefineDecoder/Q-Bound V2.0.0 time_param output is missing: "
+                "RefineDecoder/Q-Bound V2.1 time_param output is missing: "
                 + ", ".join(missing_time)
             )
 
@@ -443,41 +557,48 @@ class CRA(nn.Module):
                 f"core={qbound_aux['qbound_version']!r}."
             )
 
-        # Architectural invariants.
         expected_flags = {
             "qbound_input_is_generic": 1.0,
             "qbound_input_uses_cra_embedding": 0.0,
-            "functional_composition_enabled": 1.0,
-            "dynamic_event_count_enabled": 1.0,
+            "qbound_answer_evidence_uses_local_tokens": 1.0,
+            "qbound_answer_evidence_uses_cra_context": 0.0,
+            "functional_verifier_used": 0.0,
+            "boundary_equilibrium_used": 0.0,
+            "teacher_distribution_used": 0.0,
+
+            "latent_segment_composition_enabled": 1.0,
+            "question_token_interaction_enabled": 1.0,
+            "segment_energy_enabled": 1.0,
+
             "fixed_event_partition_enabled": 0.0,
+            "dynamic_event_count_enabled": 0.0,
             "event_count_cap_enabled": 0.0,
+            "cut_field_enabled": 0.0,
+            "boundary_gated_reasoning_enabled": 0.0,
+            "independent_endpoint_heads_enabled": 0.0,
             "hypothesis_competition_enabled": 0.0,
             "teacher_distillation_enabled": 0.0,
             "answer_features_used_in_core": 0.0,
-            "boundary_equilibrium_interface_enabled": 1.0,
-            "functional_answer_verifier_ready": 1.0,
-            "boundary_equilibrium_verifier_ready": 1.0,
-            "functional_verifier_consumer_stop_gradient": 1.0,
-            "teacher_distribution_used": 0.0,
+            "temporal_gt_used_in_core": 0.0,
         }
         for name, expected in expected_flags.items():
             actual = self._scalar_flag(qbound_aux, name)
             if actual != expected:
                 raise RuntimeError(
-                    f"V2.0.0 contract violation: {name}={actual}, "
+                    f"V2.1 contract violation: {name}={actual}, "
                     f"expected {expected}."
                 )
 
         if qbound_aux["main_video_proj"].shape != video_proj.shape:
             raise ValueError(
-                "Q-Bound main_video_proj shape does not match returned video_proj."
+                "Q-Bound main_video_proj shape does not match "
+                "returned video_proj."
             )
 
         for name in (
             "main_temporal_prob",
             "training_temporal_prob",
-            "start_prob",
-            "end_prob",
+            "soft_temporal_prob",
             "selected_span_frame_mask",
         ):
             value = qbound_aux[name]
@@ -487,26 +608,58 @@ class CRA(nn.Module):
                     f"{tuple(value.shape)}."
                 )
 
-        cut_prob = qbound_aux["functional_cut_prob"]
-        if cut_prob.shape != (batch_size, time_steps - 1):
+        if qbound_aux["node_relevance"].shape != (
+            batch_size,
+            time_steps,
+        ):
             raise ValueError(
-                "functional_cut_prob must be [B,T-1], got "
-                f"{tuple(cut_prob.shape)}."
+                "node_relevance must be [B,T]."
             )
-        if qbound_aux["functional_pair_valid_mask"].shape != cut_prob.shape:
+
+        expected_edge = (batch_size, max(time_steps - 1, 0))
+        if qbound_aux["adjacent_relation"].shape != expected_edge:
             raise ValueError(
-                "functional_pair_valid_mask must match functional_cut_prob."
+                "adjacent_relation must be [B,T-1], got "
+                f"{tuple(qbound_aux['adjacent_relation'].shape)}."
+            )
+
+        if qbound_aux["segment_prob"].shape != (
+            batch_size,
+            time_steps,
+            time_steps,
+        ):
+            raise ValueError(
+                "segment_prob must be [B,T,T]."
             )
 
         start = qbound_aux["selected_span_start_frame"]
         end = qbound_aux["selected_span_end_frame"]
         if start.shape != (batch_size,) or end.shape != (batch_size,):
-            raise ValueError("selected span endpoints must be [B].")
+            raise ValueError(
+                "selected span endpoints must be [B]."
+            )
         if torch.any(start > end):
-            raise RuntimeError("Q-Bound V2.0.0 produced start > end.")
+            raise RuntimeError(
+                "Q-Bound V2.1 produced start > end."
+            )
+
+        # The straight-through answer feature must have the exact hard forward
+        # numeric value.  A large nonzero value means integration is wrong.
+        st_diff = qbound_aux[
+            "qbound_st_hard_feature_max_abs_diff"
+        ]
+        if not torch.isfinite(st_diff).all():
+            raise RuntimeError(
+                "Q-Bound ST/hard feature diagnostic is non-finite."
+            )
+        if float(st_diff.detach().max().item()) > 1e-5:
+            raise RuntimeError(
+                "Q-Bound training feature no longer matches hard H* in the "
+                "forward pass. This breaks the V2.1 soft/hard contract."
+            )
 
     # ------------------------------------------------------------------
-    # Q-Bound V2.0.0 refine forward
+    # Q-Bound V2.1 refine forward
     # ------------------------------------------------------------------
     def refine_forward(
         self,
@@ -518,12 +671,23 @@ class CRA(nn.Module):
         gsub=None,
         question=None,
         qbound_mix=1.0,
+        answer_only=None,
     ):
         """
-        Refined CRA/Q-Bound V2.0.0 forward.
+        Refined CRA/Q-Bound V2.1 forward.
 
-        ``qbound_mix`` remains only for repository call-signature compatibility.
-        V2.0.0 does not mix CRA and Q-Bound temporal keys.
+        ``answer``
+            Existing CRA [Question SEP Answer] candidates.
+
+        ``answer_only``
+            New V2.1 answer-only candidates.  They NEVER enter Q-BoundCore.
+            When supplied, the wrapper scores hard/soft/training Q-Bound
+            evidence against detached answer-only embeddings and surfaces those
+            logits for the training pipeline.
+
+        ``qbound_mix``
+            Kept only for repository call-signature compatibility. V2.1 does
+            not mix CRA and Q-Bound temporal keys.
         """
         del qbound_mix
 
@@ -536,6 +700,7 @@ class CRA(nn.Module):
         device = video.device
         video_mask = self._move_video_mask(video_mask, device)
 
+        # Existing CRA candidate-QA representation.
         answer_g, _ = self._encode_answers(answer, device)
         batch_size = answer_g.size(0)
         answer_indices = self._prepare_answer_indices(
@@ -544,41 +709,74 @@ class CRA(nn.Module):
             answer_g.device,
         )
 
+        # V2.1 answer-only representation.  It is detached before use in the
+        # temporal-evidence auxiliary branch.
+        answer_only_g, answer_only_tokens = self._encode_answer_only(
+            answer_only,
+            device,
+        )
+        if (
+            answer_only_g is not None
+            and answer_only_g.size(0) != batch_size
+        ):
+            raise ValueError(
+                "answer_only and answer batch sizes do not match."
+            )
+
         video_f = self.video_model(video)
         qsn_gt = None
 
         if mode == "VQ" and answer_indices is not None:
-            qsn_g = self._select_candidate_features(answer_g, answer_indices)
+            qsn_g = self._select_candidate_features(
+                answer_g, answer_indices
+            )
             qsn_gt = qsn_g
         else:
-            # CRA's own reference path keeps its historical candidate-QA
-            # aggregate.  Q-Bound receives a separately encoded question-only
-            # feature below.
+            # Preserve CRA's historical candidate-QA aggregate as its own
+            # reference conditioning. Q-Bound receives question-only tokens.
             qsn_g = answer_g.max(dim=1).values
             if answer_indices is not None:
-                qsn_gt = self._select_candidate_features(answer_g, answer_indices)
+                qsn_gt = self._select_candidate_features(
+                    answer_g, answer_indices
+                )
 
-        use_qbound = bool(self.qbound_enabled and mode == "VQA")
+        use_qbound = bool(
+            self.qbound_enabled and mode == "VQA"
+        )
 
         question_g = None
         question_tokens = None
+        question_mask = None
+
         if use_qbound:
             if question is None:
                 raise ValueError(
-                    "Q-Bound V2.0.0 requires question-only token ids. "
+                    "Q-Bound V2.1 requires question-only token ids. "
                     "Pass question=... through CRA.forward()."
                 )
-            question_g, question_tokens = self._encode_question(question, device)
+
+            (
+                question_g,
+                question_tokens,
+                question_mask,
+            ) = self._encode_question(question, device)
+
             if question_g.size(0) != batch_size:
                 raise ValueError(
                     "Question and answer batch sizes do not match: "
                     f"{question_g.size(0)} vs {batch_size}."
                 )
 
-        # V2.0.0 deliberately uses the global question state in the first
-        # controlled implementation.  Token-level features are exposed in outs
-        # but do not silently change the language model compared with V1.x.
-        question_for_qbound = question_g
+            if self.qbound_require_token_question:
+                if question_tokens is None or question_tokens.ndim != 3:
+                    raise RuntimeError(
+                        "V2.1 requires token-level question features."
+                    )
+
+        # V2.1 uses the token-level question sequence.
+        question_for_qbound = (
+            question_tokens if use_qbound else None
+        )
 
         video_proj, video_attn, time_param = self.decoder(
             video_f,
@@ -586,11 +784,14 @@ class CRA(nn.Module):
             video_mask,
             gsub=gsub,
             do=self.cfgs["model"].get("do", False),
-            window_sizes=self.cfgs["model"].get("window_sizes", [1, 3, 5]),
+            window_sizes=self.cfgs["model"].get(
+                "window_sizes", [1, 3, 5]
+            ),
             use_qbound=use_qbound,
             question_feature=question_for_qbound,
             qbound_video_tokens=(video if use_qbound else None),
             qbound_mix=0.0,
+            question_mask=(question_mask if use_qbound else None),
         )
 
         answer_proj = answer_g
@@ -600,9 +801,12 @@ class CRA(nn.Module):
             else None
         )
 
+        answer_only_proj_detached = None
+        answer_only_logits = {}
+
         if use_qbound:
             time_steps = video.shape[1]
-            self._validate_v200_contract(
+            self._validate_v210_contract(
                 time_param=time_param,
                 qbound_aux=qbound_aux,
                 video_proj=video_proj,
@@ -611,152 +815,105 @@ class CRA(nn.Module):
             )
 
             # ----------------------------------------------------------
-            # Local functional KEEP-vs-MERGE verifier.
+            # Answer-only temporal-evidence supervision interface.
             # ----------------------------------------------------------
-            # This branch is fully stop-gradient and runs only after the V+Q
-            # grounding has already been produced.  It therefore cannot select
-            # or alter Q-Bound's forward grounding.
-            with torch.no_grad():
-                functional = self.decoder.score_functional_composition_pairs(
-                    answer_proj=answer_proj,
-                    qbound_aux=qbound_aux,
-                )
-                equilibrium = self.decoder.score_boundary_equilibrium_views(
-                    answer_proj=answer_proj,
-                    qbound_aux=qbound_aux,
-                )
+            # This branch happens AFTER H(V,Q) has been constructed.  It cannot
+            # affect which segment is proposed in the forward computation.
+            if answer_only_g is not None:
+                answer_only_proj_detached = answer_only_g.detach()
 
-            required_functional = {
-                "functional_keep_answer_logits",
-                "functional_merge_answer_logits",
-                "functional_left_answer_logits",
-                "functional_right_answer_logits",
-                "functional_full_video_answer_logits",
-                "functional_pair_valid_mask",
-                "functional_verifier_stop_gradient",
-                "teacher_distribution_used",
-            }
-            missing = sorted(required_functional.difference(functional))
-            if missing:
-                raise KeyError(
-                    "V2.0.0 functional verifier output is missing: "
-                    + ", ".join(missing)
+                hard_logits = self._score_answer_only(
+                    qbound_aux["qbound_hard_video_proj"],
+                    answer_only_proj_detached,
+                )
+                training_logits = self._score_answer_only(
+                    qbound_aux["qbound_training_video_proj"],
+                    answer_only_proj_detached,
+                )
+                soft_logits = self._score_answer_only(
+                    qbound_aux["qbound_soft_video_proj"],
+                    answer_only_proj_detached,
                 )
 
-            required_equilibrium = {
-                "equilibrium_selected_answer_logits",
-                "equilibrium_trim_left_answer_logits",
-                "equilibrium_trim_right_answer_logits",
-                "equilibrium_expand_left_answer_logits",
-                "equilibrium_expand_right_answer_logits",
-                "equilibrium_trim_left_valid_mask",
-                "equilibrium_trim_right_valid_mask",
-                "equilibrium_expand_left_valid_mask",
-                "equilibrium_expand_right_valid_mask",
-                "equilibrium_verifier_stop_gradient",
-                "teacher_distribution_used",
-            }
-            missing = sorted(required_equilibrium.difference(equilibrium))
-            if missing:
-                raise KeyError(
-                    "V2.0.0 boundary-equilibrium verifier output is missing: "
-                    + ", ".join(missing)
-                )
+                # Training feature has hard forward numerics. These logits
+                # should therefore also agree with hard logits numerically.
+                train_hard_logit_diff = (
+                    training_logits - hard_logits
+                ).abs().amax(dim=-1)
 
-            # Convert verifier outputs to the same grouped answer space used by
-            # the factual VQA scorer.
-            for key in (
-                "functional_keep_answer_logits",
-                "functional_merge_answer_logits",
-                "functional_left_answer_logits",
-                "functional_right_answer_logits",
-                "functional_full_video_answer_logits",
-            ):
-                functional[key] = self._aggregate_prop_logits(functional[key])
+                answer_only_logits = {
+                    "qbound_answer_only_hard_logits": hard_logits,
+                    "qbound_answer_only_training_logits": training_logits,
+                    "qbound_answer_only_soft_logits": soft_logits,
+                    "qbound_answer_only_train_hard_logit_max_abs_diff":
+                        train_hard_logit_diff,
+                    "qbound_answer_only_supervision_available": torch.ones(
+                        (),
+                        dtype=video_proj.dtype,
+                        device=video_proj.device,
+                    ),
+                    "qbound_answer_only_embeddings_stop_gradient": torch.ones(
+                        (),
+                        dtype=video_proj.dtype,
+                        device=video_proj.device,
+                    ),
+                    "qbound_answer_only_affects_segment_forward": torch.zeros(
+                        (),
+                        dtype=video_proj.dtype,
+                        device=video_proj.device,
+                    ),
+                }
 
-            for key in (
-                "equilibrium_selected_answer_logits",
-                "equilibrium_trim_left_answer_logits",
-                "equilibrium_trim_right_answer_logits",
-                "equilibrium_expand_left_answer_logits",
-                "equilibrium_expand_right_answer_logits",
-            ):
-                equilibrium[key] = self._aggregate_prop_logits(equilibrium[key])
-
-            prop_num = int(self.cfgs["model"].get("prop_num", 1))
-            if answer_proj.size(1) % prop_num != 0:
-                raise ValueError(
-                    "Candidate answer count is not divisible by prop_num."
-                )
-            num_candidates = answer_proj.size(1) // prop_num
-
-            expected_pair_shape = (batch_size, time_steps - 1, num_candidates)
-            for key in (
-                "functional_keep_answer_logits",
-                "functional_merge_answer_logits",
-                "functional_left_answer_logits",
-                "functional_right_answer_logits",
-            ):
-                if functional[key].shape != expected_pair_shape:
-                    raise ValueError(
-                        f"{key} must be {expected_pair_shape}, got "
-                        f"{tuple(functional[key].shape)}."
+                if float(
+                    train_hard_logit_diff.detach().max().item()
+                ) > 1e-5:
+                    raise RuntimeError(
+                        "Answer-only training logits no longer match hard "
+                        "forward logits. The V2.1 ST contract is broken."
                     )
+            else:
+                answer_only_logits = {
+                    "qbound_answer_only_supervision_available": torch.zeros(
+                        (),
+                        dtype=video_proj.dtype,
+                        device=video_proj.device,
+                    ),
+                    "qbound_answer_only_embeddings_stop_gradient": torch.ones(
+                        (),
+                        dtype=video_proj.dtype,
+                        device=video_proj.device,
+                    ),
+                    "qbound_answer_only_affects_segment_forward": torch.zeros(
+                        (),
+                        dtype=video_proj.dtype,
+                        device=video_proj.device,
+                    ),
+                }
 
-            expected_view_shape = (batch_size, num_candidates)
-            if functional["functional_full_video_answer_logits"].shape != expected_view_shape:
-                raise ValueError(
-                    "functional_full_video_answer_logits must be "
-                    f"{expected_view_shape}, got "
-                    f"{tuple(functional['functional_full_video_answer_logits'].shape)}."
-                )
-            for key in (
-                "equilibrium_selected_answer_logits",
-                "equilibrium_trim_left_answer_logits",
-                "equilibrium_trim_right_answer_logits",
-                "equilibrium_expand_left_answer_logits",
-                "equilibrium_expand_right_answer_logits",
-            ):
-                if equilibrium[key].shape != expected_view_shape:
-                    raise ValueError(
-                        f"{key} must be {expected_view_shape}, got "
-                        f"{tuple(equilibrium[key].shape)}."
-                    )
+            qbound_aux.update(answer_only_logits)
+            for key, value in answer_only_logits.items():
+                time_param[key] = value
 
-            if self._scalar_flag(functional, "functional_verifier_stop_gradient") != 1.0:
-                raise RuntimeError("Functional verifier unexpectedly carries gradients.")
-            if self._scalar_flag(equilibrium, "equilibrium_verifier_stop_gradient") != 1.0:
-                raise RuntimeError("Boundary-equilibrium verifier unexpectedly carries gradients.")
-            if self._scalar_flag(functional, "teacher_distribution_used") != 0.0:
-                raise RuntimeError("V2.0.0 must not restore a teacher distribution.")
-            if self._scalar_flag(equilibrium, "teacher_distribution_used") != 0.0:
-                raise RuntimeError("V2.0.0 must not restore a teacher distribution.")
-
-            # Store verifier outputs canonically in qbound_aux and time_param.
-            verifier_mapping = {
-                **functional,
-                **equilibrium,
-                "functional_verifier_uses_answer_information": torch.ones(
-                    (), dtype=video_proj.dtype, device=video_proj.device
-                ),
-                "functional_verifier_affects_grounding_forward": torch.zeros(
-                    (), dtype=video_proj.dtype, device=video_proj.device
-                ),
+            # Paper-level invariants.
+            invariants = {
                 "grounding_requires_answer_at_inference": torch.zeros(
-                    (), dtype=video_proj.dtype, device=video_proj.device
+                    (),
+                    dtype=video_proj.dtype,
+                    device=video_proj.device,
                 ),
                 "temporal_gt_used_in_training": torch.zeros(
-                    (), dtype=video_proj.dtype, device=video_proj.device
+                    (),
+                    dtype=video_proj.dtype,
+                    device=video_proj.device,
+                ),
+                "answer_only_used_inside_qbound_core": torch.zeros(
+                    (),
+                    dtype=video_proj.dtype,
+                    device=video_proj.device,
                 ),
             }
-            # Both verifier dicts contain the same zero-valued
-            # teacher_distribution_used key; force one canonical tensor.
-            verifier_mapping["teacher_distribution_used"] = torch.zeros(
-                (), dtype=video_proj.dtype, device=video_proj.device
-            )
-
-            qbound_aux.update(verifier_mapping)
-            for key, value in verifier_mapping.items():
+            qbound_aux.update(invariants)
+            for key, value in invariants.items():
                 time_param[f"qbound_{key}"] = value
 
         # --------------------------------------------------------------
@@ -769,6 +926,7 @@ class CRA(nn.Module):
             "qa_condition": qsn_g,
             "question_condition": question_g,
             "question_tokens": question_tokens,
+            "question_mask": question_mask,
             "question_only_conditioning": torch.as_tensor(
                 question_g is not None,
                 device=video_proj.device,
@@ -780,6 +938,11 @@ class CRA(nn.Module):
             "qbound_active": use_qbound,
             "qbound_version": self.qbound_version,
             "gpeb_active": use_qbound,
+
+            # Keep candidate representations explicit.
+            "answer_proj": answer_proj,
+            "answer_only_proj": answer_only_proj_detached,
+            "answer_only_tokens": answer_only_tokens,
         }
 
         if isinstance(time_param, dict):
@@ -788,114 +951,146 @@ class CRA(nn.Module):
                     outs[key] = value
 
         if isinstance(qbound_aux, dict):
-            # Surface the V2 interfaces directly for the training pipeline.  The
-            # detailed canonical object remains qbound_aux.
             direct_aux_names = (
-                # Composition / anti-collapse diagnostics.
-                "video_boundary_prior_logits",
-                "video_boundary_prior_prob",
-                "question_cut_residual_raw",
-                "question_cut_residual",
-                "functional_cut_logits",
-                "functional_cut_prob",
-                "functional_merge_gate",
-                "hard_cut",
-                "hard_event_index",
-                "hard_event_count",
-                "soft_effective_event_count",
-                "cut_mean",
-                "cut_std",
-                "prior_cut_mean",
-                "question_residual_abs_mean",
-                "one_event_indicator",
-                "all_split_indicator",
-                "functional_pair_valid_mask",
-                # Direct grounding.
-                "start_logits",
-                "end_logits",
-                "start_prob",
-                "end_prob",
-                "start_entropy",
-                "end_entropy",
-                "soft_span_support",
+                # Local/query-conditioned representation.
+                "generic_input_adapter_enabled",
+                "generic_input_token_cosine",
+                "generic_input_delta_ratio",
+                "primitive_states",
+                "delta_magnitude",
+                "accel_magnitude",
+                "relative_position",
+                "query_conditioned_states",
+                "question_interaction_delta_ratio",
+
+                # Query-specific primitive / relation evidence.
+                "node_relevance_raw",
+                "node_relevance",
+                "node_relevance_centered",
+                "adjacent_relation_raw",
+                "adjacent_relation",
+                "adjacent_relation_centered",
+
+                # Segment energy / posterior.
+                "segment_node_support",
+                "segment_relation_support",
+                "segment_boundary_separation",
+                "segment_energy",
+                "segment_logits",
+                "segment_valid_mask",
+                "segment_prob",
+                "segment_entropy",
+                "segment_entropy_ratio",
+                "segment_top1_prob",
+
+                # Soft/hard grounding.
+                "soft_inside_prob",
                 "soft_temporal_prob",
                 "training_temporal_prob",
-                "frame_evidence_logits",
+                "main_temporal_prob",
+                "main_temporal_logits",
+                "main_soft_support",
                 "selected_span_start_frame",
                 "selected_span_end_frame",
                 "selected_span_frame_mask",
                 "selected_span_frame_weights",
                 "selected_span_length",
                 "selected_span_fraction",
-                "selected_pair_score",
-                "main_temporal_prob",
-                "main_temporal_logits",
-                "main_soft_support",
-                # Equilibrium views.
-                "trim_left_frame_weights",
-                "trim_right_frame_weights",
-                "expand_left_frame_weights",
-                "expand_right_frame_weights",
-                "trim_left_valid_mask",
-                "trim_right_valid_mask",
-                "expand_left_valid_mask",
-                "expand_right_valid_mask",
+                "selected_segment_energy",
+                "soft_expected_span_length",
+                "soft_expected_span_fraction",
+
+                # Explicit shortcut diagnostics.
+                "single_frame_prob_mass",
+                "short_span_prob_mass",
+                "selected_single_frame_indicator",
+                "selected_full_video_indicator",
+
                 # Architecture flags.
-                "functional_composition_enabled",
-                "dynamic_event_count_enabled",
+                "latent_segment_composition_enabled",
+                "question_token_interaction_enabled",
+                "segment_energy_enabled",
                 "fixed_event_partition_enabled",
+                "dynamic_event_count_enabled",
                 "event_count_cap_enabled",
+                "cut_field_enabled",
+                "boundary_gated_reasoning_enabled",
+                "independent_endpoint_heads_enabled",
                 "hypothesis_competition_enabled",
                 "teacher_distillation_enabled",
                 "answer_features_used_in_core",
-                "boundary_equilibrium_interface_enabled",
-                # Functional verifier logits.
-                "functional_keep_answer_logits",
-                "functional_merge_answer_logits",
-                "functional_left_answer_logits",
-                "functional_right_answer_logits",
-                "functional_full_video_answer_logits",
-                "functional_verifier_stop_gradient",
-                # Boundary-equilibrium verifier logits.
-                "equilibrium_selected_answer_logits",
-                "equilibrium_trim_left_answer_logits",
-                "equilibrium_trim_right_answer_logits",
-                "equilibrium_expand_left_answer_logits",
-                "equilibrium_expand_right_answer_logits",
-                "equilibrium_trim_left_valid_mask",
-                "equilibrium_trim_right_valid_mask",
-                "equilibrium_expand_left_valid_mask",
-                "equilibrium_expand_right_valid_mask",
-                "equilibrium_verifier_stop_gradient",
-                # Paper-level invariants.
+                "temporal_gt_used_in_core",
+
+                # Local-evidence provenance / features.
+                "qbound_input_is_generic",
+                "qbound_input_uses_cra_embedding",
+                "qbound_answer_evidence_uses_local_tokens",
+                "qbound_answer_evidence_uses_cra_context",
+                "functional_verifier_used",
+                "boundary_equilibrium_used",
                 "teacher_distribution_used",
-                "functional_verifier_uses_answer_information",
-                "functional_verifier_affects_grounding_forward",
+                "qbound_hard_video_proj",
+                "qbound_training_video_proj",
+                "qbound_soft_video_proj",
+                "qbound_st_hard_feature_max_abs_diff",
+
+                # Answer-only auxiliary interface.
+                "qbound_answer_only_hard_logits",
+                "qbound_answer_only_training_logits",
+                "qbound_answer_only_soft_logits",
+                "qbound_answer_only_train_hard_logit_max_abs_diff",
+                "qbound_answer_only_supervision_available",
+                "qbound_answer_only_embeddings_stop_gradient",
+                "qbound_answer_only_affects_segment_forward",
+
+                # Paper-level invariants.
                 "grounding_requires_answer_at_inference",
                 "temporal_gt_used_in_training",
+                "answer_only_used_inside_qbound_core",
             )
             for name in direct_aux_names:
                 if name in qbound_aux:
-                    outs[f"qbound_{name}"] = qbound_aux[name]
+                    outs[name] = qbound_aux[name]
 
-            # Main answer/key aliases for generic repository evaluation.
-            outs["qbound_video_proj"] = qbound_aux.get("qbound_video_proj")
+            # Main answer/key aliases for repository evaluation.
+            outs["qbound_video_proj"] = qbound_aux.get(
+                "qbound_video_proj"
+            )
+            outs["qbound_hard_video_proj"] = qbound_aux.get(
+                "qbound_hard_video_proj"
+            )
+            outs["qbound_soft_video_proj"] = qbound_aux.get(
+                "qbound_soft_video_proj"
+            )
+            outs["qbound_training_video_proj"] = qbound_aux.get(
+                "qbound_training_video_proj"
+            )
+
             outs["qbound_calibrated_video_proj"] = qbound_aux.get(
                 "qbound_video_proj"
             )
             outs["qbound_refined_video_proj"] = qbound_aux.get(
                 "qbound_video_proj"
             )
-            outs["qbound_key"] = qbound_aux.get("qbound_key")
-            outs["qbound_training_key"] = qbound_aux.get("qbound_training_key")
-            outs["qbound_calibrated_key"] = qbound_aux.get("qbound_key")
-            outs["qbound_refined_key"] = qbound_aux.get("qbound_key")
-            outs["cra_video_proj"] = qbound_aux.get("cra_video_proj")
-            outs["cra_key"] = qbound_aux.get("cra_key")
 
-            # Candidate-answer features are exposed only for functional-verifier
-            # diagnostics/bookkeeping.  They never enter QBoundCore.
-            outs["qbound_functional_verifier_answer_proj"] = answer_proj.detach()
+            outs["qbound_key"] = qbound_aux.get("qbound_key")
+            outs["qbound_training_key"] = qbound_aux.get(
+                "qbound_training_key"
+            )
+            outs["qbound_soft_key"] = qbound_aux.get(
+                "qbound_soft_key"
+            )
+            outs["qbound_calibrated_key"] = qbound_aux.get(
+                "qbound_key"
+            )
+            outs["qbound_refined_key"] = qbound_aux.get(
+                "qbound_key"
+            )
+
+            outs["cra_video_proj"] = qbound_aux.get(
+                "cra_video_proj"
+            )
+            outs["cra_key"] = qbound_aux.get("cra_key")
 
         return video_proj, answer_proj, outs
 
@@ -912,8 +1107,11 @@ class CRA(nn.Module):
         gsub=None,
         question=None,
         qbound_mix=1.0,
+        answer_only=None,
     ):
-        del gsub, question, qbound_mix
+        # answer_only is accepted only to keep one repository-level call
+        # signature. The baseline CRA path does not use V2.1 supervision.
+        del gsub, question, qbound_mix, answer_only
 
         mode = mode.upper()
         if mode not in {"VQ", "VQA"}:
@@ -922,9 +1120,13 @@ class CRA(nn.Module):
             )
 
         device = video.device
-        video_mask = self._move_video_mask(video_mask, device)
+        video_mask = self._move_video_mask(
+            video_mask, device
+        )
 
-        answer_g, answer_tokens = self._encode_answers(answer, device)
+        answer_g, answer_tokens = self._encode_answers(
+            answer, device
+        )
         answer_indices = self._prepare_answer_indices(
             answer_id,
             answer_g.size(0),
@@ -933,7 +1135,9 @@ class CRA(nn.Module):
 
         video_f = self.video_model(video)
         if answer_indices is not None:
-            qsn_g = self._select_candidate_features(answer_g, answer_indices)
+            qsn_g = self._select_candidate_features(
+                answer_g, answer_indices
+            )
         else:
             qsn_g = answer_g.max(dim=1).values
 
@@ -951,7 +1155,12 @@ class CRA(nn.Module):
     # ------------------------------------------------------------------
     # Existing weak alignment objective
     # ------------------------------------------------------------------
-    def align_loss(self, qsn, grounding_feature, neg_sample=None):
+    def align_loss(
+        self,
+        qsn,
+        grounding_feature,
+        neg_sample=None,
+    ):
         def _sample_negatives(x_pos, k):
             batch_size, feature_dim = x_pos.size()
             if batch_size < 2:
@@ -969,8 +1178,14 @@ class CRA(nn.Module):
             for index in range(batch_size):
                 candidate_indices = torch.cat(
                     [
-                        torch.arange(0, index, device=x_pos.device),
-                        torch.arange(index + 1, batch_size, device=x_pos.device),
+                        torch.arange(
+                            0, index, device=x_pos.device
+                        ),
+                        torch.arange(
+                            index + 1,
+                            batch_size,
+                            device=x_pos.device,
+                        ),
                     ]
                 )
                 sampled_positions = torch.randint(
@@ -979,33 +1194,60 @@ class CRA(nn.Module):
                     size=(k,),
                     device=x_pos.device,
                 )
-                x_neg[index] = x_pos[candidate_indices[sampled_positions]]
+                x_neg[index] = x_pos[
+                    candidate_indices[sampled_positions]
+                ]
             return x_neg
 
         if neg_sample is None:
-            negative_count = max(1, self.cfgs["dataset"]["batch_size"] // 2)
-            x_neg = _sample_negatives(grounding_feature, negative_count)
+            negative_count = max(
+                1,
+                self.cfgs["dataset"]["batch_size"] // 2,
+            )
+            x_neg = _sample_negatives(
+                grounding_feature,
+                negative_count,
+            )
         else:
             x_neg = neg_sample
 
-        return self._info_nce_loss(qsn, grounding_feature, x_neg)
+        return self._info_nce_loss(
+            qsn,
+            grounding_feature,
+            x_neg,
+        )
 
     @staticmethod
-    def _info_nce_loss(x, x_pos, x_neg, temperature=0.07):
+    def _info_nce_loss(
+        x,
+        x_pos,
+        x_neg,
+        temperature=0.07,
+    ):
         x = F.normalize(x, dim=-1)
         x_pos = F.normalize(x_pos, dim=-1)
         x_neg = F.normalize(x_neg, dim=-1)
 
-        pos_sim = torch.sum(x * x_pos, dim=-1, keepdim=True) / temperature
+        pos_sim = torch.sum(
+            x * x_pos,
+            dim=-1,
+            keepdim=True,
+        ) / temperature
         neg_sim = torch.bmm(
             x.unsqueeze(1),
             x_neg.transpose(1, 2),
         ).squeeze(1) / temperature
 
-        logits = torch.cat([pos_sim, neg_sim], dim=-1)
+        logits = torch.cat(
+            [pos_sim, neg_sim],
+            dim=-1,
+        )
         labels = torch.zeros(
             x.size(0),
             dtype=torch.long,
             device=x.device,
         )
-        return F.cross_entropy(logits, labels)
+        return F.cross_entropy(
+            logits,
+            labels,
+        )

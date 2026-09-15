@@ -1,3 +1,4 @@
+
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -7,70 +8,95 @@ import torch.nn.functional as F
 
 class QBoundCore(nn.Module):
     """
-    Q-Bound V2.0.0 -- Query-Adaptive Functional Temporal Composition.
+    Q-Bound V2.1.0 -- Query-Conditioned Latent Segment Composition.
 
-    Scientific reset from V1.x
+    Scientific motivation
+    ---------------------
+    V2.0 coupled predicted temporal cuts to information propagation.  The QA
+    objective could therefore improve simply by closing cuts, producing the
+    observed one-event collapse.  V2.0 also used independent start/end heads,
+    which admitted a second shortcut: both endpoints could collapse onto one
+    highly discriminative frame, producing micro-spans and a large soft/hard
+    grounding gap.
+
+    V2.1 removes both mechanisms.
+
+    Core hypothesis
+    ---------------
+        Events are not pre-partitioned from the whole video.  A query-specific
+        evidence event is composed from local temporal primitives according to
+
+          (1) primitive relevance to the question,
+          (2) coherence between adjacent primitives,
+          (3) separation from neighboring primitives.
+
+    V2.1 deliberately avoids both raw-sum and simple-mean span scoring:
+        - a raw sum structurally favors long spans;
+        - a simple mean has a dangerous opposite bias: the maximum mean over
+          all contiguous spans is attained by a single maximum-scoring token.
+
+    Instead, V2.1 centers node/edge evidence within each video and accumulates
+    it with sqrt(length) normalization.  A coherent run of positive evidence
+    can therefore beat a singleton, while adding irrelevant/negative evidence
+    hurts the segment.  This is a scale-neutral structural choice rather than
+    a target-duration prior.
+
+    Importantly, temporal structure NEVER gates the primitive encoder.  The
+    model first builds local frame/clip primitives, injects question semantics,
+    then scores all variable-length contiguous segments using one shared energy
+    function E(s,e).
+
+    Input
+    -----
+        video_tokens:
+            [B, T, D], expected to be temporally local frozen visual features
+            (for the current CRA/NExT-GQA testbed: CLIP-L frame features).
+
+        question_features:
+            [B, D] or [B, L, D].
+            V2.1 prefers token-level [B,L,D] features.
+
+        video_mask:
+            optional [B,T] boolean / 0-1 mask.
+
+        question_mask:
+            optional [B,L] boolean / 0-1 mask.  If omitted, every supplied
+            question feature is treated as valid.
+
+    Output
+    ------
+        - local primitive states and query-conditioned primitive states;
+        - node relevance u_t;
+        - adjacent relation/cohesion r_t;
+        - segment_energy / segment_prob over all s <= e;
+        - a hard segment H* = argmax E(s,e);
+        - a soft differentiable inside distribution derived from the SAME
+          segment energy;
+        - a straight-through temporal distribution whose forward value is the
+          hard segment and whose backward path follows the soft segment model.
+
+    Weak-supervision contract
     -------------------------
-    V1.x committed to a discrete event partition before grounding, then tried
-    to repair errors with event reasoning, span composition/refinement, or
-    hypothesis ranking.  V2.0.0 removes that assumption.
+    The core receives NO answer candidates, NO GT answer and NO temporal GT.
+    Answer-only candidates may supervise the selected evidence downstream, but
+    they must never enter this segment scorer.
 
-    The core hypothesis is:
-
-        video tells us where temporal change may happen;
-        the question tells us which changes matter.
-
-    Therefore the core learns a *soft cut field* over adjacent temporal tokens
-    instead of a fixed event list.  The number of query-specific latent events
-    is emergent and is never capped by ``max_events``.
-
-    Main path
-    ---------
-        generic video tokens
-            -> temporal dynamics encoder
-            -> video-only structural boundary prior
-            -> bounded question-conditioned cut residual
-            -> query-specific soft cut field
-            -> boundary-gated temporal reasoning
-            -> factorized start/end grounding
-            -> exact hard span H* using an O(T) decoder
-
-    The cut field is not an auxiliary branch.  It directly gates temporal
-    information flow before the grounding head, so there is no raw-video bypass
-    around composition.
-
-    Weak supervision contract
-    -------------------------
-    This core never receives answer candidates, the ground-truth answer, or
-    temporal ground truth.  The downstream training pipeline may use the GT
-    answer to construct a stop-gradient functional KEEP-vs-MERGE target for
-    each valid adjacent pair.  To support that training objective, the core
-    exposes the learned cut field; the downstream CRA consumer provides the
-    detached answer-space KEEP/MERGE consequence signal.
-
-    Temporal GT remains evaluation-only.
-
-    Anti-collapse design
-    --------------------
-    V2.0.0 intentionally has no event-count loss, no minimum event count, and
-    no maximum event count.  Collapse is addressed mechanistically:
-
-      1) a video-only dynamics prior anchors temporal structure;
-      2) the question can only modify that prior through a bounded residual;
-      3) the final cut field causally controls temporal information flow;
-      4) a downstream functional composition loss supervises whether merging
-         an adjacent distinction damages question-answer evidence.
-
-    One event is allowed when it is truly sufficient.  Dataset-wide one-event
-    collapse is therefore detectable but not forbidden by an arbitrary count
-    target.
+    No V2.0 mechanisms are retained:
+        - no cut field;
+        - no cut-gated information propagation;
+        - no event-count objective;
+        - no independent start/end heads;
+        - no functional KEEP/MERGE verifier;
+        - no boundary-equilibrium objective;
+        - no teacher distribution.
 
     Complexity
     ----------
-    Composition decisions are only made between adjacent temporal tokens, so
-    the cut field is O(T).  Long-range reasoning uses a small constant number
-    of adjacent temporal states, giving O(T) temporal reasoning rather
-    than O(T^2) event interactions. The final factorized span decoder is O(T).
+    Primitive encoding and text interaction are O(TL).
+    Segment energy materialization is O(T^2).  For NExT-GQA T=32, this is only
+    528 valid contiguous segments and, unlike V1.12, they are NOT independent
+    semantic hypothesis objects: every score is analytically composed from the
+    same T node scores and T-1 adjacent-relation scores.
     """
 
     def __init__(
@@ -80,11 +106,11 @@ class QBoundCore(nn.Module):
         dropout: float = 0.1,
         use_generic_input_adapter: bool = True,
         input_adapter_dropout: Optional[float] = None,
-        input_adapter_use_position: bool = True,
-        cut_temperature: float = 1.0,
-        cut_threshold: float = 0.5,
-        question_residual_scale: float = 1.0,
-        num_local_reasoning_layers: int = 2,
+        num_question_heads: int = 4,
+        question_ff_multiplier: int = 2,
+        segment_temperature: float = 1.0,
+        relation_weight: float = 0.50,
+        boundary_weight: float = 0.25,
     ) -> None:
         super().__init__()
 
@@ -96,34 +122,35 @@ class QBoundCore(nn.Module):
             input_adapter_dropout = dropout
         if not 0.0 <= float(input_adapter_dropout) < 1.0:
             raise ValueError("input_adapter_dropout must be in [0, 1).")
-        if cut_temperature <= 0.0:
-            raise ValueError("cut_temperature must be positive.")
-        if not 0.0 < cut_threshold < 1.0:
-            raise ValueError("cut_threshold must be in (0, 1).")
-        if question_residual_scale <= 0.0:
-            raise ValueError("question_residual_scale must be positive.")
-        if num_local_reasoning_layers < 1:
-            raise ValueError("num_local_reasoning_layers must be >= 1.")
+        if num_question_heads < 1 or hidden_dim % num_question_heads != 0:
+            raise ValueError(
+                "hidden_dim must be divisible by num_question_heads."
+            )
+        if question_ff_multiplier < 1:
+            raise ValueError("question_ff_multiplier must be >= 1.")
+        if segment_temperature <= 0.0:
+            raise ValueError("segment_temperature must be positive.")
+        if relation_weight < 0.0:
+            raise ValueError("relation_weight must be non-negative.")
+        if boundary_weight < 0.0:
+            raise ValueError("boundary_weight must be non-negative.")
 
         self.input_dim = int(input_dim)
         self.hidden_dim = int(hidden_dim)
-        self.qbound_version = "2.0.0"
+        self.qbound_version = "2.1.0"
 
         self.use_generic_input_adapter = bool(use_generic_input_adapter)
-        self.input_adapter_use_position = bool(input_adapter_use_position)
         self.input_adapter_dropout_p = float(input_adapter_dropout)
-        self.cut_temperature = float(cut_temperature)
-        self.cut_threshold = float(cut_threshold)
-        self.question_residual_scale = float(question_residual_scale)
-        self.num_local_reasoning_layers = int(num_local_reasoning_layers)
+        self.num_question_heads = int(num_question_heads)
+        self.segment_temperature = float(segment_temperature)
+        self.relation_weight = float(relation_weight)
+        self.boundary_weight = float(boundary_weight)
 
         # ------------------------------------------------------------------
-        # 0. Generic input adapter.
+        # 0. Generic visual input adapter.
         # ------------------------------------------------------------------
-        # ``content_tokens`` are kept position-free for temporal-change
-        # measurement.  Positional encoding is added only to the reasoning
-        # stream, avoiding a deterministic sinusoidal difference contaminating
-        # the video-only dynamics prior.
+        # This is point-wise across time.  It cannot mix information between
+        # temporal positions and therefore cannot create fake local grounding.
         self.generic_input_proj = nn.Linear(input_dim, input_dim)
         self.generic_input_gelu = nn.GELU()
         self.generic_input_norm = nn.LayerNorm(input_dim, eps=1e-12)
@@ -136,8 +163,11 @@ class QBoundCore(nn.Module):
         nn.init.zeros_(self.generic_input_proj.bias)
 
         # ------------------------------------------------------------------
-        # 1. Temporal dynamics encoder.
+        # 1. LOCAL primitive encoder.
         # ------------------------------------------------------------------
+        # No temporal self-attention and no recurrent global scan are allowed
+        # before segment selection.  Each primitive sees only its own visual
+        # feature and local first-/second-order temporal changes.
         self.state_proj = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -150,163 +180,82 @@ class QBoundCore(nn.Module):
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
         )
-        self.dynamics_fuse = nn.Sequential(
-            nn.Linear(hidden_dim * 3, hidden_dim),
+        # Relative time is an explicit local feature.  It gives the model an
+        # order cue for words such as before/after without mixing video tokens.
+        self.position_proj = nn.Sequential(
+            nn.Linear(1, hidden_dim),
+            nn.Tanh(),
+        )
+        self.primitive_fuse = nn.Sequential(
+            nn.Linear(hidden_dim * 4, hidden_dim),
             nn.GELU(),
             nn.LayerNorm(hidden_dim),
             nn.Dropout(dropout),
         )
 
         # ------------------------------------------------------------------
-        # 2. Video-only structural boundary prior.
+        # 2. Token-level question injection.
         # ------------------------------------------------------------------
-        # The prior has no question input.  It sees adjacent dynamics states and
-        # explicit first-/second-order motion magnitudes.
-        prior_input_dim = hidden_dim * 4 + 2
-        self.video_boundary_encoder = nn.Sequential(
-            nn.Linear(prior_input_dim, hidden_dim),
-            nn.GELU(),
-            nn.LayerNorm(hidden_dim),
-            nn.Dropout(dropout),
-        )
-        self.video_boundary_score = nn.Linear(hidden_dim, 1)
-        nn.init.normal_(self.video_boundary_score.weight, mean=0.0, std=2e-2)
-        nn.init.zeros_(self.video_boundary_score.bias)
-
-        # ------------------------------------------------------------------
-        # 3. Question-conditioned functional composition residual.
-        # ------------------------------------------------------------------
-        self.question_proj = nn.Sequential(
+        # Every visual primitive independently attends to the question tokens.
+        # There is still no visual-to-visual communication here.
+        self.question_token_proj = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
         )
+        self.visual_to_question_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=self.num_question_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.question_cross_norm = nn.LayerNorm(hidden_dim)
+        ff_dim = hidden_dim * int(question_ff_multiplier)
+        self.question_ff = nn.Sequential(
+            nn.Linear(hidden_dim, ff_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ff_dim, hidden_dim),
+            nn.Dropout(dropout),
+        )
+        self.question_ff_norm = nn.LayerNorm(hidden_dim)
 
-        # left, right, |right-left|, left*right, q, left*q, right*q +
-        # video-prior logit + local dynamics magnitude.
-        composer_input_dim = hidden_dim * 7 + 2
-        self.functional_composer = nn.Sequential(
-            nn.Linear(composer_input_dim, hidden_dim),
+        # ------------------------------------------------------------------
+        # 3. Primitive relevance u_t.
+        # ------------------------------------------------------------------
+        # query-conditioned primitive, global q, interaction, dynamics, time.
+        node_input_dim = hidden_dim * 3 + 3
+        self.node_encoder = nn.Sequential(
+            nn.Linear(node_input_dim, hidden_dim),
             nn.GELU(),
             nn.LayerNorm(hidden_dim),
             nn.Dropout(dropout),
         )
-        self.question_cut_residual = nn.Linear(hidden_dim, 1)
-        # Start from the video-only prior.  Question-specific composition must
-        # be learned rather than dominating from the first iteration.
-        nn.init.zeros_(self.question_cut_residual.weight)
-        nn.init.zeros_(self.question_cut_residual.bias)
+        self.node_score = nn.Linear(hidden_dim, 1)
 
         # ------------------------------------------------------------------
-        # 4. Boundary-gated local temporal reasoning.
+        # 4. Adjacent relation/cohesion r_t.
         # ------------------------------------------------------------------
-        scan_input_dim = hidden_dim * 4
-        self.forward_scan_updates = nn.ModuleList()
-        self.forward_scan_gates = nn.ModuleList()
-        self.forward_scan_norms = nn.ModuleList()
-        self.backward_scan_updates = nn.ModuleList()
-        self.backward_scan_gates = nn.ModuleList()
-        self.backward_scan_norms = nn.ModuleList()
-
-        for _ in range(self.num_local_reasoning_layers):
-            self.forward_scan_updates.append(
-                nn.Sequential(
-                    nn.Linear(scan_input_dim, hidden_dim),
-                    nn.GELU(),
-                    nn.Dropout(dropout),
-                    nn.Linear(hidden_dim, hidden_dim),
-                )
-            )
-            self.forward_scan_gates.append(
-                nn.Sequential(
-                    nn.Linear(hidden_dim * 3, hidden_dim),
-                    nn.GELU(),
-                    nn.Linear(hidden_dim, 1),
-                )
-            )
-            self.forward_scan_norms.append(nn.LayerNorm(hidden_dim))
-
-            self.backward_scan_updates.append(
-                nn.Sequential(
-                    nn.Linear(scan_input_dim, hidden_dim),
-                    nn.GELU(),
-                    nn.Dropout(dropout),
-                    nn.Linear(hidden_dim, hidden_dim),
-                )
-            )
-            self.backward_scan_gates.append(
-                nn.Sequential(
-                    nn.Linear(hidden_dim * 3, hidden_dim),
-                    nn.GELU(),
-                    nn.Linear(hidden_dim, 1),
-                )
-            )
-            self.backward_scan_norms.append(nn.LayerNorm(hidden_dim))
-
-        self.local_reasoning_fuse = nn.Sequential(
-            nn.Linear(hidden_dim * 5, hidden_dim),
+        # A positive relation means "these adjacent primitives coherently belong
+        # together for this question"; a negative relation is boundary evidence.
+        edge_input_dim = hidden_dim * 5 + 4
+        self.edge_encoder = nn.Sequential(
+            nn.Linear(edge_input_dim, hidden_dim),
             nn.GELU(),
             nn.LayerNorm(hidden_dim),
             nn.Dropout(dropout),
         )
+        self.edge_score = nn.Linear(hidden_dim, 1)
 
-        # ------------------------------------------------------------------
-        # 5. Final normalization after boundary-gated local reasoning.
-        # ------------------------------------------------------------------
-        # V2.0.0 deliberately has NO global video-attention/anchor bypass here.
-        # Every temporal interaction before grounding must cross the learned
-        # merge gates, otherwise the model could ignore functional composition.
-        self.reasoning_norm = nn.LayerNorm(hidden_dim)
-
-        # ------------------------------------------------------------------
-        # 6. Direct frame-exact grounding.  No 528-hypothesis bank.
-        # ------------------------------------------------------------------
-        # reasoned, q, reasoned*q + left cut, right cut, local dynamics.
-        endpoint_input_dim = hidden_dim * 3 + 3
-        self.endpoint_encoder = nn.Sequential(
-            nn.Linear(endpoint_input_dim, hidden_dim),
-            nn.GELU(),
-            nn.LayerNorm(hidden_dim),
-            nn.Dropout(dropout),
-        )
-        self.start_score = nn.Linear(hidden_dim, 1)
-        self.end_score = nn.Linear(hidden_dim, 1)
-        self.frame_evidence_score = nn.Linear(hidden_dim, 1)
-        for head in (self.start_score, self.end_score, self.frame_evidence_score):
-            nn.init.normal_(head.weight, mean=0.0, std=1e-2)
-            nn.init.zeros_(head.bias)
+        nn.init.normal_(self.node_score.weight, mean=0.0, std=1e-2)
+        nn.init.zeros_(self.node_score.bias)
+        nn.init.normal_(self.edge_score.weight, mean=0.0, std=1e-2)
+        nn.init.zeros_(self.edge_score.bias)
 
     # ------------------------------------------------------------------
     # Generic helpers
     # ------------------------------------------------------------------
     @staticmethod
-    def _sinusoidal_position_encoding(
-        time_steps: int,
-        feature_dim: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        position = torch.arange(
-            time_steps, device=device, dtype=torch.float32
-        ).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(
-                0, feature_dim, 2, device=device, dtype=torch.float32
-            )
-            * (-torch.log(torch.tensor(10000.0, device=device)) / feature_dim)
-        )
-
-        pe = torch.zeros(
-            time_steps, feature_dim, device=device, dtype=torch.float32
-        )
-        pe[:, 0::2] = torch.sin(position * div_term)
-        if feature_dim > 1:
-            pe[:, 1::2] = torch.cos(
-                position * div_term[: pe[:, 1::2].shape[1]]
-            )
-        return pe.unsqueeze(0).to(dtype=dtype)
-
-    @staticmethod
-    def _normalize_mask(
+    def _normalize_video_mask(
         mask: Optional[torch.Tensor],
         batch_size: int,
         time_steps: int,
@@ -319,6 +268,7 @@ class QBoundCore(nn.Module):
 
         while mask.ndim > 2 and mask.size(1) == 1:
             mask = mask.squeeze(1)
+
         if mask.ndim != 2 or mask.shape != (batch_size, time_steps):
             raise ValueError(
                 "video_mask must reduce to [B,T]; expected "
@@ -330,17 +280,54 @@ class QBoundCore(nn.Module):
             raise ValueError("Every sample must contain at least one valid video token.")
         return mask
 
-    @staticmethod
-    def _masked_softmax(
-        logits: torch.Tensor,
-        mask: torch.Tensor,
-        dim: int,
-    ) -> torch.Tensor:
-        mask = mask.bool()
-        masked_logits = logits.masked_fill(~mask, -1e4)
-        weights = torch.softmax(masked_logits, dim=dim)
-        weights = weights * mask.to(weights.dtype)
-        return weights / weights.sum(dim=dim, keepdim=True).clamp_min(1e-6)
+    def _normalize_question_features(
+        self,
+        question_features: torch.Tensor,
+        question_mask: Optional[torch.Tensor],
+        batch_size: int,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if question_features.ndim == 2:
+            if question_features.shape != (batch_size, self.input_dim):
+                raise ValueError(
+                    "2-D question_features must be [B,D]; expected "
+                    f"{(batch_size, self.input_dim)}, got "
+                    f"{tuple(question_features.shape)}."
+                )
+            question_features = question_features.unsqueeze(1)
+
+        if question_features.ndim != 3:
+            raise ValueError(
+                "question_features must be [B,D] or [B,L,D]."
+            )
+        if question_features.size(0) != batch_size:
+            raise ValueError("Video/question batch sizes do not match.")
+        if question_features.size(-1) != self.input_dim:
+            raise ValueError(
+                f"Expected question feature dim {self.input_dim}, got "
+                f"{question_features.size(-1)}."
+            )
+
+        q_len = question_features.size(1)
+        if question_mask is None:
+            q_mask = torch.ones(
+                batch_size, q_len, dtype=torch.bool, device=device
+            )
+        else:
+            while question_mask.ndim > 2 and question_mask.size(1) == 1:
+                question_mask = question_mask.squeeze(1)
+            if question_mask.ndim != 2 or question_mask.shape != (batch_size, q_len):
+                raise ValueError(
+                    "question_mask must reduce to [B,L]; expected "
+                    f"{(batch_size, q_len)}, got {tuple(question_mask.shape)}."
+                )
+            q_mask = question_mask.bool()
+            if not torch.all(q_mask.any(dim=-1)):
+                raise ValueError(
+                    "Every sample must contain at least one valid question token."
+                )
+
+        return question_features, q_mask
 
     @staticmethod
     def _masked_mean(
@@ -358,445 +345,18 @@ class QBoundCore(nn.Module):
     @staticmethod
     def _entropy_from_distribution(
         distribution: torch.Tensor,
-        dim: int,
-    ) -> torch.Tensor:
-        return -torch.sum(
-            distribution * torch.log(distribution.clamp_min(1e-8)), dim=dim
+        mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        p = distribution * mask.to(distribution.dtype)
+        entropy = -(p * torch.log(p.clamp_min(1e-8))).sum(dim=(-2, -1))
+        valid_count = mask.sum(dim=(-2, -1)).to(distribution.dtype).clamp_min(1.0)
+        max_entropy = torch.log(valid_count.clamp_min(2.0))
+        ratio = torch.where(
+            valid_count > 1.0,
+            entropy / max_entropy.clamp_min(1e-6),
+            torch.zeros_like(entropy),
         )
-
-    def _summarize_question(self, question_features: torch.Tensor) -> torch.Tensor:
-        """
-        Accept [B,D] or [B,L,D].  V2.0.0 keeps the core interface generic.
-
-        Token-level question reasoning can be introduced later at the wrapper
-        level without changing the temporal-composition contract.  For the first
-        V2 implementation we deliberately keep one question state so that gains
-        can be attributed to temporal composition rather than a new language
-        encoder.
-        """
-        if question_features.ndim < 2:
-            raise ValueError("question_features must have at least 2 dimensions.")
-        if question_features.size(-1) != self.input_dim:
-            raise ValueError(
-                f"Expected final question dimension {self.input_dim}, got "
-                f"{question_features.size(-1)}."
-            )
-        if question_features.ndim == 2:
-            return question_features
-
-        batch_size = question_features.size(0)
-        tokens = question_features.reshape(batch_size, -1, self.input_dim)
-        return tokens.mean(dim=1)
-
-    def _adapt_generic_video_tokens(
-        self,
-        video_tokens: torch.Tensor,
-        video_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
-        """
-        Return:
-          reasoning_tokens: [B,T,D], with optional temporal position;
-          content_tokens:   [B,T,D], position-free for dynamics measurement;
-          diagnostics.
-        """
-        mask_f = video_mask.to(video_tokens.dtype).unsqueeze(-1)
-        raw_masked = video_tokens * mask_f
-
-        if self.use_generic_input_adapter:
-            content = self.generic_input_proj(video_tokens)
-            content = self.generic_input_gelu(content)
-            content = self.generic_input_norm(content)
-        else:
-            content = video_tokens
-        content = content * mask_f
-
-        reasoning = content
-        if self.input_adapter_use_position:
-            position = self._sinusoidal_position_encoding(
-                time_steps=video_tokens.size(1),
-                feature_dim=video_tokens.size(2),
-                device=video_tokens.device,
-                dtype=video_tokens.dtype,
-            )
-            reasoning = reasoning + position * mask_f
-        reasoning = self.generic_input_dropout(reasoning) * mask_f
-
-        valid_count = video_mask.sum(dim=-1).to(video_tokens.dtype).clamp_min(1.0)
-        feature_count = float(video_tokens.size(-1))
-        raw_rms = torch.sqrt(
-            raw_masked.pow(2).sum(dim=(1, 2))
-            / (valid_count * feature_count).clamp_min(1.0)
-            + 1e-8
-        )
-        adapted_rms = torch.sqrt(
-            reasoning.pow(2).sum(dim=(1, 2))
-            / (valid_count * feature_count).clamp_min(1.0)
-            + 1e-8
-        )
-
-        raw_unit = F.normalize(raw_masked, p=2, dim=-1)
-        content_unit = F.normalize(content, p=2, dim=-1)
-        token_cos = (raw_unit * content_unit).sum(dim=-1)
-        token_cos = (
-            token_cos * video_mask.to(token_cos.dtype)
-        ).sum(dim=-1) / valid_count
-
-        delta = (content - raw_masked) * mask_f
-        delta_norm = torch.linalg.vector_norm(delta, dim=-1)
-        raw_norm = torch.linalg.vector_norm(raw_masked, dim=-1)
-        delta_ratio = (
-            delta_norm * video_mask.to(delta_norm.dtype)
-        ).sum(dim=-1) / (
-            (raw_norm * video_mask.to(raw_norm.dtype))
-            .sum(dim=-1)
-            .clamp_min(1e-6)
-        )
-
-        return reasoning, content, {
-            "generic_input_raw_rms": raw_rms,
-            "generic_input_adapted_rms": adapted_rms,
-            "generic_input_token_cosine": token_cos,
-            "generic_input_delta_ratio": delta_ratio,
-        }
-
-    # ------------------------------------------------------------------
-    # 1. Temporal dynamics
-    # ------------------------------------------------------------------
-    def _encode_temporal_dynamics(
-        self,
-        reasoning_tokens: torch.Tensor,
-        content_tokens: torch.Tensor,
-        video_mask: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
-        batch_size, time_steps, _ = content_tokens.shape
-        mask_f = video_mask.to(content_tokens.dtype).unsqueeze(-1)
-
-        first_delta = torch.zeros_like(content_tokens)
-        if time_steps > 1:
-            edge_valid = video_mask[:, 1:] & video_mask[:, :-1]
-            first_delta[:, 1:] = content_tokens[:, 1:] - content_tokens[:, :-1]
-            first_delta[:, 1:] = (
-                first_delta[:, 1:]
-                * edge_valid.to(content_tokens.dtype).unsqueeze(-1)
-            )
-
-        second_delta = torch.zeros_like(content_tokens)
-        if time_steps > 2:
-            second_valid = (
-                video_mask[:, 2:]
-                & video_mask[:, 1:-1]
-                & video_mask[:, :-2]
-            )
-            second_delta[:, 2:] = first_delta[:, 2:] - first_delta[:, 1:-1]
-            second_delta[:, 2:] = (
-                second_delta[:, 2:]
-                * second_valid.to(content_tokens.dtype).unsqueeze(-1)
-            )
-
-        state_h = self.state_proj(reasoning_tokens)
-        delta_h = self.delta_proj(first_delta)
-        accel_h = self.accel_proj(second_delta)
-        dynamics_states = self.dynamics_fuse(
-            torch.cat([state_h, delta_h, accel_h], dim=-1)
-        )
-        dynamics_states = dynamics_states * mask_f
-
-        scale = float(max(self.input_dim, 1)) ** 0.5
-        delta_magnitude = torch.linalg.vector_norm(first_delta, dim=-1) / scale
-        accel_magnitude = torch.linalg.vector_norm(second_delta, dim=-1) / scale
-        delta_magnitude = delta_magnitude * video_mask.to(delta_magnitude.dtype)
-        accel_magnitude = accel_magnitude * video_mask.to(accel_magnitude.dtype)
-
-        return {
-            "dynamics_states": dynamics_states,
-            "first_delta": first_delta,
-            "second_delta": second_delta,
-            "delta_magnitude": delta_magnitude,
-            "accel_magnitude": accel_magnitude,
-        }
-
-    # ------------------------------------------------------------------
-    # 2-3. Video prior + question-conditioned functional cut field
-    # ------------------------------------------------------------------
-    def _build_functional_cut_field(
-        self,
-        dynamics_states: torch.Tensor,
-        delta_magnitude: torch.Tensor,
-        accel_magnitude: torch.Tensor,
-        question_state: torch.Tensor,
-        video_mask: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
-        batch_size, time_steps, _ = dynamics_states.shape
-        boundary_mask = video_mask[:, :-1] & video_mask[:, 1:]
-
-        left = dynamics_states[:, :-1]
-        right = dynamics_states[:, 1:]
-        edge_delta = delta_magnitude[:, 1:]
-        edge_accel = accel_magnitude[:, 1:]
-
-        prior_features = torch.cat(
-            [
-                left,
-                right,
-                torch.abs(right - left),
-                left * right,
-                edge_delta.unsqueeze(-1),
-                edge_accel.unsqueeze(-1),
-            ],
-            dim=-1,
-        )
-        prior_hidden = self.video_boundary_encoder(prior_features)
-        prior_logits_raw = self.video_boundary_score(prior_hidden).squeeze(-1)
-        prior_logits = prior_logits_raw.masked_fill(~boundary_mask, 0.0)
-        prior_prob = torch.sigmoid(prior_logits / self.cut_temperature)
-        prior_prob = prior_prob * boundary_mask.to(prior_prob.dtype)
-
-        q_edge = question_state.unsqueeze(1).expand(-1, time_steps - 1, -1)
-        local_variation = (edge_delta + 0.5 * edge_accel).unsqueeze(-1)
-        composer_features = torch.cat(
-            [
-                left,
-                right,
-                torch.abs(right - left),
-                left * right,
-                q_edge,
-                left * q_edge,
-                right * q_edge,
-                prior_logits.unsqueeze(-1),
-                local_variation,
-            ],
-            dim=-1,
-        )
-        composer_hidden = self.functional_composer(composer_features)
-        residual_raw = self.question_cut_residual(composer_hidden).squeeze(-1)
-        residual_bounded = self.question_residual_scale * torch.tanh(residual_raw)
-        residual_bounded = residual_bounded * boundary_mask.to(residual_bounded.dtype)
-
-        # Video prior anchors the topology.  Question semantics can modify but
-        # cannot arbitrarily replace it in one step because the residual is
-        # bounded in logit space.
-        cut_logits = prior_logits + residual_bounded
-        cut_prob = torch.sigmoid(cut_logits / self.cut_temperature)
-        cut_prob = cut_prob * boundary_mask.to(cut_prob.dtype)
-
-        hard_cut = (cut_prob >= self.cut_threshold) & boundary_mask
-        hard_event_index = F.pad(
-            torch.cumsum(hard_cut.long(), dim=-1), (1, 0), value=0
-        )
-        hard_event_index = hard_event_index * video_mask.long()
-
-        valid_edge_count = boundary_mask.sum(dim=-1).to(cut_prob.dtype).clamp_min(1.0)
-        cut_mean = cut_prob.sum(dim=-1) / valid_edge_count
-        prior_cut_mean = prior_prob.sum(dim=-1) / valid_edge_count
-        residual_abs_mean = residual_bounded.abs().sum(dim=-1) / valid_edge_count
-
-        centered = (cut_prob - cut_mean.unsqueeze(-1)) * boundary_mask.to(cut_prob.dtype)
-        cut_std = torch.sqrt(
-            centered.pow(2).sum(dim=-1) / valid_edge_count + 1e-8
-        )
-
-        hard_event_count = 1.0 + hard_cut.sum(dim=-1).to(cut_prob.dtype)
-        soft_event_count = 1.0 + cut_prob.sum(dim=-1)
-        valid_token_count = video_mask.sum(dim=-1).to(cut_prob.dtype)
-        one_event_indicator = (hard_event_count <= 1.0 + 1e-6).to(cut_prob.dtype)
-        all_split_indicator = (
-            hard_event_count >= valid_token_count.clamp_min(1.0) - 1e-6
-        ).to(cut_prob.dtype)
-
-        return {
-            "boundary_mask": boundary_mask,
-            "video_boundary_prior_logits": prior_logits,
-            "video_boundary_prior_prob": prior_prob,
-            "question_cut_residual_raw": residual_raw,
-            "question_cut_residual": residual_bounded,
-            "functional_cut_logits": cut_logits,
-            "functional_cut_prob": cut_prob,
-            "functional_merge_gate": (1.0 - cut_prob)
-            * boundary_mask.to(cut_prob.dtype),
-            "hard_cut": hard_cut,
-            "hard_event_index": hard_event_index,
-            "hard_event_count": hard_event_count,
-            "soft_effective_event_count": soft_event_count,
-            "cut_mean": cut_mean,
-            "cut_std": cut_std,
-            "prior_cut_mean": prior_cut_mean,
-            "question_residual_abs_mean": residual_abs_mean,
-            "one_event_indicator": one_event_indicator,
-            "all_split_indicator": all_split_indicator,
-        }
-
-    # ------------------------------------------------------------------
-    # 4. Boundary-gated local scans
-    # ------------------------------------------------------------------
-    def _single_direction_scan(
-        self,
-        states: torch.Tensor,
-        question_state: torch.Tensor,
-        merge_gate: torch.Tensor,
-        video_mask: torch.Tensor,
-        update_module: nn.Module,
-        gate_module: nn.Module,
-        norm_module: nn.Module,
-        reverse: bool,
-    ) -> torch.Tensor:
-        """
-        O(T) recurrent information propagation.
-
-        ``merge_gate[t] = 1 - cut_prob[t]`` controls whether information can
-        cross the edge between t and t+1.  This is the causal point at which the
-        composition field changes the representation used by grounding.
-        """
-        batch_size, time_steps, hidden_dim = states.shape
-        if time_steps == 1:
-            return states
-
-        output = torch.zeros_like(states)
-        q = question_state
-
-        if not reverse:
-            indices = range(time_steps)
-            previous = None
-            for t in indices:
-                current = states[:, t]
-                valid = video_mask[:, t]
-                if previous is None:
-                    new_state = current
-                else:
-                    structural_gate = merge_gate[:, t - 1]
-                    local_input = torch.cat(
-                        [current, previous, current * previous, q], dim=-1
-                    )
-                    message = update_module(local_input)
-                    learned_gate = torch.sigmoid(
-                        gate_module(
-                            torch.cat([current, previous, q], dim=-1)
-                        ).squeeze(-1)
-                    )
-                    gate = structural_gate * learned_gate
-                    new_state = norm_module(current + gate.unsqueeze(-1) * message)
-                new_state = new_state * valid.to(new_state.dtype).unsqueeze(-1)
-                output[:, t] = new_state
-                previous = new_state
-        else:
-            indices = range(time_steps - 1, -1, -1)
-            previous = None
-            for t in indices:
-                current = states[:, t]
-                valid = video_mask[:, t]
-                if previous is None:
-                    new_state = current
-                else:
-                    structural_gate = merge_gate[:, t]
-                    local_input = torch.cat(
-                        [current, previous, current * previous, q], dim=-1
-                    )
-                    message = update_module(local_input)
-                    learned_gate = torch.sigmoid(
-                        gate_module(
-                            torch.cat([current, previous, q], dim=-1)
-                        ).squeeze(-1)
-                    )
-                    gate = structural_gate * learned_gate
-                    new_state = norm_module(current + gate.unsqueeze(-1) * message)
-                new_state = new_state * valid.to(new_state.dtype).unsqueeze(-1)
-                output[:, t] = new_state
-                previous = new_state
-
-        return output
-
-    def _boundary_gated_reasoning(
-        self,
-        dynamics_states: torch.Tensor,
-        question_state: torch.Tensor,
-        merge_gate: torch.Tensor,
-        video_mask: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
-        forward_states = dynamics_states
-        backward_states = dynamics_states
-
-        for layer_idx in range(self.num_local_reasoning_layers):
-            forward_states = self._single_direction_scan(
-                states=forward_states,
-                question_state=question_state,
-                merge_gate=merge_gate,
-                video_mask=video_mask,
-                update_module=self.forward_scan_updates[layer_idx],
-                gate_module=self.forward_scan_gates[layer_idx],
-                norm_module=self.forward_scan_norms[layer_idx],
-                reverse=False,
-            )
-            backward_states = self._single_direction_scan(
-                states=backward_states,
-                question_state=question_state,
-                merge_gate=merge_gate,
-                video_mask=video_mask,
-                update_module=self.backward_scan_updates[layer_idx],
-                gate_module=self.backward_scan_gates[layer_idx],
-                norm_module=self.backward_scan_norms[layer_idx],
-                reverse=True,
-            )
-
-        q_frames = question_state.unsqueeze(1).expand_as(dynamics_states)
-        local_states = self.local_reasoning_fuse(
-            torch.cat(
-                [
-                    dynamics_states,
-                    forward_states,
-                    backward_states,
-                    q_frames,
-                    dynamics_states * q_frames,
-                ],
-                dim=-1,
-            )
-        )
-        local_states = local_states * video_mask.to(local_states.dtype).unsqueeze(-1)
-
-        # No global anchor branch: such a branch would allow information to
-        # cross strong cuts and become a bypass around composition.  The
-        # bidirectional O(T) gated scans above are the complete temporal
-        # interaction path in V2.0.0.
-        reasoned_states = self.reasoning_norm(local_states)
-        reasoned_states = (
-            reasoned_states * video_mask.to(reasoned_states.dtype).unsqueeze(-1)
-        )
-
-        return {
-            "forward_reasoned_states": forward_states,
-            "backward_reasoned_states": backward_states,
-            "local_reasoned_states": local_states,
-            "reasoned_states": reasoned_states,
-        }
-
-    # ------------------------------------------------------------------
-    # 6. Grounding and boundary-equilibrium interface
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _select_span_linear(
-        start_logits: torch.Tensor,
-        end_logits: torch.Tensor,
-        video_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Exact argmax of start[s] + end[e] subject to s <= e, in O(T).
-
-        This replaces the V1.12 O(T^2) materialized hypothesis bank while still
-        producing the exact best factorized contiguous span.
-        """
-        start_detached = start_logits.detach().masked_fill(~video_mask, -1e4)
-        end_detached = end_logits.detach().masked_fill(~video_mask, -1e4)
-
-        best_start_score, best_start_index = torch.cummax(start_detached, dim=1)
-        end_candidate_score = best_start_score + end_detached
-        end_candidate_score = end_candidate_score.masked_fill(~video_mask, -1e4)
-
-        selected_end = end_candidate_score.argmax(dim=-1)
-        selected_start = best_start_index.gather(
-            1, selected_end.unsqueeze(-1)
-        ).squeeze(-1)
-        selected_pair_score = end_candidate_score.gather(
-            1, selected_end.unsqueeze(-1)
-        ).squeeze(-1)
-        return selected_start, selected_end, selected_pair_score
+        return entropy, ratio
 
     @staticmethod
     def _span_mask_from_bounds(
@@ -815,234 +375,571 @@ class QBoundCore(nn.Module):
         )
 
     @staticmethod
-    def _mask_to_weights(
+    def _mask_to_uniform_weights(
         mask: torch.Tensor,
         dtype: torch.dtype,
     ) -> torch.Tensor:
         weights = mask.to(dtype)
         return weights / weights.sum(dim=-1, keepdim=True).clamp_min(1.0)
 
-    def _build_equilibrium_views(
+    # ------------------------------------------------------------------
+    # 0. Point-wise input adaptation
+    # ------------------------------------------------------------------
+    def _adapt_visual_tokens(
         self,
-        selected_start: torch.Tensor,
-        selected_end: torch.Tensor,
+        video_tokens: torch.Tensor,
         video_mask: torch.Tensor,
-        dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        mask_f = video_mask.to(video_tokens.dtype).unsqueeze(-1)
+        raw = video_tokens * mask_f
+
+        if self.use_generic_input_adapter:
+            adapted = self.generic_input_proj(video_tokens)
+            adapted = self.generic_input_gelu(adapted)
+            adapted = self.generic_input_norm(adapted)
+            adapted = self.generic_input_dropout(adapted)
+        else:
+            adapted = video_tokens
+
+        adapted = adapted * mask_f
+
+        valid_count = video_mask.sum(dim=-1).to(video_tokens.dtype).clamp_min(1.0)
+        raw_unit = F.normalize(raw, p=2, dim=-1)
+        adapted_unit = F.normalize(adapted, p=2, dim=-1)
+        cosine = (raw_unit * adapted_unit).sum(dim=-1)
+        cosine = (
+            cosine * video_mask.to(cosine.dtype)
+        ).sum(dim=-1) / valid_count
+
+        delta_ratio = torch.linalg.vector_norm(
+            (adapted - raw) * mask_f, dim=-1
+        )
+        raw_norm = torch.linalg.vector_norm(raw, dim=-1)
+        delta_ratio = (
+            delta_ratio * video_mask.to(delta_ratio.dtype)
+        ).sum(dim=-1) / (
+            (raw_norm * video_mask.to(raw_norm.dtype))
+            .sum(dim=-1)
+            .clamp_min(1e-6)
+        )
+
+        return adapted, {
+            "generic_input_adapter_enabled": torch.as_tensor(
+                float(self.use_generic_input_adapter),
+                dtype=video_tokens.dtype,
+                device=video_tokens.device,
+            ),
+            "generic_input_token_cosine": cosine,
+            "generic_input_delta_ratio": delta_ratio,
+        }
+
+    # ------------------------------------------------------------------
+    # 1. Local temporal primitives
+    # ------------------------------------------------------------------
+    def _encode_local_primitives(
+        self,
+        content_tokens: torch.Tensor,
+        video_mask: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        batch_size, time_steps = video_mask.shape
-        device = video_mask.device
+        batch_size, time_steps, _ = content_tokens.shape
+        mask_f = video_mask.to(content_tokens.dtype).unsqueeze(-1)
 
-        first_valid = torch.argmax(video_mask.to(torch.int64), dim=-1)
-        reverse_index = torch.argmax(
-            torch.flip(video_mask, dims=[1]).to(torch.int64), dim=-1
-        )
-        last_valid = (time_steps - 1) - reverse_index
+        first_delta = torch.zeros_like(content_tokens)
+        if time_steps > 1:
+            edge_valid = video_mask[:, 1:] & video_mask[:, :-1]
+            first_delta[:, 1:] = content_tokens[:, 1:] - content_tokens[:, :-1]
+            first_delta[:, 1:] *= edge_valid.to(content_tokens.dtype).unsqueeze(-1)
 
-        trim_valid = selected_start < selected_end
-        expand_left_valid = selected_start > first_valid
-        expand_right_valid = selected_end < last_valid
+        second_delta = torch.zeros_like(content_tokens)
+        if time_steps > 2:
+            second_valid = (
+                video_mask[:, 2:]
+                & video_mask[:, 1:-1]
+                & video_mask[:, :-2]
+            )
+            second_delta[:, 2:] = first_delta[:, 2:] - first_delta[:, 1:-1]
+            second_delta[:, 2:] *= second_valid.to(content_tokens.dtype).unsqueeze(-1)
 
-        trim_left_start = torch.where(
-            trim_valid, selected_start + 1, selected_start
+        state_h = self.state_proj(content_tokens)
+        delta_h = self.delta_proj(first_delta)
+        accel_h = self.accel_proj(second_delta)
+
+        denom = float(max(time_steps - 1, 1))
+        position = torch.arange(
+            time_steps,
+            device=content_tokens.device,
+            dtype=content_tokens.dtype,
+        ).view(1, time_steps, 1) / denom
+        position = position.expand(batch_size, -1, -1)
+        position_h = self.position_proj(position)
+
+        primitive_states = self.primitive_fuse(
+            torch.cat([state_h, delta_h, accel_h, position_h], dim=-1)
         )
-        trim_left_end = selected_end
-        trim_right_start = selected_start
-        trim_right_end = torch.where(
-            trim_valid, selected_end - 1, selected_end
+        primitive_states = primitive_states * mask_f
+
+        scale = float(max(self.input_dim, 1)) ** 0.5
+        delta_magnitude = torch.linalg.vector_norm(first_delta, dim=-1) / scale
+        accel_magnitude = torch.linalg.vector_norm(second_delta, dim=-1) / scale
+        delta_magnitude *= video_mask.to(delta_magnitude.dtype)
+        accel_magnitude *= video_mask.to(accel_magnitude.dtype)
+
+        return {
+            "primitive_states": primitive_states,
+            "first_delta": first_delta,
+            "second_delta": second_delta,
+            "delta_magnitude": delta_magnitude,
+            "accel_magnitude": accel_magnitude,
+            "relative_position": position.squeeze(-1),
+        }
+
+    # ------------------------------------------------------------------
+    # 2. Question-conditioned primitive semantics
+    # ------------------------------------------------------------------
+    def _inject_question(
+        self,
+        primitive_states: torch.Tensor,
+        question_features: torch.Tensor,
+        question_mask: torch.Tensor,
+        video_mask: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        q_tokens = self.question_token_proj(question_features)
+        q_tokens = q_tokens * question_mask.to(q_tokens.dtype).unsqueeze(-1)
+        q_global = self._masked_mean(q_tokens, question_mask, dim=1)
+
+        cross, attn = self.visual_to_question_attn(
+            query=primitive_states,
+            key=q_tokens,
+            value=q_tokens,
+            key_padding_mask=~question_mask,
+            need_weights=True,
+            average_attn_weights=False,
         )
-        expand_left_start = torch.where(
-            expand_left_valid, selected_start - 1, selected_start
+
+        q_states = self.question_cross_norm(primitive_states + cross)
+        q_states = self.question_ff_norm(q_states + self.question_ff(q_states))
+        q_states = q_states * video_mask.to(q_states.dtype).unsqueeze(-1)
+
+        primitive_norm = torch.linalg.vector_norm(primitive_states, dim=-1)
+        cross_delta = torch.linalg.vector_norm(
+            (q_states - primitive_states)
+            * video_mask.to(q_states.dtype).unsqueeze(-1),
+            dim=-1,
         )
-        expand_left_end = selected_end
-        expand_right_start = selected_start
-        expand_right_end = torch.where(
-            expand_right_valid, selected_end + 1, selected_end
+        valid = video_mask.to(cross_delta.dtype)
+        interaction_ratio = (cross_delta * valid).sum(dim=-1) / (
+            (primitive_norm * valid).sum(dim=-1).clamp_min(1e-6)
         )
+
+        return {
+            "question_tokens_projected": q_tokens,
+            "question_state": q_global,
+            "query_conditioned_states": q_states,
+            "visual_question_attention": attn,
+            "question_interaction_delta_ratio": interaction_ratio,
+        }
+
+    # ------------------------------------------------------------------
+    # 3-4. Node relevance and adjacent relation
+    # ------------------------------------------------------------------
+    def _score_primitives_and_relations(
+        self,
+        query_states: torch.Tensor,
+        question_state: torch.Tensor,
+        delta_magnitude: torch.Tensor,
+        accel_magnitude: torch.Tensor,
+        relative_position: torch.Tensor,
+        video_mask: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        batch_size, time_steps, hidden_dim = query_states.shape
+        q_frames = question_state.unsqueeze(1).expand(-1, time_steps, -1)
+
+        node_features = torch.cat(
+            [
+                query_states,
+                q_frames,
+                query_states * q_frames,
+                delta_magnitude.unsqueeze(-1),
+                accel_magnitude.unsqueeze(-1),
+                relative_position.unsqueeze(-1),
+            ],
+            dim=-1,
+        )
+        node_hidden = self.node_encoder(node_features)
+        node_raw = self.node_score(node_hidden).squeeze(-1)
+
+        # Bound the primitive score.  This stabilizes length-normalized segment
+        # energies and prevents a single frame from winning through arbitrarily
+        # large logits.
+        node_relevance = torch.tanh(node_raw)
+        node_relevance = node_relevance * video_mask.to(node_relevance.dtype)
+
+        if time_steps == 1:
+            edge_mask = video_mask.new_zeros(batch_size, 0)
+            edge_raw = query_states.new_zeros(batch_size, 0)
+            edge_relation = edge_raw
+        else:
+            edge_mask = video_mask[:, :-1] & video_mask[:, 1:]
+            left = query_states[:, :-1]
+            right = query_states[:, 1:]
+            q_edges = question_state.unsqueeze(1).expand(-1, time_steps - 1, -1)
+
+            # Local dynamics attached to the right primitive correspond to the
+            # change from t -> t+1.
+            edge_delta = delta_magnitude[:, 1:]
+            edge_accel = accel_magnitude[:, 1:]
+            edge_pos = 0.5 * (
+                relative_position[:, :-1] + relative_position[:, 1:]
+            )
+
+            edge_features = torch.cat(
+                [
+                    left,
+                    right,
+                    torch.abs(right - left),
+                    left * right,
+                    q_edges,
+                    edge_delta.unsqueeze(-1),
+                    edge_accel.unsqueeze(-1),
+                    edge_pos.unsqueeze(-1),
+                    (left * q_edges).mean(dim=-1, keepdim=True),
+                ],
+                dim=-1,
+            )
+            edge_hidden = self.edge_encoder(edge_features)
+            edge_raw = self.edge_score(edge_hidden).squeeze(-1)
+            edge_relation = torch.tanh(edge_raw)
+            edge_relation = edge_relation * edge_mask.to(edge_relation.dtype)
+
+        return {
+            "node_relevance_raw": node_raw,
+            "node_relevance": node_relevance,
+            "adjacent_relation_raw": edge_raw,
+            "adjacent_relation": edge_relation,
+            "adjacent_relation_mask": edge_mask,
+        }
+
+    # ------------------------------------------------------------------
+    # 5. Shared variable-scale segment energy
+    # ------------------------------------------------------------------
+    def _build_segment_energy(
+        self,
+        node_relevance: torch.Tensor,
+        adjacent_relation: torch.Tensor,
+        video_mask: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Build one shared variable-scale energy E(s,e).
+
+        Critical anti-shortcut choice
+        -----------------------------
+        We do NOT use
+
+            mean(node scores in span)
+
+        as the main segment score, because the maximum average over all
+        contiguous spans is mathematically achieved by a singleton containing
+        the maximum-scoring token.  That would recreate V2.0's micro-span
+        shortcut by construction.
+
+        We also do NOT use an unnormalized raw sum, which would reward longer
+        spans whenever scores are mostly positive.
+
+        Instead, evidence is centered within each video and accumulated with
+        sqrt(length) normalization:
+
+            node_support(s,e)
+                = sum_{t=s..e} (u_t - mean_valid(u)) / sqrt(L)
+
+            relation_support(s,e)
+                = sum_{t=s..e-1} (r_t - mean_valid(r)) / sqrt(L-1)
+
+        A consistently relevant/coherent run becomes stronger as it grows,
+        while irrelevant frames dilute or reverse the accumulated support.
+        Full-video node support is approximately zero by construction, and
+        single-frame spans receive no automatic advantage from the scoring
+        formula.
+
+        A boundary-separation term additionally penalizes cutting through an
+        adjacent pair that the model itself considers strongly coherent.
+        """
+        batch_size, time_steps = node_relevance.shape
+        dtype = node_relevance.dtype
+        device = node_relevance.device
+
+        starts = torch.arange(time_steps, device=device).view(time_steps, 1)
+        ends = torch.arange(time_steps, device=device).view(1, time_steps)
+        span_len = ends - starts + 1
+        upper = span_len >= 1
+        span_len_f = span_len.clamp_min(1).to(dtype)
+
+        # A span is valid only when every token between s and e is valid.
+        valid_prefix = F.pad(
+            torch.cumsum(video_mask.to(torch.long), dim=-1),
+            (1, 0),
+            value=0,
+        )
+        valid_count = (
+            valid_prefix[:, 1:].unsqueeze(1)
+            - valid_prefix[:, :-1].unsqueeze(2)
+        )
+        segment_valid = (
+            upper.unsqueeze(0)
+            & (valid_count == span_len.unsqueeze(0))
+        )
+
+        # --------------------------------------------------------------
+        # Center node evidence per video to remove a global positive offset.
+        # This is not a duration target; it only makes evidence relative to
+        # the current video's baseline relevance.
+        # --------------------------------------------------------------
+        node_baseline = self._masked_mean(
+            node_relevance, video_mask, dim=1
+        )
+        node_centered = (
+            node_relevance - node_baseline.unsqueeze(-1)
+        ) * video_mask.to(dtype)
+
+        node_prefix = F.pad(
+            torch.cumsum(node_centered, dim=-1),
+            (1, 0),
+            value=0.0,
+        )
+        node_sum = (
+            node_prefix[:, 1:].unsqueeze(1)
+            - node_prefix[:, :-1].unsqueeze(2)
+        )
+        node_support = node_sum / torch.sqrt(
+            span_len_f.unsqueeze(0)
+        ).clamp_min(1.0)
+
+        if time_steps > 1:
+            edge_mask = video_mask[:, :-1] & video_mask[:, 1:]
+
+            # Center relation evidence over valid adjacent pairs.
+            edge_baseline = self._masked_mean(
+                adjacent_relation, edge_mask, dim=1
+            )
+            relation_centered = (
+                adjacent_relation - edge_baseline.unsqueeze(-1)
+            ) * edge_mask.to(dtype)
+
+            edge_prefix = F.pad(
+                torch.cumsum(relation_centered, dim=-1),
+                (1, 0),
+                value=0.0,
+            )  # [B,T], prefix[k] = sum of centered edges < k
+
+            edge_sum = (
+                edge_prefix.unsqueeze(1)
+                - edge_prefix.unsqueeze(2)
+            )
+            edge_count = (ends - starts).clamp_min(0).to(dtype)
+
+            relation_support = torch.where(
+                edge_count.unsqueeze(0) > 0,
+                edge_sum
+                / torch.sqrt(
+                    edge_count.clamp_min(1.0).unsqueeze(0)
+                ),
+                torch.zeros_like(edge_sum),
+            )
+
+            # Boundary separation uses the original bounded relation score:
+            # positive = coherent pair, negative = likely boundary.
+            left_rel = F.pad(adjacent_relation, (1, 0), value=0.0)
+            right_rel = F.pad(adjacent_relation, (0, 1), value=0.0)
+            left_valid = F.pad(edge_mask, (1, 0), value=False)
+            right_valid = F.pad(edge_mask, (0, 1), value=False)
+
+            left_rel_2d = left_rel.unsqueeze(2)
+            right_rel_2d = right_rel.unsqueeze(1)
+            left_valid_2d = left_valid.unsqueeze(2)
+            right_valid_2d = right_valid.unsqueeze(1)
+
+            boundary_count = (
+                left_valid_2d.to(dtype)
+                + right_valid_2d.to(dtype)
+            )
+            boundary_mean = (
+                left_rel_2d * left_valid_2d.to(dtype)
+                + right_rel_2d * right_valid_2d.to(dtype)
+            ) / boundary_count.clamp_min(1.0)
+
+            # Strong positive cohesion at a candidate boundary means the span
+            # is cutting through a relation that should probably remain inside.
+            boundary_separation = torch.where(
+                boundary_count > 0,
+                -boundary_mean,
+                torch.zeros_like(boundary_mean),
+            )
+        else:
+            edge_mask = video_mask.new_zeros(batch_size, 0)
+            relation_centered = adjacent_relation
+            relation_support = node_relevance.new_zeros(batch_size, 1, 1)
+            boundary_separation = node_relevance.new_zeros(batch_size, 1, 1)
+
+        segment_energy = (
+            node_support
+            + self.relation_weight * relation_support
+            + self.boundary_weight * boundary_separation
+        )
+
+        segment_logits = (
+            segment_energy / self.segment_temperature
+        ).masked_fill(~segment_valid, -1e4)
+
+        flat_logits = segment_logits.reshape(batch_size, -1)
+        flat_valid = segment_valid.reshape(batch_size, -1)
+        flat_prob = torch.softmax(
+            flat_logits.masked_fill(~flat_valid, -1e4),
+            dim=-1,
+        )
+        flat_prob = flat_prob * flat_valid.to(flat_prob.dtype)
+        flat_prob = flat_prob / flat_prob.sum(
+            dim=-1, keepdim=True
+        ).clamp_min(1e-6)
+        segment_prob = flat_prob.reshape(
+            batch_size, time_steps, time_steps
+        )
+
+        # Hard segment from exactly the same energy as the soft posterior.
+        selected_flat = flat_logits.masked_fill(
+            ~flat_valid, -1e4
+        ).argmax(dim=-1)
+        selected_start = torch.div(
+            selected_flat, time_steps, rounding_mode="floor"
+        )
+        selected_end = selected_flat % time_steps
+
+        selected_energy = flat_logits.gather(
+            1, selected_flat.unsqueeze(-1)
+        ).squeeze(-1)
+        selected_prob = flat_prob.gather(
+            1, selected_flat.unsqueeze(-1)
+        ).squeeze(-1)
 
         selected_mask = self._span_mask_from_bounds(
             selected_start, selected_end, video_mask
         )
-        trim_left_mask = self._span_mask_from_bounds(
-            trim_left_start, trim_left_end, video_mask
-        )
-        trim_right_mask = self._span_mask_from_bounds(
-            trim_right_start, trim_right_end, video_mask
-        )
-        expand_left_mask = self._span_mask_from_bounds(
-            expand_left_start, expand_left_end, video_mask
-        )
-        expand_right_mask = self._span_mask_from_bounds(
-            expand_right_start, expand_right_end, video_mask
+        hard_temporal_prob = self._mask_to_uniform_weights(
+            selected_mask, dtype=dtype
         )
 
-        return {
-            "selected_span_frame_mask": selected_mask.detach(),
-            "selected_span_frame_weights": self._mask_to_weights(selected_mask, dtype),
-            "trim_left_valid_mask": trim_valid.detach(),
-            "trim_left_frame_mask": trim_left_mask.detach(),
-            "trim_left_frame_weights": self._mask_to_weights(trim_left_mask, dtype),
-            "trim_right_valid_mask": trim_valid.detach(),
-            "trim_right_frame_mask": trim_right_mask.detach(),
-            "trim_right_frame_weights": self._mask_to_weights(trim_right_mask, dtype),
-            "expand_left_valid_mask": expand_left_valid.detach(),
-            "expand_left_frame_mask": expand_left_mask.detach(),
-            "expand_left_frame_weights": self._mask_to_weights(expand_left_mask, dtype),
-            "expand_right_valid_mask": expand_right_valid.detach(),
-            "expand_right_frame_mask": expand_right_mask.detach(),
-            "expand_right_frame_weights": self._mask_to_weights(expand_right_mask, dtype),
-            "trim_left_start_frame": trim_left_start.detach(),
-            "trim_left_end_frame": trim_left_end.detach(),
-            "trim_right_start_frame": trim_right_start.detach(),
-            "trim_right_end_frame": trim_right_end.detach(),
-            "expand_left_start_frame": expand_left_start.detach(),
-            "expand_left_end_frame": expand_left_end.detach(),
-            "expand_right_start_frame": expand_right_start.detach(),
-            "expand_right_end_frame": expand_right_end.detach(),
-        }
+        # --------------------------------------------------------------
+        # Soft frame membership from the SAME P(s,e).
+        # --------------------------------------------------------------
+        index = torch.arange(time_steps, device=device)
+        start_grid = index.view(time_steps, 1, 1)
+        end_grid = index.view(1, time_steps, 1)
+        frame_grid = index.view(1, 1, time_steps)
+        inclusion = (
+            (start_grid <= frame_grid)
+            & (frame_grid <= end_grid)
+        ).to(dtype)  # [T,T,T]
 
-    def _ground(
-        self,
-        reasoned_states: torch.Tensor,
-        question_state: torch.Tensor,
-        cut_prob: torch.Tensor,
-        delta_magnitude: torch.Tensor,
-        video_mask: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
-        batch_size, time_steps, _ = reasoned_states.shape
-        q_frames = question_state.unsqueeze(1).expand_as(reasoned_states)
-
-        # Natural video edges are strong endpoint cues.  Interior endpoint cues
-        # come from the learned query-specific cut field.
-        left_cut = F.pad(cut_prob, (1, 0), value=1.0)
-        right_cut = F.pad(cut_prob, (0, 1), value=1.0)
-        left_cut = left_cut * video_mask.to(left_cut.dtype)
-        right_cut = right_cut * video_mask.to(right_cut.dtype)
-
-        endpoint_input = torch.cat(
-            [
-                reasoned_states,
-                q_frames,
-                reasoned_states * q_frames,
-                left_cut.unsqueeze(-1),
-                right_cut.unsqueeze(-1),
-                delta_magnitude.unsqueeze(-1),
-            ],
-            dim=-1,
+        soft_inside_prob = torch.einsum(
+            "bij,ijt->bt",
+            segment_prob,
+            inclusion,
         )
-        endpoint_hidden = self.endpoint_encoder(endpoint_input)
-        endpoint_hidden = endpoint_hidden * video_mask.to(endpoint_hidden.dtype).unsqueeze(-1)
-
-        start_logits_raw = self.start_score(endpoint_hidden).squeeze(-1)
-        end_logits_raw = self.end_score(endpoint_hidden).squeeze(-1)
-        frame_evidence_logits_raw = self.frame_evidence_score(endpoint_hidden).squeeze(-1)
-
-        start_logits = start_logits_raw.masked_fill(~video_mask, -1e4)
-        end_logits = end_logits_raw.masked_fill(~video_mask, -1e4)
-        frame_evidence_logits = frame_evidence_logits_raw.masked_fill(~video_mask, -1e4)
-
-        start_prob = self._masked_softmax(start_logits, video_mask, dim=-1)
-        end_prob = self._masked_softmax(end_logits, video_mask, dim=-1)
-
-        # Differentiable O(T) inclusion support used only as a backward bridge
-        # for weak QA supervision.  Final inference remains the hard H* below.
-        # P(t inside) ~= P(start <= t) * P(end >= t).
-        start_cdf = torch.cumsum(start_prob, dim=-1)
-        end_survival = torch.flip(
-            torch.cumsum(torch.flip(end_prob, dims=[1]), dim=-1), dims=[1]
+        soft_inside_prob = (
+            soft_inside_prob * video_mask.to(dtype)
         )
-        soft_span_support = start_cdf * end_survival
-        soft_span_support = soft_span_support * video_mask.to(soft_span_support.dtype)
-        soft_span_support = soft_span_support / soft_span_support.sum(
+
+        # Downstream pooling uses a normalized differentiable evidence weight.
+        soft_temporal_prob = soft_inside_prob / soft_inside_prob.sum(
             dim=-1, keepdim=True
         ).clamp_min(1e-6)
 
-        frame_evidence_prob = self._masked_softmax(
-            frame_evidence_logits, video_mask, dim=-1
-        )
-        soft_temporal_prob = soft_span_support * frame_evidence_prob
-        soft_temporal_prob = soft_temporal_prob / soft_temporal_prob.sum(
-            dim=-1, keepdim=True
-        ).clamp_min(1e-6)
-
-        selected_start, selected_end, selected_pair_score = self._select_span_linear(
-            start_logits=start_logits,
-            end_logits=end_logits,
-            video_mask=video_mask,
-        )
-        equilibrium = self._build_equilibrium_views(
-            selected_start=selected_start,
-            selected_end=selected_end,
-            video_mask=video_mask,
-            dtype=reasoned_states.dtype,
-        )
-        selected_mask = equilibrium["selected_span_frame_mask"]
-
-        # Score H*/trim/expand with the SAME frame-evidence weighting rule used
-        # by the factual main branch.  Uniform span averaging would make the
-        # verifier measure a different consumer from the one being trained.
-        view_specs = (
-            ("selected_span_frame_mask", "selected_span_frame_weights"),
-            ("trim_left_frame_mask", "trim_left_frame_weights"),
-            ("trim_right_frame_mask", "trim_right_frame_weights"),
-            ("expand_left_frame_mask", "expand_left_frame_weights"),
-            ("expand_right_frame_mask", "expand_right_frame_weights"),
-        )
-        for mask_name, weight_name in view_specs:
-            view_mask = equilibrium[mask_name]
-            equilibrium[weight_name] = self._masked_softmax(
-                frame_evidence_logits, view_mask, dim=-1
-            ).detach()
-
-        main_temporal_prob = self._masked_softmax(
-            frame_evidence_logits, selected_mask, dim=-1
-        )
-        main_temporal_logits = torch.log(main_temporal_prob.clamp_min(1e-8))
-        main_soft_support = selected_mask.to(main_temporal_prob.dtype)
-
-        # Straight-through temporal distribution: forward value is exactly the
-        # hard-span main distribution, while the backward pass also reaches
-        # start/end probabilities through ``soft_temporal_prob``.  This avoids
-        # reintroducing V1.6-style soft-span inference while still making the
-        # weak QA loss capable of training the endpoint heads.
+        # Exact hard forward value, structured soft backward path.
         training_temporal_prob = (
-            main_temporal_prob
+            hard_temporal_prob
             + soft_temporal_prob
             - soft_temporal_prob.detach()
         )
 
-        valid_length = video_mask.sum(dim=-1).to(reasoned_states.dtype).clamp_min(1.0)
-        selected_length = selected_mask.sum(dim=-1).to(reasoned_states.dtype)
-        selected_fraction = selected_length / valid_length
-        denominator = (valid_length - 1.0).clamp_min(1.0)
+        valid_token_count = (
+            video_mask.sum(dim=-1).to(dtype).clamp_min(1.0)
+        )
+        selected_length = selected_mask.sum(dim=-1).to(dtype)
+        selected_fraction = selected_length / valid_token_count
+
+        denominator = (valid_token_count - 1.0).clamp_min(1.0)
         selected_start_norm = (
-            selected_start.to(reasoned_states.dtype) / denominator
+            selected_start.to(dtype) / denominator
         ).clamp(0.0, 1.0)
         selected_end_norm = (
-            selected_end.to(reasoned_states.dtype) / denominator
+            selected_end.to(dtype) / denominator
         ).clamp(0.0, 1.0)
 
+        expected_length = (
+            segment_prob * span_len_f.unsqueeze(0)
+        ).sum(dim=(-2, -1))
+        expected_fraction = expected_length / valid_token_count
+
+        entropy, entropy_ratio = self._entropy_from_distribution(
+            segment_prob, segment_valid
+        )
+
+        # Shortcut diagnostics.
+        diag_mask = torch.eye(
+            time_steps, dtype=torch.bool, device=device
+        ).unsqueeze(0)
+        single_frame_prob_mass = (
+            segment_prob * diag_mask.to(dtype)
+        ).sum(dim=(-2, -1))
+
+        short_mask = (
+            upper & (span_len <= 2)
+        ).unsqueeze(0) & segment_valid
+        short_span_prob_mass = (
+            segment_prob * short_mask.to(dtype)
+        ).sum(dim=(-2, -1))
+
+        selected_single_frame_indicator = (
+            selected_length <= 1.0 + 1e-6
+        ).to(dtype)
+        selected_full_video_indicator = (
+            selected_length >= valid_token_count - 1e-6
+        ).to(dtype)
+
         return {
-            "start_logits": start_logits,
-            "end_logits": end_logits,
-            "start_prob": start_prob,
-            "end_prob": end_prob,
-            "start_entropy": self._entropy_from_distribution(start_prob, dim=-1),
-            "end_entropy": self._entropy_from_distribution(end_prob, dim=-1),
-            "soft_span_support": soft_span_support,
+            "node_relevance_centered": node_centered,
+            "adjacent_relation_centered": relation_centered,
+            "segment_node_support": node_support,
+            "segment_relation_support": relation_support,
+            "segment_boundary_separation": boundary_separation,
+            "segment_energy": segment_energy,
+            "segment_logits": segment_logits,
+            "segment_valid_mask": segment_valid,
+            "segment_prob": segment_prob,
+            "segment_entropy": entropy,
+            "segment_entropy_ratio": entropy_ratio,
+            "segment_top1_prob": selected_prob,
+            "soft_inside_prob": soft_inside_prob,
             "soft_temporal_prob": soft_temporal_prob,
             "training_temporal_prob": training_temporal_prob,
-            "frame_evidence_logits": frame_evidence_logits,
+            "main_temporal_prob": hard_temporal_prob,
+            "main_temporal_logits": torch.log(
+                hard_temporal_prob.clamp_min(1e-8)
+            ),
+            "main_soft_support": selected_mask.to(dtype),
+            "selected_span_frame_mask": selected_mask.detach(),
+            "selected_span_frame_weights": hard_temporal_prob,
             "selected_span_start_frame": selected_start.detach(),
             "selected_span_end_frame": selected_end.detach(),
             "selected_span_start": selected_start_norm,
             "selected_span_end": selected_end_norm,
             "selected_span_length": selected_length,
             "selected_span_fraction": selected_fraction,
-            "selected_pair_score": selected_pair_score,
-            "main_temporal_prob": main_temporal_prob,
-            "main_temporal_logits": main_temporal_logits,
-            "main_soft_support": main_soft_support,
-            **equilibrium,
+            "selected_segment_energy": selected_energy,
+            "soft_expected_span_length": expected_length,
+            "soft_expected_span_fraction": expected_fraction,
+            "single_frame_prob_mass": single_frame_prob_mass,
+            "short_span_prob_mass": short_span_prob_mass,
+            "selected_single_frame_indicator": selected_single_frame_indicator,
+            "selected_full_video_indicator": selected_full_video_indicator,
         }
 
     # ------------------------------------------------------------------
@@ -1053,132 +950,152 @@ class QBoundCore(nn.Module):
         video_tokens: torch.Tensor,
         question_features: torch.Tensor,
         video_mask: Optional[torch.Tensor] = None,
+        question_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         if video_tokens.ndim != 3:
             raise ValueError("video_tokens must be [B,T,D].")
+
         batch_size, time_steps, feature_dim = video_tokens.shape
         if feature_dim != self.input_dim:
             raise ValueError(
                 f"Expected input_dim={self.input_dim}, got {feature_dim}."
             )
-        if time_steps < 2:
-            raise ValueError("Q-Bound V2.0.0 requires at least 2 timesteps.")
+        if time_steps < 1:
+            raise ValueError("Q-Bound V2.1 requires at least one timestep.")
 
-        video_mask = self._normalize_mask(
-            video_mask, batch_size, time_steps, video_tokens.device
+        video_mask = self._normalize_video_mask(
+            video_mask,
+            batch_size,
+            time_steps,
+            video_tokens.device,
         )
-        question_summary = self._summarize_question(question_features)
-        question_state = self.question_proj(question_summary)
+        question_features, question_mask = self._normalize_question_features(
+            question_features,
+            question_mask,
+            batch_size,
+            video_tokens.device,
+        )
 
-        # Keep the external source tokens for a downstream stop-gradient
-        # functional KEEP/MERGE target.  The core itself never sees answers.
-        reasoning_tokens, content_tokens, adapter_diag = (
-            self._adapt_generic_video_tokens(video_tokens, video_mask)
+        content_tokens, adapter_diag = self._adapt_visual_tokens(
+            video_tokens, video_mask
         )
-        dynamics = self._encode_temporal_dynamics(
-            reasoning_tokens=reasoning_tokens,
-            content_tokens=content_tokens,
+        primitives = self._encode_local_primitives(
+            content_tokens, video_mask
+        )
+        question_conditioned = self._inject_question(
+            primitive_states=primitives["primitive_states"],
+            question_features=question_features,
+            question_mask=question_mask,
             video_mask=video_mask,
         )
-        composition = self._build_functional_cut_field(
-            dynamics_states=dynamics["dynamics_states"],
-            delta_magnitude=dynamics["delta_magnitude"],
-            accel_magnitude=dynamics["accel_magnitude"],
-            question_state=question_state,
+        scoring = self._score_primitives_and_relations(
+            query_states=question_conditioned["query_conditioned_states"],
+            question_state=question_conditioned["question_state"],
+            delta_magnitude=primitives["delta_magnitude"],
+            accel_magnitude=primitives["accel_magnitude"],
+            relative_position=primitives["relative_position"],
             video_mask=video_mask,
         )
-        reasoning = self._boundary_gated_reasoning(
-            dynamics_states=dynamics["dynamics_states"],
-            question_state=question_state,
-            merge_gate=composition["functional_merge_gate"],
+        segments = self._build_segment_energy(
+            node_relevance=scoring["node_relevance"],
+            adjacent_relation=scoring["adjacent_relation"],
             video_mask=video_mask,
         )
-        grounding = self._ground(
-            reasoned_states=reasoning["reasoned_states"],
-            question_state=question_state,
-            cut_prob=composition["functional_cut_prob"],
-            delta_magnitude=dynamics["delta_magnitude"],
-            video_mask=video_mask,
-        )
+
+        dtype = video_tokens.dtype
+        device = video_tokens.device
 
         return {
             # ----------------------------------------------------------
             # Architecture contract.
             # ----------------------------------------------------------
             "qbound_version": self.qbound_version,
-            "functional_composition_enabled": torch.ones(
-                (), dtype=video_tokens.dtype, device=video_tokens.device
+            "latent_segment_composition_enabled": torch.ones(
+                (), dtype=dtype, device=device
             ),
-            "dynamic_event_count_enabled": torch.ones(
-                (), dtype=video_tokens.dtype, device=video_tokens.device
+            "question_token_interaction_enabled": torch.ones(
+                (), dtype=dtype, device=device
+            ),
+            "segment_energy_enabled": torch.ones(
+                (), dtype=dtype, device=device
             ),
             "fixed_event_partition_enabled": torch.zeros(
-                (), dtype=video_tokens.dtype, device=video_tokens.device
+                (), dtype=dtype, device=device
+            ),
+            "dynamic_event_count_enabled": torch.zeros(
+                (), dtype=dtype, device=device
             ),
             "event_count_cap_enabled": torch.zeros(
-                (), dtype=video_tokens.dtype, device=video_tokens.device
+                (), dtype=dtype, device=device
+            ),
+            "cut_field_enabled": torch.zeros(
+                (), dtype=dtype, device=device
+            ),
+            "boundary_gated_reasoning_enabled": torch.zeros(
+                (), dtype=dtype, device=device
+            ),
+            "independent_endpoint_heads_enabled": torch.zeros(
+                (), dtype=dtype, device=device
             ),
             "hypothesis_competition_enabled": torch.zeros(
-                (), dtype=video_tokens.dtype, device=video_tokens.device
+                (), dtype=dtype, device=device
             ),
             "teacher_distillation_enabled": torch.zeros(
-                (), dtype=video_tokens.dtype, device=video_tokens.device
+                (), dtype=dtype, device=device
             ),
             "answer_features_used_in_core": torch.zeros(
-                (), dtype=video_tokens.dtype, device=video_tokens.device
+                (), dtype=dtype, device=device
             ),
-            "boundary_equilibrium_interface_enabled": torch.ones(
-                (), dtype=video_tokens.dtype, device=video_tokens.device
+            "temporal_gt_used_in_core": torch.zeros(
+                (), dtype=dtype, device=device
             ),
 
-            # Generic input diagnostics.
-            "generic_input_adapter_enabled": torch.as_tensor(
-                float(self.use_generic_input_adapter),
-                dtype=video_tokens.dtype,
-                device=video_tokens.device,
-            ),
-            "generic_input_position_enabled": torch.as_tensor(
-                float(self.input_adapter_use_position),
-                dtype=video_tokens.dtype,
-                device=video_tokens.device,
-            ),
+            # Masks + generic input diagnostics.
+            "video_mask": video_mask,
+            "question_mask": question_mask,
+            "content_tokens": content_tokens,
             **adapter_diag,
 
-            # Question + dynamics states.
-            "question_state": question_state,
-            "reasoning_tokens": reasoning_tokens,
-            "content_tokens": content_tokens,
-            **dynamics,
+            # Local primitive representation.
+            **primitives,
 
-            # Query-adaptive functional composition.
-            **composition,
+            # Token-level question interaction.
+            **question_conditioned,
 
-            # O(T*R) composition-aware reasoning.
-            **reasoning,
+            # Local query-conditioned evidence.
+            **scoring,
 
-            # Functional KEEP/MERGE supervision interface.
-            "functional_pair_valid_mask": composition["boundary_mask"],
+            # Shared soft/hard segment model.
+            **segments,
 
-            # Direct frame-exact grounding + equilibrium views.
-            **grounding,
-
-            # Semantically safe compatibility aliases for downstream temporal
-            # consumers.  They do not restore any V1.x hypothesis machinery.
-            "event_temporal_prob": grounding["main_temporal_prob"],
-            "calibrated_temporal_prob": grounding["main_temporal_prob"],
-            "calibrated_temporal_logits": grounding["main_temporal_logits"],
-            "calibrated_soft_support": grounding["main_soft_support"],
-            "calibrated_span_start_frame": grounding[
+            # ----------------------------------------------------------
+            # Compatibility aliases used by existing downstream temporal
+            # consumers.  These aliases are semantically valid and DO NOT
+            # restore V1/V2.0 cut, endpoint, teacher or equilibrium machinery.
+            # ----------------------------------------------------------
+            "event_temporal_prob": segments["main_temporal_prob"],
+            "calibrated_temporal_prob": segments["main_temporal_prob"],
+            "calibrated_temporal_logits": segments["main_temporal_logits"],
+            "calibrated_soft_support": segments["main_soft_support"],
+            "calibrated_span_start_frame": segments[
                 "selected_span_start_frame"
             ],
-            "calibrated_span_end_frame": grounding[
+            "calibrated_span_end_frame": segments[
                 "selected_span_end_frame"
             ],
-            "calibrated_frame_mask": grounding["selected_span_frame_mask"],
-            "calibrated_span_frame_length": grounding[
+            "calibrated_frame_mask": segments[
+                "selected_span_frame_mask"
+            ],
+            "calibrated_span_frame_length": segments[
                 "selected_span_length"
             ],
-            "calibrated_span_fraction": grounding["selected_span_fraction"],
-            "calibrated_span_start": grounding["selected_span_start"],
-            "calibrated_span_end": grounding["selected_span_end"],
+            "calibrated_span_fraction": segments[
+                "selected_span_fraction"
+            ],
+            "calibrated_span_start": segments[
+                "selected_span_start"
+            ],
+            "calibrated_span_end": segments[
+                "selected_span_end"
+            ],
         }

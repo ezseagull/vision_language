@@ -1,10 +1,31 @@
+# Q-Bound V2.1.0 — Query-Conditioned Latent Temporal Segment Composition
+#
+# Main path:
+#   official frozen CLIP-L temporal features + question tokens
+#       -> local temporal primitives (x, dx, d2x, relative time)
+#       -> token-level visual-to-question interaction
+#       -> primitive relevance u_t
+#       -> adjacent relation/cohesion r_t
+#       -> shared variable-scale segment energy E(s,e)
+#       -> soft posterior P(s,e) and hard H* from the SAME energy
+#
+# Training:
+#   L = L_CRA/main + lambda_A * L_answer_only
+#
+# answer_only is used only AFTER H(V,Q) is constructed. It never enters
+# QBoundCore and is not required for grounding inference.
+#
+# Explicitly removed from V2.0:
+#   cut field, cut-gated propagation, independent start/end heads,
+#   functional KEEP/MERGE verifier, boundary-equilibrium objective.
+#
+# Temporal GT / IoU / IoP are never used as training supervision.
 dataset:
   name: nextgqa
   csv_path: /content/data/nextgqa
   features_path: /content/data/nextqa/video_feature/CLIPL
   causal_feature_path: /content/data/nextgqa/causal_feature
   vocab_path: null
-
   batch_size: 64
   num_thread_reader: 4
   qmax_words: 30
@@ -13,14 +34,11 @@ dataset:
   mc: 5
   a2id: null
   feat_type: CLIPL
-
 model:
   name: CRA
   baseline: refine
-
   lan: RoBERTa
   lan_weight_path: roberta-base
-
   feature_dim: 768
   word_dim: 768
   d_model: 768
@@ -29,172 +47,54 @@ model:
   num_heads: 8
   dropout: 0.3
   vocab_size: 50265
-
   n_negs: 1
   prop_num: 1
-
-  # CRA remains only the downstream VideoQA consumer/testbed.
-  # Q-Bound V2.0.0 receives the sampled raw CLIP-L sequence through its own
-  # generic adapter. CRA temporal grounding is retained only as a diagnostic.
   sigma: 3.0
   gamma: 1
   lamb: 0.15
-  window_sizes: [1, 3, 5]
+  window_sizes:
+  - 1
+  - 3
+  - 5
   time_penalty: null
-
-  # Controlled V2.0.0 path: VisualIntervention stays OFF.
   do: false
-
   vg_loss: 1
   vote: 0
-
-  # ============================================================
-  # Q-Bound V2.0.0 — FUNCTIONAL QUERY-ADAPTIVE TEMPORAL COMPOSITION
-  #
-  # Main path:
-  #
-  #   raw CLIP-L video + question-only semantics
-  #                    ↓
-  #            generic input adapter
-  #                    ↓
-  #             temporal dynamics
-  #          (state + Δx + Δ²x)
-  #                    ↓
-  #        video-only boundary prior b_t
-  #                    │
-  #                    ├──────── question
-  #                    ↓
-  #       bounded question residual δ_t^Q
-  #                    ↓
-  #        functional soft cut field c_t^Q
-  #                    ↓
-  #        boundary-gated bidirectional reasoning O(T)
-  #        (no global attention bypass around cuts)
-  #                    ↓
-  #          factorized start/end heads
-  #                    ↓
-  #                 hard H*
-  #
-  # Training uses GT answer labels only as weak functional supervision:
-  #   KEEP vs MERGE consequence -> functional composition loss
-  #   trim/expand consequence   -> boundary-equilibrium loss
-  #
-  # Temporal GT / IoU / IoP never enter the training loss.
-  # There is no fixed event count, max-event cap, event-count target,
-  # 528-span hypothesis bank, teacher distribution, or KL distillation.
-  # ============================================================
   qbound:
     enabled: true
-    version: "2.0.0"
-
-    # ----------------------------------------------------------
-    # Generic answer-free Q-Bound interface
-    # ----------------------------------------------------------
+    version: 2.1.0
     hidden_dim: 256
     require_question_only: true
-
-    # External CLIP/RoBERTa encoders do not receive gradients through the
-    # Q-Bound route; Q-Bound's private adapter/core remain trainable.
+    require_token_question: true
     detach_backbone_inputs: true
-
     dropout: 0.3
-
-    # ----------------------------------------------------------
-    # Generic visual input adapter
-    # ----------------------------------------------------------
     use_generic_input_adapter: true
     input_adapter_dropout: 0.3
-    input_adapter_use_position: true
-
-    # ----------------------------------------------------------
-    # Query-adaptive functional cut field
-    # ----------------------------------------------------------
-    # Soft cut probabilities are produced from:
-    #   video-only prior logit + bounded question residual.
-    cut_temperature: 0.7
-
-    # Used to convert the soft cut field into hard event-count diagnostics.
-    # It is NOT a maximum/minimum event-count constraint.
-    cut_threshold: 0.5
-
-    # Maximum magnitude of the question-conditioned residual in cut-logit space.
-    # This keeps the video dynamics prior as the structural anchor.
-    question_residual_scale: 0.5
-
-    # ----------------------------------------------------------
-    # Boundary-gated temporal reasoning
-    # ----------------------------------------------------------
-    # All temporal interaction before grounding passes through the learned
-    # boundary gates; there is no global attention bypass in V2.0.0.
-    num_local_reasoning_layers: 2
-
-    # ----------------------------------------------------------
-    # Weak functional composition supervision
-    # ----------------------------------------------------------
-    # GT answers evaluate whether KEEP or MERGE preserves useful evidence.
-    # Near-ties receive low confidence rather than being forced into a cut/merge.
-    functional_composition:
-      loss_weight: 0.10
-      confidence_scale: 0.25
-
-    # ----------------------------------------------------------
-    # Functional boundary equilibrium
-    # ----------------------------------------------------------
-    # GT-answer consequences of one-step trim/expand operations provide
-    # detached local correction targets for differentiable start/end heads.
-    boundary_equilibrium:
-      loss_weight: 0.10
-      confidence_scale: 0.25
-
-    # ----------------------------------------------------------
-    # V2.0.0 controlled exclusions
-    # ----------------------------------------------------------
-    # No:
-    #   temporal-GT supervision
-    #   supervised start/end labels
-    #   IoU / IoP optimization loss
-    #   max_events / min_events / event-count target
-    #   event-count regularization
-    #   target duration / minimality / sparsity loss
-    #   hard pre-reasoning event partition
-    #   all-pair O(K^2) event graph
-    #   528-span hypothesis bank
-    #   privileged teacher distribution / KL distillation
-    #   weak-align auxiliary branch from V1.12
-    #   CRA -> Q-Bound temporal handover
-    #   direct reasoned-event -> answer residual
-    #   answer features inside QBoundCore
-    #   answer requirement at grounding inference
-
+    num_question_heads: 4
+    question_ff_multiplier: 2
+    segment_temperature: 1.0
+    relation_weight: 0.5
+    boundary_weight: 0.25
+    answer_only_supervision:
+      loss_weight: 0.1
 optim:
   pipeline: cra
   optimizer: Adam
-
-  # Main CRA objectives remain unchanged. Q-Bound V2.0.0 adds only:
-  #   lambda_comp * L_functional_composition
-  #   lambda_eq   * L_boundary_equilibrium
-  # Their weights are configured inside model.qbound above.
   loss:
     ce:
       vq: 1
       vqa: 1
     align:
       g: 0.5
-
   clip: 12
-  lr: 1.e-5
+  lr: 1.0e-05
   weight_decay: 0
   amsgrad: true
-
-  # All decoder.qbound.* parameters use the higher Q-Bound learning rate.
-  qbound_lr: 5.e-5
-
+  qbound_lr: 5.0e-05
   epochs: 15
   save_period: 1
-
   lr_scheduler: warmup
   step_size: 1
-
 stat:
   monitor:
     mode: max
@@ -202,14 +102,17 @@ stat:
     early_stop: 15
     vis: false
     display_port: 8099
-
   record_dir: ./output
-
-  # V2.0.0 is an architectural reset. Train from scratch.
   resume: null
-
 misc:
-  running_name: CRA/NextGQA/QBound_v2.0.0_functional_composition_seed2024
-  info: "CRA downstream testbed + Q-Bound V2.0.0 | raw CLIP-L -> temporal dynamics -> video-only boundary prior + bounded question residual -> dynamic functional cut field | no event-count cap | boundary-gated bidirectional O(T) reasoning with no global bypass | direct start/end grounding | GT-answer KEEP-vs-MERGE functional supervision lambda_comp=0.10 | trim/expand boundary-equilibrium lambda_eq=0.10 | no temporal GT | no 528 hypotheses | no teacher distillation | answer-free grounding inference"
-  cuda: "0"
+  running_name: CRA/NextGQA/QBound_v2.1.0_latent_segment_seed2024
+  info: CRA downstream testbed + Q-Bound V2.1.0 | official frozen CLIP-L local temporal
+    features -> local primitive encoder (state + dx + d2x + relative time) -> token-level
+    question interaction -> node relevance + adjacent relation -> shared variable-scale
+    segment energy E(s,e) -> soft P(s,e) and hard H* from the same energy | answer-only
+    candidate supervision lambda_A=0.10 after grounding only | no cut field | no independent
+    start/end heads | no event-count target/cap | no functional KEEP/MERGE verifier
+    | no boundary-equilibrium loss | no teacher distillation | no temporal GT/IoU/IoP
+    training | answer-free grounding inference
+  cuda: '0'
   seed: 2024

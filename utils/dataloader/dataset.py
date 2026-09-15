@@ -306,6 +306,21 @@ class VideoQADataset(Dataset):
             qsns_seq_len = torch.tensor([len(qsn) for qsn in qsns_token_ids], dtype=torch.long)
         
         question_id = vid_id +'_'+str(cur_sample["qid"])
+
+        # --------------------------------------------------------------
+        # V2.1 DATA CONTRACT
+        # Keep CRA's existing Question[SEP]Answer candidates unchanged,
+        # but expose a second answer-only view for Q-Bound supervision.
+        #
+        # IMPORTANT:
+        #   - Q-Bound grounding must still use Video + Question only.
+        #   - `answer_only` is training supervision / answer evidence only;
+        #     it must never be fed into the temporal segment scorer.
+        # --------------------------------------------------------------
+        answer_only_txts = None
+        answer_only_token_ids = None
+        answer_only_len = None
+
         if self.mc:
             ans = cur_sample['answer']
             choices = [str(cur_sample["a" + str(i)]) for i in range(self.mc)]
@@ -346,44 +361,60 @@ class VideoQADataset(Dataset):
                 print("Fail to tokenize:", answer_txts)
                 raise e
             qas_len = torch.tensor([len(ans) for ans in ans_token_ids], dtype=torch.long)
+
+            # V2.1: tokenize the same candidate choices WITHOUT prepending
+            # the question. This avoids the Q <-> [Q SEP A] language shortcut
+            # when answer candidates supervise the temporal evidence.
+            answer_only_txts = list(choices)
+            try:
+                answer_only_token_ids, _ = tokenize(
+                    answer_only_txts,
+                    self.tokenizer,
+                    add_special_tokens=True,
+                    max_length=self.amax_words,
+                    dynamic_padding=False,
+                    truncation=True
+                )
+            except Exception as e:
+                print("Fail to tokenize answer-only candidates:", answer_only_txts)
+                raise e
+
+            answer_only_len = torch.tensor(
+                [len(ans) for ans in answer_only_token_ids],
+                dtype=torch.long
+            )
         else:
             answer_txts = cur_sample["answer"]
             answer_id = self.a2id.get(answer_txts, -1)  # answer_id -1 if not in top answers, that will be considered as wrong prediction during evaluation
         
-        if self.split == "train":
-            return {
-                "video_id": vid_id,
-                "video_frames": vid_frames,
-                "video_len": vlen,
-                "question": qsn_tk_id,
-                "question_txt": question_txt,
-                "type": qtype,
-                "answer_id": answer_id,
-                "answer_txt": answer_txts,
-                "answer": ans_token_ids,
-                "qas_len": qas_len,
-                "question_id": question_id,
-                "qsns_id": qsns_id,
-                "qsns_token_ids": qsns_token_ids,
-                "qsns_seq_len": qsns_seq_len,
-                "q_len": q_len,
-            }
-        else:
-            return {
-                "video_id": vid_id,
-                "video_frames": vid_frames,
-                "video_len": vlen,
-                "question": qsn_tk_id,
-                "question_txt": question_txt,
-                "type": qtype,
-                "answer_id": answer_id,
-                "answer_txt": answer_txts,
-                "answer": ans_token_ids,
-                "qas_len": qas_len,
-                "question_id": question_id,
-                "qsns_id": qsns_id,
-                "qsns_token_ids": qsns_token_ids,
-                "qsns_seq_len": qsns_seq_len,
-                "q_len": q_len,
-                "gsub": gsub
-            }
+        sample = {
+            "video_id": vid_id,
+            "video_frames": vid_frames,
+            "video_len": vlen,
+            "question": qsn_tk_id,
+            "question_txt": question_txt,
+            "type": qtype,
+            "answer_id": answer_id,
+            "answer_txt": answer_txts,
+            "answer": ans_token_ids,
+            "qas_len": qas_len,
+            "question_id": question_id,
+            "qsns_id": qsns_id,
+            "qsns_token_ids": qsns_token_ids,
+            "qsns_seq_len": qsns_seq_len,
+            "q_len": q_len,
+        }
+
+        # V2.1-specific fields. For NExT-GQA (mc=5), these are always present.
+        # Keeping them separate preserves the original CRA input exactly.
+        if self.mc:
+            sample.update({
+                "answer_only_txt": answer_only_txts,
+                "answer_only": answer_only_token_ids,
+                "answer_only_len": answer_only_len,
+            })
+
+        if self.split != "train":
+            sample["gsub"] = gsub
+
+        return sample
