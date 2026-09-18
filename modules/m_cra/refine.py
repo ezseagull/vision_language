@@ -108,43 +108,39 @@ class DecoderLayer(nn.Module):
 
 
 
+
 class Decoder(nn.Module):
     """
-    CRA downstream decoder with Q-Bound V2.1.0.
+    CRA downstream decoder with Q-Bound V2.4.0.
 
-    V2.1 is a clean architectural break from V2.0.
+    V2.4 removes the V2.3 two-stage coarse->BoundaryRefiner design.
 
-    The old V2.0 path:
-        raw video -> learned cuts -> cut-gated temporal propagation
-                  -> independent start/end heads
+    Final Q-Bound path:
+        raw/generic CLIP video + question tokens
+            -> QBoundCore
+            -> temporal context + early Q->V conditioning
+            -> Evidence Core a_t + Event Continuity j_t
+            -> Core-to-Closure P_Q(s,e)
+            -> hard MAP span for official downstream QA
+            -> soft frame marginal for Q-Bound grounding supervision.
 
-    is removed because the cuts created an information-flow shortcut and the
-    independent endpoints admitted micro-span collapse.
+    Separation contract
+    -------------------
+    * Q-Bound receives only video + question.
+    * Q-Bound never receives answer candidates or GT answer.
+    * Q-Bound never receives temporal GT / IoU / IoP targets.
+    * CRA x_bar / CRA grounding remain a detached reference while Q-Bound is active.
+    * The official CRA QA feature is pooled with the HARD Q-Bound MAP key.
+      Therefore the downstream VQA loss does not backpropagate through Q-Bound
+      temporal topology.
+    * The differentiable SOFT Q-Bound evidence is exposed separately for the
+      Video-Question grounding objective implemented downstream in cra_pipeline.py.
+    * The evidence values are the original/light raw visual tokens returned by
+      QBoundCore, not the Q-conditioned WHERE states.
 
-    V2.1 instead uses:
-        local CLIP primitives + question tokens
-            -> query-conditioned primitive relevance / adjacent relation
-            -> one shared variable-scale segment energy E(s,e)
-            -> soft P(s,e) and hard H* from the SAME energy
-
-    Scientific separation
-    ---------------------
-    * Q-Bound receives RAW / generic local visual features, never CRA x_bar.
-    * CRA x_bar + CRA grounding are kept only as a detached reference/testbed.
-    * The answer-space visual evidence for active Q-Bound is pooled from
-      Q-Bound's temporally local ``content_tokens`` -- NOT from globally
-      contextualized CRA x_bar.  This prevents a short selected span from
-      secretly carrying whole-video context.
-    * GT answers / answer candidates are never inputs to Q-BoundCore.
-    * V2.0 functional KEEP/MERGE and boundary-equilibrium verifiers are removed.
-
-    Training / inference alignment
-    ------------------------------
-    ``main_temporal_prob`` is the hard H* distribution used for inference.
-    ``training_temporal_prob`` has exactly the same forward numeric value but
-    uses the soft structured segment posterior in backward.  Consequently the
-    downstream QA loss can train the shared segment energy without restoring an
-    independent soft inference path.
+    No BoundaryRefiner, local candidate bank, answer critic, adaptive radius,
+    learned routing gate, independent endpoint heads, Gaussian smoothing, or
+    length prior is used here.
     """
 
     def __init__(
@@ -163,7 +159,7 @@ class Decoder(nn.Module):
 
         self.embed_dim = int(embed_dim)
         self.cfgs = cfgs
-        self.qbound_version = "2.1.0"
+        self.qbound_version = "2.4.0"
 
         # ------------------------------------------------------------------
         # CRA downstream/reference branch.
@@ -182,7 +178,7 @@ class Decoder(nn.Module):
             nn.Softmax(dim=-2),
         )
 
-        # Keep original CRA parameter names for checkpoint compatibility.
+        # Preserve original CRA parameter names for checkpoint compatibility.
         self.video_proj = nn.Sequential(
             nn.Dropout(dropout),
             nn.Linear(embed_dim, embed_dim),
@@ -220,25 +216,38 @@ class Decoder(nn.Module):
                 ),
             )
         )
+
+        # V2.4 is strictly question-only for temporal localization.
         self.qbound_require_question_only = bool(
             qbound_cfg.get(
                 "require_question_only",
                 model_cfg.get(
                     "qbound_require_question_only",
-                    model_cfg.get("gpeb_require_question_only", True),
+                    True,
                 ),
             )
         )
-        # V2.1 is explicitly designed around token-level question injection.
+        if self.qbound_enabled and not self.qbound_require_question_only:
+            raise ValueError(
+                "Q-Bound V2.4 requires question-only temporal input. "
+                "Set model.qbound.require_question_only=true."
+            )
+
         self.qbound_require_token_question = bool(
             qbound_cfg.get("require_token_question", True)
         )
+        if self.qbound_enabled and not self.qbound_require_token_question:
+            raise ValueError(
+                "Q-Bound V2.4 requires token-level question features for early "
+                "Q->V cross-attention. Set require_token_question=true."
+            )
+
         self.qbound_detach_backbone_inputs = bool(
             qbound_cfg.get(
                 "detach_backbone_inputs",
                 model_cfg.get(
                     "qbound_detach_backbone_inputs",
-                    model_cfg.get("gpeb_detach_backbone_inputs", True),
+                    True,
                 ),
             )
         )
@@ -252,25 +261,47 @@ class Decoder(nn.Module):
                 )
             )
 
-            # Fail fast if an old V2.0 configuration is accidentally reused.
-            # These keys are not harmless hyperparameters: they belong to
-            # mechanisms that V2.1 deliberately removes.
-            forbidden_v20_keys = {
+            # V2.4 deliberately removes the following historical mechanisms.
+            # Fail fast instead of silently carrying stale config into the new
+            # experiment.
+            forbidden_keys = {
+                # V2.0 / V2.1 leftovers.
                 "input_adapter_use_position",
                 "cut_temperature",
                 "cut_threshold",
                 "question_residual_scale",
                 "num_local_reasoning_layers",
+
+                # V2.3 input-adapter / segment-composition knobs removed in V2.4.
+                "use_generic_input_adapter",
+                "input_adapter_dropout",
+                "relation_weight",
+                "boundary_weight",
+
+                # V2.3 exact-boundary stage.
+                "boundary_refiner",
+                "adaptive_radius_ratio",
+                "min_radius",
+                "joint_scoring",
+
+                # Removed regularizers / topology controls.
+                "length_prior",
+                "minimality_weight",
+                "entropy_weight",
+                "sparsity_weight",
+                "gaussian_sigma",
+                "event_count",
             }
+
             stale = sorted(
-                key for key in forbidden_v20_keys if key in qbound_cfg
+                key for key in forbidden_keys if key in qbound_cfg
             )
             if stale:
                 raise ValueError(
-                    "Q-Bound V2.1 config still contains removed V2.0 keys: "
+                    "Q-Bound V2.4 config contains removed/stale keys: "
                     + ", ".join(stale)
-                    + ". Remove them rather than silently carrying V2.0 "
-                      "mechanisms into V2.1."
+                    + ". Remove them rather than silently reintroducing older "
+                      "mechanisms."
                 )
 
             self.qbound = QBoundCore(
@@ -282,18 +313,6 @@ class Decoder(nn.Module):
                         model_cfg.get("qbound_dropout", dropout),
                     )
                 ),
-                use_generic_input_adapter=bool(
-                    qbound_cfg.get("use_generic_input_adapter", True)
-                ),
-                input_adapter_dropout=float(
-                    qbound_cfg.get(
-                        "input_adapter_dropout",
-                        qbound_cfg.get(
-                            "dropout",
-                            model_cfg.get("qbound_dropout", dropout),
-                        ),
-                    )
-                ),
                 num_question_heads=int(
                     qbound_cfg.get("num_question_heads", 4)
                 ),
@@ -302,12 +321,6 @@ class Decoder(nn.Module):
                 ),
                 segment_temperature=float(
                     qbound_cfg.get("segment_temperature", 1.0)
-                ),
-                relation_weight=float(
-                    qbound_cfg.get("relation_weight", 0.50)
-                ),
-                boundary_weight=float(
-                    qbound_cfg.get("boundary_weight", 0.25)
                 ),
             )
 
@@ -347,7 +360,9 @@ class Decoder(nn.Module):
 
         mask = mask.to(device=device).bool()
         if not torch.all(mask.any(dim=-1)):
-            raise ValueError("Every sample must contain at least one valid video token.")
+            raise ValueError(
+                "Every sample must contain at least one valid video token."
+            )
         return mask
 
     @staticmethod
@@ -362,6 +377,7 @@ class Decoder(nn.Module):
             )
 
         batch_size, q_len, _ = question_feature.shape
+
         while mask.ndim > 2 and mask.size(1) == 1:
             mask = mask.squeeze(1)
 
@@ -382,6 +398,7 @@ class Decoder(nn.Module):
     def _normalize_temporal_distribution(values, valid_mask, eps=1e-6):
         if values.ndim == 3 and values.size(-1) == 1:
             values = values.squeeze(-1)
+
         if values.shape != valid_mask.shape:
             raise ValueError(
                 "Temporal distribution and valid mask must have the same "
@@ -391,6 +408,7 @@ class Decoder(nn.Module):
 
         values = values.clamp_min(0.0)
         values = values * valid_mask.to(values.dtype)
+
         denominator = values.sum(dim=-1, keepdim=True)
         normalized = values / denominator.clamp_min(eps)
 
@@ -399,7 +417,12 @@ class Decoder(nn.Module):
             dim=-1,
             keepdim=True,
         ).clamp_min(1.0)
-        return torch.where(denominator > eps, normalized, fallback)
+
+        return torch.where(
+            denominator > eps,
+            normalized,
+            fallback,
+        )
 
     @staticmethod
     def _masked_mean_video(features, valid_mask):
@@ -409,37 +432,8 @@ class Decoder(nn.Module):
             / weights.sum(dim=1).clamp_min(1.0)
         )
 
-    # ------------------------------------------------------------------
-    # Shared projection helpers
-    # ------------------------------------------------------------------
-    def _sample_projection_dropout_mask(self, reference):
-        dropout_layer = self.video_proj[0]
-        if not self.training or dropout_layer.p <= 0.0:
-            return torch.ones_like(reference)
-
-        keep_prob = 1.0 - float(dropout_layer.p)
-        if keep_prob <= 0.0:
-            raise ValueError("video projection dropout must be < 1.")
-        mask = torch.empty_like(reference).bernoulli_(keep_prob)
-        return mask / keep_prob
-
-    def _apply_video_projection(self, pooled, dropout_mask):
-        if pooled.shape != dropout_mask.shape:
-            raise ValueError(
-                "pooled representation and dropout mask must have the same "
-                f"shape; got {tuple(pooled.shape)} and "
-                f"{tuple(dropout_mask.shape)}."
-            )
-        return self.video_proj[1](pooled * dropout_mask)
-
-    def _project_temporal_sequence(
-        self,
-        sequence,
-        temporal_weights,
-        projection_dropout_mask,
-        do=False,
-        x_star_proj=None,
-    ):
+    @staticmethod
+    def _pool_temporal_sequence(sequence, temporal_weights):
         if sequence.ndim != 3:
             raise ValueError(
                 "Temporal evidence sequence must be [B,T,D], got "
@@ -452,10 +446,54 @@ class Decoder(nn.Module):
                 f"{tuple(sequence.shape)}."
             )
 
-        pooled = torch.sum(
+        return torch.sum(
             sequence * temporal_weights.unsqueeze(-1),
             dim=1,
         )
+
+    # ------------------------------------------------------------------
+    # Shared CRA projection helpers
+    # ------------------------------------------------------------------
+    def _sample_projection_dropout_mask(self, reference):
+        dropout_layer = self.video_proj[0]
+
+        if not self.training or dropout_layer.p <= 0.0:
+            return torch.ones_like(reference)
+
+        keep_prob = 1.0 - float(dropout_layer.p)
+        if keep_prob <= 0.0:
+            raise ValueError(
+                "video projection dropout must be < 1."
+            )
+
+        mask = torch.empty_like(reference).bernoulli_(keep_prob)
+        return mask / keep_prob
+
+    def _apply_video_projection(self, pooled, dropout_mask):
+        if pooled.shape != dropout_mask.shape:
+            raise ValueError(
+                "pooled representation and dropout mask must have the same "
+                f"shape; got {tuple(pooled.shape)} and "
+                f"{tuple(dropout_mask.shape)}."
+            )
+
+        return self.video_proj[1](
+            pooled * dropout_mask
+        )
+
+    def _project_temporal_sequence(
+        self,
+        sequence,
+        temporal_weights,
+        projection_dropout_mask,
+        do=False,
+        x_star_proj=None,
+    ):
+        pooled = self._pool_temporal_sequence(
+            sequence,
+            temporal_weights,
+        )
+
         projected = self._apply_video_projection(
             pooled,
             projection_dropout_mask,
@@ -466,25 +504,27 @@ class Decoder(nn.Module):
                 raise ValueError(
                     "x_star_proj is required when visual intervention is enabled."
                 )
-            projected = self.do(x_star_proj, projected)
-        return projected
+            projected = self.do(
+                x_star_proj,
+                projected,
+            )
+
+        return pooled, projected
 
     # ------------------------------------------------------------------
-    # V2.0 verifier methods are intentionally invalid in V2.1.
-    # Leaving explicit fail-fast stubs catches stale pipeline code.
+    # Explicit fail-fast stubs for mechanisms removed before V2.4.
     # ------------------------------------------------------------------
     def score_functional_composition_pairs(self, *args, **kwargs):
         del args, kwargs
         raise RuntimeError(
-            "score_functional_composition_pairs() was removed in Q-Bound V2.1. "
-            "V2.1 has no functional KEEP/MERGE verifier. Update cra_pipeline.py."
+            "score_functional_composition_pairs() is not part of Q-Bound V2.4. "
+            "V2.4 has no answer-based functional temporal critic."
         )
 
     def score_boundary_equilibrium_views(self, *args, **kwargs):
         del args, kwargs
         raise RuntimeError(
-            "score_boundary_equilibrium_views() was removed in Q-Bound V2.1. "
-            "V2.1 has no boundary-equilibrium verifier. Update cra_pipeline.py."
+            "score_boundary_equilibrium_views() is not part of Q-Bound V2.4."
         )
 
     # ------------------------------------------------------------------
@@ -494,6 +534,7 @@ class Decoder(nn.Module):
         self,
         final_key,
         training_key,
+        soft_key,
         base_temporal,
         qbound_active,
         qbound_time=None,
@@ -501,34 +542,46 @@ class Decoder(nn.Module):
         if qbound_active:
             if qbound_time is None:
                 raise ValueError(
-                    "qbound_time is required for active Q-Bound V2.1."
+                    "qbound_time is required for active Q-Bound V2.4."
                 )
+
             time_param = dict(qbound_time)
             time_param["key"] = final_key
         else:
             time_param = self.grounding_module.gen_grounding(
                 final_key,
                 window_sizes=self.cfgs["model"].get(
-                    "window_sizes", [1, 3, 5]
+                    "window_sizes",
+                    [1, 3, 5],
                 ),
             )
 
         time_param["ori_key"] = base_temporal["ori_key"]
         time_param["cra_key"] = base_temporal["cra_key"]
+
+        # Canonical Q-Bound temporal interfaces.
         time_param["qbound_key"] = final_key
         time_param["qbound_training_key"] = training_key
+        time_param["qbound_soft_key"] = soft_key
+
         time_param["qbound_mix"] = torch.full(
             (final_key.size(0),),
             1.0 if qbound_active else 0.0,
             dtype=final_key.dtype,
             device=final_key.device,
         )
+
         time_param["qbound_handover_enabled"] = torch.zeros(
-            (), dtype=final_key.dtype, device=final_key.device
+            (),
+            dtype=final_key.dtype,
+            device=final_key.device,
         )
         time_param["qbound_smoothing_applied"] = torch.zeros(
-            (), dtype=final_key.dtype, device=final_key.device
+            (),
+            dtype=final_key.dtype,
+            device=final_key.device,
         )
+
         return time_param
 
     # ------------------------------------------------------------------
@@ -557,10 +610,11 @@ class Decoder(nn.Module):
             use_qbound = bool(use_qbound or use_gpeb)
 
         # --------------------------------------------------------------
-        # CRA branch is retained only as the downstream benchmark/reference.
+        # CRA branch: retained as benchmark/reference and QA host.
         # --------------------------------------------------------------
         for layer in self.layers:
             x = layer(x, self_mask)
+
         x_bar = self.norm(x)
         batch_size, time_steps, _ = x_bar.shape
 
@@ -571,55 +625,69 @@ class Decoder(nn.Module):
             x_bar.device,
         )
 
-        qbound_active = bool(self.qbound_enabled and use_qbound)
+        qbound_active = bool(
+            self.qbound_enabled and use_qbound
+        )
+
         if qbound_active and do:
             raise RuntimeError(
-                "Controlled Q-Bound V2.1 requires model.do=false. "
-                "VisualIntervention would confound the temporal-composition "
-                "experiment."
+                "Controlled Q-Bound V2.4 requires model.do=false. "
+                "VisualIntervention would confound the grounding experiment."
             )
 
-        # CRA temporal grounding remains a detached reference while Q-Bound
-        # is active.  It cannot teach or shape Q-Bound's segment structure.
+        # CRA temporal grounding remains a detached reference whenever Q-Bound
+        # is active.  CRA must not teach Q-Bound's temporal topology.
         if qbound_active:
             with torch.no_grad():
-                base_temporal = self.grounding_module.compute_base_temporal(
+                base_temporal = (
+                    self.grounding_module.compute_base_temporal(
+                        x_bar,
+                        qa,
+                        valid_mask=valid_mask,
+                    )
+                )
+        else:
+            base_temporal = (
+                self.grounding_module.compute_base_temporal(
                     x_bar,
                     qa,
                     valid_mask=valid_mask,
                 )
-        else:
-            base_temporal = self.grounding_module.compute_base_temporal(
-                x_bar,
-                qa,
-                valid_mask=valid_mask,
             )
 
         cra_key = self._normalize_temporal_distribution(
             base_temporal["cra_key"],
             valid_mask,
         )
+
         if qbound_active:
             cra_key = cra_key.detach()
 
+        # Shared projection dropout is sampled once so CRA/Q-Bound hard/soft
+        # feature comparisons are not contaminated by different dropout masks.
         projection_reference = self._masked_mean_video(
-            x_bar, valid_mask
+            x_bar,
+            valid_mask,
         )
-        projection_dropout_mask = self._sample_projection_dropout_mask(
-            projection_reference
+        projection_dropout_mask = (
+            self._sample_projection_dropout_mask(
+                projection_reference
+            )
         )
 
         x_star_proj = None
         if do:
-            x_star_dropout_mask = self._sample_projection_dropout_mask(
-                projection_reference
+            x_star_dropout_mask = (
+                self._sample_projection_dropout_mask(
+                    projection_reference
+                )
             )
             x_star_proj = self._apply_video_projection(
                 projection_reference,
                 x_star_dropout_mask,
             )
 
-        cra_video_proj = self._project_temporal_sequence(
+        _, cra_video_proj = self._project_temporal_sequence(
             sequence=x_bar,
             temporal_weights=cra_key,
             projection_dropout_mask=projection_dropout_mask,
@@ -632,44 +700,46 @@ class Decoder(nn.Module):
 
         if qbound_active:
             # ----------------------------------------------------------
-            # Q-Bound input contract.
+            # Strict V2.4 question-only input contract.
             # ----------------------------------------------------------
-            if question_feature is None and self.qbound_require_question_only:
+            if question_feature is None:
                 raise ValueError(
-                    "Q-Bound V2.1 requires question_feature. "
-                    "Do not reuse candidate-answer features as Q-Bound input."
+                    "Q-Bound V2.4 requires question_feature. "
+                    "Answer/candidate-answer features may not be substituted."
                 )
 
-            qbound_language = (
-                question_feature if question_feature is not None else qa
-            )
-            if self.qbound_require_token_question and qbound_language.ndim != 3:
+            if self.qbound_require_token_question and question_feature.ndim != 3:
                 raise ValueError(
-                    "Q-Bound V2.1 requires token-level question features "
-                    "[B,L,D]. Pass LanModel.encode_question(...)[1], not only "
-                    "the pooled question vector."
+                    "Q-Bound V2.4 requires token-level question features "
+                    "[B,L,D] for early Q->V cross-attention."
                 )
 
             if qbound_video_tokens is None:
                 raise ValueError(
-                    "Q-Bound V2.1 requires qbound_video_tokens=[B,T,D] "
-                    "containing the raw/generic local visual sequence."
+                    "Q-Bound V2.4 requires qbound_video_tokens=[B,T,D] "
+                    "containing the raw/generic CLIP sequence."
                 )
+
             if qbound_video_tokens.ndim != 3:
                 raise ValueError(
                     "qbound_video_tokens must be [B,T,D], got "
                     f"{tuple(qbound_video_tokens.shape)}."
                 )
-            if qbound_video_tokens.shape[:2] != (batch_size, time_steps):
+
+            if qbound_video_tokens.shape[:2] != (
+                batch_size,
+                time_steps,
+            ):
                 raise ValueError(
                     "qbound_video_tokens batch/time mismatch: expected "
                     f"{(batch_size, time_steps)}, got "
                     f"{tuple(qbound_video_tokens.shape[:2])}."
                 )
+
             if qbound_video_tokens.size(-1) != self.embed_dim:
                 raise ValueError(
-                    "Controlled V2.1 currently expects generic visual "
-                    f"dimension {self.embed_dim}; got "
+                    "Q-Bound V2.4 currently expects visual dimension "
+                    f"{self.embed_dim}; got "
                     f"{qbound_video_tokens.size(-1)}."
                 )
 
@@ -677,24 +747,36 @@ class Decoder(nn.Module):
                 device=x_bar.device,
                 dtype=x_bar.dtype,
             )
-            qbound_language = qbound_language.to(
+
+            qbound_language = question_feature.to(
                 device=x_bar.device,
                 dtype=x_bar.dtype,
             )
 
-            normalized_question_mask = self._normalize_question_mask(
-                question_mask,
-                qbound_language,
-                x_bar.device,
+            normalized_question_mask = (
+                self._normalize_question_mask(
+                    question_mask,
+                    qbound_language,
+                    x_bar.device,
+                )
             )
 
+            # External feature sources are detached by default so the V2.4
+            # experiment learns only Q-Bound's own WHERE representation.
             if self.qbound_detach_backbone_inputs:
-                video_for_qbound = qbound_video_tokens.detach()
-                language_for_qbound = qbound_language.detach()
+                video_for_qbound = (
+                    qbound_video_tokens.detach()
+                )
+                language_for_qbound = (
+                    qbound_language.detach()
+                )
             else:
                 video_for_qbound = qbound_video_tokens
                 language_for_qbound = qbound_language
 
+            # ----------------------------------------------------------
+            # One-stage V2.4 Core-to-Closure grounding.
+            # ----------------------------------------------------------
             qbound_aux = self.qbound(
                 video_tokens=video_for_qbound,
                 question_features=language_for_qbound,
@@ -704,259 +786,353 @@ class Decoder(nn.Module):
 
             required_core_keys = {
                 "qbound_version",
-                "latent_segment_composition_enabled",
-                "question_token_interaction_enabled",
-                "segment_energy_enabled",
-                "fixed_event_partition_enabled",
-                "dynamic_event_count_enabled",
-                "event_count_cap_enabled",
-                "cut_field_enabled",
-                "boundary_gated_reasoning_enabled",
+
+                # Architecture flags.
+                "core_to_closure_enabled",
+                "temporal_context_enabled",
+                "early_question_conditioning_enabled",
+                "evidence_core_enabled",
+                "event_continuity_enabled",
+                "same_interval_model_for_hard_and_soft",
+                "value_where_separation_enabled",
+
+                "boundary_refiner_enabled",
+                "local_candidate_refinement_enabled",
+                "adaptive_radius_enabled",
+                "learned_routing_gate_enabled",
                 "independent_endpoint_heads_enabled",
-                "hypothesis_competition_enabled",
-                "teacher_distillation_enabled",
                 "answer_features_used_in_core",
                 "temporal_gt_used_in_core",
-                "content_tokens",
-                "primitive_states",
-                "query_conditioned_states",
-                "node_relevance",
-                "adjacent_relation",
+                "answer_conditioned_temporal_critic_enabled",
+                "length_prior_enabled",
+                "gaussian_smoothing_enabled",
+                "fixed_event_count_enabled",
+
+                # Representation.
+                "value_tokens",
+                "where_context_states",
+                "question_conditioned_states",
+                "question_state",
+
+                # Core / continuity.
+                "evidence_core",
+                "evidence_core_prob",
+                "evidence_core_entropy_ratio",
+                "evidence_core_top1_prob",
+                "event_continuity",
+                "continuity_mask",
+
+                # Shared interval model.
                 "segment_energy",
                 "segment_prob",
                 "segment_entropy_ratio",
                 "segment_top1_prob",
+                "main_temporal_prob",
                 "soft_temporal_prob",
                 "training_temporal_prob",
-                "main_temporal_prob",
-                "main_temporal_logits",
-                "main_soft_support",
                 "selected_span_start_frame",
                 "selected_span_end_frame",
                 "selected_span_frame_mask",
-                "selected_span_frame_weights",
                 "selected_span_length",
                 "selected_span_fraction",
                 "soft_expected_span_length",
                 "soft_expected_span_fraction",
                 "single_frame_prob_mass",
                 "short_span_prob_mass",
-                "selected_single_frame_indicator",
-                "selected_full_video_indicator",
             }
-            missing = sorted(required_core_keys.difference(qbound_aux))
+
+            missing = sorted(
+                required_core_keys.difference(qbound_aux)
+            )
             if missing:
                 raise KeyError(
-                    "Q-Bound V2.1 core output is missing: "
+                    "Q-Bound V2.4 core output is missing: "
                     + ", ".join(missing)
                 )
 
             if str(qbound_aux["qbound_version"]) != self.qbound_version:
                 raise RuntimeError(
-                    "RefineDecoder/QBoundCore V2.1 runtime version mismatch: "
+                    "RefineDecoder/QBoundCore V2.4 runtime version mismatch: "
                     f"decoder={self.qbound_version!r}, "
                     f"core={qbound_aux['qbound_version']!r}."
                 )
 
-            def _flag(name):
-                value = qbound_aux[name]
-                if not torch.is_tensor(value):
+            def _flag(container, name):
+                value = container[name]
+                if not torch.is_tensor(value) or value.numel() != 1:
                     raise TypeError(
-                        f"Q-Bound flag {name!r} must be a tensor."
+                        f"Q-Bound flag {name!r} must be a scalar tensor."
                     )
                 return float(value.detach().item())
 
-            # Positive V2.1 requirements.
-            if _flag("latent_segment_composition_enabled") != 1.0:
-                raise RuntimeError(
-                    "V2.1 requires latent segment composition."
-                )
-            if _flag("question_token_interaction_enabled") != 1.0:
-                raise RuntimeError(
-                    "V2.1 requires token-level question interaction."
-                )
-            if _flag("segment_energy_enabled") != 1.0:
-                raise RuntimeError(
-                    "V2.1 requires one shared segment-energy model."
-                )
+            required_core_on = {
+                "core_to_closure_enabled",
+                "temporal_context_enabled",
+                "early_question_conditioning_enabled",
+                "evidence_core_enabled",
+                "event_continuity_enabled",
+                "same_interval_model_for_hard_and_soft",
+                "value_where_separation_enabled",
+            }
 
-            # Removed mechanisms must stay off.
-            forbidden_active_flags = {
-                "fixed_event_partition_enabled",
-                "dynamic_event_count_enabled",
-                "event_count_cap_enabled",
-                "cut_field_enabled",
-                "boundary_gated_reasoning_enabled",
+            for name in required_core_on:
+                if _flag(qbound_aux, name) != 1.0:
+                    raise RuntimeError(
+                        f"Q-Bound V2.4 requires core flag {name}=1."
+                    )
+
+            required_core_off = {
+                "boundary_refiner_enabled",
+                "local_candidate_refinement_enabled",
+                "adaptive_radius_enabled",
+                "learned_routing_gate_enabled",
                 "independent_endpoint_heads_enabled",
-                "hypothesis_competition_enabled",
-                "teacher_distillation_enabled",
                 "answer_features_used_in_core",
                 "temporal_gt_used_in_core",
+                "answer_conditioned_temporal_critic_enabled",
+                "length_prior_enabled",
+                "gaussian_smoothing_enabled",
+                "fixed_event_count_enabled",
             }
-            for name in forbidden_active_flags:
-                if _flag(name) != 0.0:
+
+            for name in required_core_off:
+                if _flag(qbound_aux, name) != 0.0:
                     raise RuntimeError(
-                        f"Q-Bound V2.1 requires {name}=0."
+                        f"Q-Bound V2.4 requires core flag {name}=0."
                     )
 
             # ----------------------------------------------------------
-            # One shared soft/hard segment model.
+            # Final V2.4 temporal distributions.
+            #
+            # final_key:
+            #     hard MAP support for official downstream CRA QA.
+            #
+            # training_key / soft_key:
+            #     differentiable soft membership from the SAME P(s,e), exposed
+            #     for the Q-Bound Video-Question grounding objective.
+            #
+            # The soft key is deliberately NOT substituted into the official
+            # CRA answer feature; therefore VQA cannot shape Q-Bound topology.
             # ----------------------------------------------------------
             final_key = self._normalize_temporal_distribution(
                 qbound_aux["main_temporal_prob"],
                 valid_mask,
-            )
-            qbound_key = final_key
+            ).detach()
 
-            training_key = self._normalize_temporal_distribution(
-                qbound_aux["training_temporal_prob"],
-                valid_mask,
-            )
             soft_key = self._normalize_temporal_distribution(
                 qbound_aux["soft_temporal_prob"],
                 valid_mask,
             )
 
-            qbound_time = self.grounding_module.gen_adaptive_grounding(
-                final_key,
-                selected_span_start_frame=qbound_aux[
-                    "selected_span_start_frame"
-                ],
-                selected_span_end_frame=qbound_aux[
-                    "selected_span_end_frame"
-                ],
-                valid_mask=valid_mask,
-                selected_frame_mask=qbound_aux[
-                    "selected_span_frame_mask"
-                ],
+            training_key = self._normalize_temporal_distribution(
+                qbound_aux["training_temporal_prob"],
+                valid_mask,
             )
+
+            # Core V2.4 guarantees training_temporal_prob == soft_temporal_prob.
+            # Check numerically without cutting the differentiable path.
+            soft_training_max_abs_diff = (
+                training_key.detach()
+                - soft_key.detach()
+            ).abs().amax(dim=-1)
+
+            # ----------------------------------------------------------
+            # Exact hard interval metadata.  No smoothing/refinement.
+            # ----------------------------------------------------------
+            qbound_time = (
+                self.grounding_module.gen_adaptive_grounding(
+                    final_key,
+                    selected_span_start_frame=qbound_aux[
+                        "selected_span_start_frame"
+                    ],
+                    selected_span_end_frame=qbound_aux[
+                        "selected_span_end_frame"
+                    ],
+                    valid_mask=valid_mask,
+                    selected_frame_mask=qbound_aux[
+                        "selected_span_frame_mask"
+                    ],
+                )
+            )
+
             qbound_time["pre_smooth_key"] = final_key
             qbound_time["post_smooth_key"] = final_key
             qbound_time["qbound_key"] = final_key
             qbound_time["qbound_training_key"] = training_key
             qbound_time["qbound_soft_key"] = soft_key
             qbound_time["qbound_smoothing_applied"] = torch.zeros(
-                (), dtype=final_key.dtype, device=final_key.device
+                (),
+                dtype=final_key.dtype,
+                device=final_key.device,
             )
 
             # ----------------------------------------------------------
-            # CRITICAL V2.1 anti-leak design:
-            # Answer evidence is pooled from Q-Bound's temporally LOCAL
-            # content tokens, not from globally contextualized CRA x_bar.
+            # VALUE evidence.
+            #
+            # QBoundCore returns the original masked CLIP/value tokens.
+            # The Q-conditioned WHERE states are NEVER pooled as downstream
+            # visual evidence in V2.4.
             # ----------------------------------------------------------
-            local_evidence_sequence = qbound_aux["content_tokens"]
-            if local_evidence_sequence.shape != qbound_video_tokens.shape:
+            value_sequence = qbound_aux["value_tokens"]
+
+            if value_sequence.shape != qbound_video_tokens.shape:
                 raise ValueError(
-                    "Q-Bound content_tokens must preserve [B,T,D] for local "
-                    "answer evidence; expected "
+                    "Q-Bound value_tokens must preserve [B,T,D]; expected "
                     f"{tuple(qbound_video_tokens.shape)}, got "
-                    f"{tuple(local_evidence_sequence.shape)}."
+                    f"{tuple(value_sequence.shape)}."
                 )
 
-            qbound_hard_video_proj = self._project_temporal_sequence(
-                sequence=local_evidence_sequence,
+            # Hard evidence: official downstream QA feature.
+            (
+                qbound_hard_pooled_value,
+                qbound_hard_video_proj,
+            ) = self._project_temporal_sequence(
+                sequence=value_sequence,
                 temporal_weights=final_key,
                 projection_dropout_mask=projection_dropout_mask,
                 do=False,
                 x_star_proj=None,
             )
 
-            # Forward value is numerically the same as hard H*, but gradients
-            # pass through the soft structured posterior.
-            qbound_training_video_proj = self._project_temporal_sequence(
-                sequence=local_evidence_sequence,
-                temporal_weights=training_key,
-                projection_dropout_mask=projection_dropout_mask,
-                do=False,
-                x_star_proj=None,
-            )
-
-            # True soft evidence is exposed for diagnostics / optional
-            # answer-only auxiliary supervision in the next integration step.
-            qbound_soft_video_proj = self._project_temporal_sequence(
-                sequence=local_evidence_sequence,
+            # Soft evidence: differentiable grounding supervision feature.
+            (
+                qbound_soft_pooled_value,
+                qbound_soft_video_proj,
+            ) = self._project_temporal_sequence(
+                sequence=value_sequence,
                 temporal_weights=soft_key,
                 projection_dropout_mask=projection_dropout_mask,
                 do=False,
                 x_star_proj=None,
             )
 
-            # Official downstream answer feature.  Forward = hard H*;
-            # backward = structured soft segment posterior.
-            qbound_video_proj = qbound_training_video_proj
-            video_proj = qbound_video_proj
-
-            # The ST feature should match the hard feature numerically in
-            # forward. Log any accidental divergence explicitly.
-            st_hard_max_abs_diff = (
-                qbound_training_video_proj
-                - qbound_hard_video_proj
-            ).abs().amax(dim=-1)
-
-            qbound_aux["qbound_local_evidence_sequence"] = (
-                local_evidence_sequence
+            (
+                qbound_training_pooled_value,
+                qbound_training_video_proj,
+            ) = self._project_temporal_sequence(
+                sequence=value_sequence,
+                temporal_weights=training_key,
+                projection_dropout_mask=projection_dropout_mask,
+                do=False,
+                x_star_proj=None,
             )
-            qbound_aux["qbound_hard_video_proj"] = qbound_hard_video_proj
+
+            # Official answer-space feature is HARD and contains no gradient
+            # through the discrete temporal topology.
+            video_proj = qbound_hard_video_proj
+
+            # ----------------------------------------------------------
+            # Expose clean V2.4 contract for cra_pipeline.py / diagnostics.
+            # ----------------------------------------------------------
+            qbound_aux["qbound_key"] = final_key
+            qbound_aux["qbound_training_key"] = training_key
+            qbound_aux["qbound_soft_key"] = soft_key
+            qbound_aux["final_key"] = final_key
+
+            qbound_aux["qbound_value_sequence"] = value_sequence
+
+            qbound_aux["qbound_hard_pooled_value"] = (
+                qbound_hard_pooled_value
+            )
+            qbound_aux["qbound_soft_pooled_value"] = (
+                qbound_soft_pooled_value
+            )
+            qbound_aux["qbound_training_pooled_value"] = (
+                qbound_training_pooled_value
+            )
+
+            qbound_aux["qbound_hard_video_proj"] = (
+                qbound_hard_video_proj
+            )
+            qbound_aux["qbound_soft_video_proj"] = (
+                qbound_soft_video_proj
+            )
             qbound_aux["qbound_training_video_proj"] = (
                 qbound_training_video_proj
             )
-            qbound_aux["qbound_soft_video_proj"] = qbound_soft_video_proj
-            qbound_aux["qbound_st_hard_feature_max_abs_diff"] = (
-                st_hard_max_abs_diff
+
+            qbound_aux["qbound_soft_training_key_max_abs_diff"] = (
+                soft_training_max_abs_diff
             )
+
             qbound_aux["qbound_question_mask_provided"] = torch.as_tensor(
                 float(normalized_question_mask is not None),
                 dtype=x_bar.dtype,
                 device=x_bar.device,
             )
 
-            # Explicit anti-shortcut provenance flags.
+            # Provenance / anti-shortcut flags.
             qbound_aux["qbound_input_is_generic"] = torch.ones(
-                (), dtype=x_bar.dtype, device=x_bar.device
+                (),
+                dtype=x_bar.dtype,
+                device=x_bar.device,
             )
             qbound_aux["qbound_input_uses_cra_embedding"] = torch.zeros(
-                (), dtype=x_bar.dtype, device=x_bar.device
+                (),
+                dtype=x_bar.dtype,
+                device=x_bar.device,
             )
-            qbound_aux["qbound_answer_evidence_uses_local_tokens"] = torch.ones(
-                (), dtype=x_bar.dtype, device=x_bar.device
+            qbound_aux["qbound_value_uses_question_conditioned_states"] = (
+                torch.zeros(
+                    (),
+                    dtype=x_bar.dtype,
+                    device=x_bar.device,
+                )
             )
-            qbound_aux["qbound_answer_evidence_uses_cra_context"] = torch.zeros(
-                (), dtype=x_bar.dtype, device=x_bar.device
+            qbound_aux["qbound_value_uses_raw_visual_tokens"] = torch.ones(
+                (),
+                dtype=x_bar.dtype,
+                device=x_bar.device,
             )
-            qbound_aux["functional_verifier_used"] = torch.zeros(
-                (), dtype=x_bar.dtype, device=x_bar.device
+            qbound_aux["qbound_vqa_gradient_to_topology_enabled"] = (
+                torch.zeros(
+                    (),
+                    dtype=x_bar.dtype,
+                    device=x_bar.device,
+                )
             )
-            qbound_aux["boundary_equilibrium_used"] = torch.zeros(
-                (), dtype=x_bar.dtype, device=x_bar.device
+            qbound_aux["qbound_soft_grounding_feature_exposed"] = torch.ones(
+                (),
+                dtype=x_bar.dtype,
+                device=x_bar.device,
             )
-            qbound_aux["teacher_distribution_used"] = torch.zeros(
-                (), dtype=x_bar.dtype, device=x_bar.device
+            qbound_aux["functional_critic_used_in_decoder"] = torch.zeros(
+                (),
+                dtype=x_bar.dtype,
+                device=x_bar.device,
+            )
+            qbound_aux["answer_features_used_in_temporal_inference"] = (
+                torch.zeros(
+                    (),
+                    dtype=x_bar.dtype,
+                    device=x_bar.device,
+                )
             )
 
-            # Downstream/reference aliases only.
+            # Reference branch.
             qbound_aux["cra_key"] = cra_key
-            qbound_aux["qbound_key"] = final_key
-            qbound_aux["qbound_training_key"] = training_key
-            qbound_aux["qbound_soft_key"] = soft_key
-            qbound_aux["final_key"] = final_key
-            qbound_aux["main_video_proj"] = qbound_video_proj
-            qbound_aux["qbound_video_proj"] = qbound_video_proj
             qbound_aux["cra_video_proj"] = cra_video_proj
+            qbound_aux["main_video_proj"] = video_proj
+            qbound_aux["qbound_video_proj"] = video_proj
+
         else:
             final_key = cra_key
             training_key = cra_key
-            qbound_key = cra_key
+            soft_key = cra_key
             video_proj = cra_video_proj
 
         time_param = self._build_time_param(
             final_key=final_key,
             training_key=training_key,
+            soft_key=soft_key,
             base_temporal=base_temporal,
             qbound_active=qbound_active,
             qbound_time=qbound_time,
         )
 
-        # Official downstream answer-space feature.
+        # --------------------------------------------------------------
+        # Official downstream QA feature.
+        # --------------------------------------------------------------
         time_param["grounding_feature"] = video_proj
         time_param["qbound_feature"] = video_proj
         time_param["qbound_grounding_feature"] = video_proj
@@ -965,25 +1141,35 @@ class Decoder(nn.Module):
 
         # No direct hidden-event residual into the answer representation.
         zero_residual = torch.zeros_like(video_proj)
+
         time_param["qbound_reasoning_residual"] = zero_residual
         time_param["qbound_reasoning_residual_used"] = zero_residual
         time_param["qbound_reasoning_scale"] = torch.zeros(
-            (), dtype=video_proj.dtype, device=video_proj.device
+            (),
+            dtype=video_proj.dtype,
+            device=video_proj.device,
         )
         time_param["qbound_direct_reasoning_residual_enabled"] = torch.zeros(
-            (), dtype=video_proj.dtype, device=video_proj.device
+            (),
+            dtype=video_proj.dtype,
+            device=video_proj.device,
         )
 
         if qbound_aux is not None:
-            # Prefix the complete V2.1 interface into time_param.
+            # Copy Q-Bound outputs into time_param without producing redundant
+            # qbound_qbound_* keys.
             for key, value in qbound_aux.items():
                 if key == "qbound_version":
                     continue
-                time_param[f"qbound_{key}"] = value
+
+                if key.startswith("qbound_"):
+                    time_param[key] = value
+                else:
+                    time_param[f"qbound_{key}"] = value
 
             time_param["qbound_version"] = self.qbound_version
 
-            # Main exact-span aliases used by metrics / wrappers.
+            # Canonical final-span aliases expected by metrics/wrappers.
             time_param["qbound_selected_span_start_frame"] = qbound_aux[
                 "selected_span_start_frame"
             ]
@@ -1006,8 +1192,9 @@ class Decoder(nn.Module):
                 "soft_expected_span_fraction"
             ]
 
-            # Generic evaluation aliases. These refer to the same V2.1 hard
-            # segment; no V1.x refiner/calibration machinery is restored.
+            # Compatibility aliases: "calibrated" now means the final V2.4
+            # Core-to-Closure MAP output.  No calibration/smoothing mechanism is
+            # actually restored.
             time_param["qbound_calibrated_video_proj"] = video_proj
             time_param["qbound_calibrated_key"] = final_key
             time_param["qbound_calibrated_start"] = time_param["start"]
@@ -1020,33 +1207,44 @@ class Decoder(nn.Module):
                 "selected_span_fraction"
             ]
 
-            # Architecture flags for fail-fast integration checks.
+            # Explicit architecture flags for fail-fast integration checks.
             architecture_flags = (
-                "latent_segment_composition_enabled",
-                "question_token_interaction_enabled",
-                "segment_energy_enabled",
-                "fixed_event_partition_enabled",
-                "dynamic_event_count_enabled",
-                "event_count_cap_enabled",
-                "cut_field_enabled",
-                "boundary_gated_reasoning_enabled",
+                "core_to_closure_enabled",
+                "temporal_context_enabled",
+                "early_question_conditioning_enabled",
+                "evidence_core_enabled",
+                "event_continuity_enabled",
+                "same_interval_model_for_hard_and_soft",
+                "value_where_separation_enabled",
+
+                "boundary_refiner_enabled",
+                "local_candidate_refinement_enabled",
+                "adaptive_radius_enabled",
+                "learned_routing_gate_enabled",
                 "independent_endpoint_heads_enabled",
-                "hypothesis_competition_enabled",
-                "teacher_distillation_enabled",
                 "answer_features_used_in_core",
                 "temporal_gt_used_in_core",
+                "answer_conditioned_temporal_critic_enabled",
+                "length_prior_enabled",
+                "gaussian_smoothing_enabled",
+                "fixed_event_count_enabled",
             )
+
             for name in architecture_flags:
                 time_param[f"qbound_{name}"] = qbound_aux[name]
 
-            qbound_aux["qbound_handover_enabled"] = torch.zeros(
-                (), dtype=video_proj.dtype, device=video_proj.device
+            time_param["qbound_handover_enabled"] = torch.zeros(
+                (),
+                dtype=video_proj.dtype,
+                device=video_proj.device,
             )
-            qbound_aux["qbound_direct_reasoning_residual_enabled"] = torch.zeros(
-                (), dtype=video_proj.dtype, device=video_proj.device
+            time_param["qbound_direct_reasoning_residual_enabled"] = (
+                torch.zeros(
+                    (),
+                    dtype=video_proj.dtype,
+                    device=video_proj.device,
+                )
             )
-            qbound_aux["qbound_reasoning_residual"] = zero_residual
-            qbound_aux["qbound_reasoning_residual_used"] = zero_residual
 
         time_param["qbound_aux"] = qbound_aux
 

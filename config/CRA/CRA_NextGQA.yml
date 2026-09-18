@@ -1,25 +1,55 @@
-# Q-Bound V2.1.0 — Query-Conditioned Latent Temporal Segment Composition
+# Q-Bound V2.4.0 — Question-Conditioned Core-to-Closure Grounding
 #
-# Main path:
-#   official frozen CLIP-L temporal features + question tokens
-#       -> local temporal primitives (x, dx, d2x, relative time)
-#       -> token-level visual-to-question interaction
-#       -> primitive relevance u_t
-#       -> adjacent relation/cohesion r_t
-#       -> shared variable-scale segment energy E(s,e)
-#       -> soft posterior P(s,e) and hard H* from the SAME energy
+# Design goal:
+#   Preserve the useful semantic content of frozen CLIP-L while changing only
+#   the temporal decision mechanism that failed in V2.1 / V2.3.
 #
-# Training:
-#   L = L_CRA/main + lambda_A * L_answer_only
+# WHERE path:
+#   frozen/generic CLIP-L temporal features
+#       -> light WHERE projection
+#       -> one shallow Temporal Context block
+#       -> early token-level Q -> V cross-attention
+#       -> question-conditioned WHERE representation
+#       -> Evidence Core a_t
+#       + Event Continuity j_t
+#       -> Core-to-Closure energy E_Q(s,e)
+#       -> one shared posterior P_Q(s,e)
 #
-# answer_only is used only AFTER H(V,Q) is constructed. It never enters
-# QBoundCore and is not required for grounding inference.
+# VALUE path:
+#   original/masked CLIP-L features
+#       -> pooled by temporal support from P_Q(s,e)
 #
-# Explicitly removed from V2.0:
-#   cut field, cut-gated propagation, independent start/end heads,
-#   functional KEEP/MERGE verifier, boundary-equilibrium objective.
+# Hard / soft use:
+#   hard MAP span from P_Q(s,e)
+#       -> detached temporal key
+#       -> ordinary CRA VideoQA host
 #
-# Temporal GT / IoU / IoP are never used as training supervision.
+#   soft temporal membership from the SAME P_Q(s,e)
+#       -> Video-Question grounding objective
+#       -> gradient trains Q-Bound temporal topology
+#
+# Final training:
+#   L = L_CRA/main + lambda_G * L_ground
+#
+# Important:
+#   - temporal inference is strictly Video + Question;
+#   - answers NEVER enter QBoundCore or temporal topology;
+#   - VQA gradients NEVER train Q-Bound temporal topology;
+#   - no BoundaryRefiner / adaptive local radius;
+#   - no answer-only functional critic;
+#   - no independent start/end heads;
+#   - no learned routing gate;
+#   - no event-count target/cap;
+#   - no length/minimality/sparsity/entropy temporal objective;
+#   - no Gaussian temporal smoothing inside Q-Bound;
+#   - no temporal GT / IoU / IoP training supervision;
+#   - CRA remains only the controlled downstream VideoQA testbed/reference.
+#
+# V2.4 research hypothesis:
+#   discriminative evidence core != complete supporting-event extent.
+#   Core identifies WHERE the strongest question evidence lies;
+#   Continuity determines HOW FAR the supporting event should extend.
+
 dataset:
   name: nextgqa
   csv_path: /content/data/nextgqa
@@ -34,11 +64,13 @@ dataset:
   mc: 5
   a2id: null
   feat_type: CLIPL
+
 model:
   name: CRA
   baseline: refine
   lan: RoBERTa
   lan_weight_path: roberta-base
+
   feature_dim: 768
   word_dim: 768
   d_model: 768
@@ -47,54 +79,89 @@ model:
   num_heads: 8
   dropout: 0.3
   vocab_size: 50265
+
+  # Keep the CRA host/testbed settings unchanged for a controlled comparison.
   n_negs: 1
   prop_num: 1
   sigma: 3.0
   gamma: 1
   lamb: 0.15
+
   window_sizes:
-  - 1
-  - 3
-  - 5
+    - 1
+    - 3
+    - 5
+
   time_penalty: null
   do: false
   vg_loss: 1
   vote: 0
+
   qbound:
     enabled: true
-    version: 2.1.0
-    hidden_dim: 256
+    version: 2.4.0
+
+    # ------------------------------------------------------------
+    # Controlled Q-Bound input contract.
+    # ------------------------------------------------------------
     require_question_only: true
     require_token_question: true
+
+    # Keep the frozen/generic visual source fixed. Q-Bound learns WHERE,
+    # rather than silently fine-tuning the backbone/content representation.
     detach_backbone_inputs: true
+
+    # ------------------------------------------------------------
+    # V2.4 WHERE representation.
+    # One light temporal-context block + early Q -> V interaction.
+    # ------------------------------------------------------------
+    hidden_dim: 256
     dropout: 0.3
-    use_generic_input_adapter: true
-    input_adapter_dropout: 0.3
     num_question_heads: 4
     question_ff_multiplier: 2
+
+    # Shared Core-to-Closure span posterior temperature.
+    # No relation_weight / boundary_weight / length prior is used.
     segment_temperature: 1.0
-    relation_weight: 0.5
-    boundary_weight: 0.25
-    answer_only_supervision:
-      loss_weight: 0.1
+
+    # ------------------------------------------------------------
+    # The ONLY V2.4-specific temporal learning objective.
+    #
+    # Soft evidence from P_Q(s,e) is contrasted against QUESTION-ONLY
+    # representations. Answer candidates and temporal GT are not used.
+    # ------------------------------------------------------------
+    grounding_loss:
+      enabled: true
+      loss_weight: 1.0
+      temperature: 0.07
+
 optim:
   pipeline: cra
   optimizer: Adam
+
+  # Preserve the original CRA downstream objectives as the controlled host.
   loss:
     ce:
       vq: 1
       vqa: 1
     align:
       g: 0.5
+
   clip: 12
   lr: 1.0e-05
   weight_decay: 0
   amsgrad: true
+
+  # All trainable V2.4 temporal components under decoder.qbound.*
+  # use this dedicated learning rate.
   qbound_lr: 5.0e-05
+
   epochs: 15
   save_period: 1
+
   lr_scheduler: warmup
   step_size: 1
+
 stat:
   monitor:
     mode: max
@@ -102,17 +169,33 @@ stat:
     early_stop: 15
     vis: false
     display_port: 8099
+
   record_dir: ./output
   resume: null
+
 misc:
-  running_name: CRA/NextGQA/QBound_v2.1.0_latent_segment_seed2024
-  info: CRA downstream testbed + Q-Bound V2.1.0 | official frozen CLIP-L local temporal
-    features -> local primitive encoder (state + dx + d2x + relative time) -> token-level
-    question interaction -> node relevance + adjacent relation -> shared variable-scale
-    segment energy E(s,e) -> soft P(s,e) and hard H* from the same energy | answer-only
-    candidate supervision lambda_A=0.10 after grounding only | no cut field | no independent
-    start/end heads | no event-count target/cap | no functional KEEP/MERGE verifier
-    | no boundary-equilibrium loss | no teacher distillation | no temporal GT/IoU/IoP
-    training | answer-free grounding inference
+  running_name: CRA/NextGQA/QBound_v2.4.0_core_to_closure_seed2024
+
+  info: >-
+    CRA downstream testbed + Q-Bound V2.4.0.
+    Frozen/generic CLIP-L visual features are preserved as the VALUE source,
+    while a dedicated WHERE representation is learned through one shallow
+    temporal-context block followed by early token-level Question-to-Video
+    interaction. The temporal decision is factorized into question-specific
+    Evidence Core a_t and Event Continuity j_t. All contiguous span scores are
+    derived structurally by a single Core-to-Closure energy E_Q(s,e), producing
+    one shared posterior P_Q(s,e). Hard MAP grounding from this posterior is
+    detached before the ordinary CRA VideoQA host, so VQA gradients cannot shape
+    Q-Bound temporal topology. The soft frame membership from the same posterior
+    is used by one additional Video-Question grounding objective only
+    (lambda_G=1.0, temperature=0.07). Answers never enter QBoundCore or temporal
+    inference/training. There is no BoundaryRefiner, adaptive local radius,
+    functional answer critic, answer-only temporal supervision, learned routing
+    gate, independent start/end heads, event-count target, length/minimality/
+    sparsity/entropy temporal objective, Gaussian smoothing inside Q-Bound, or
+    temporal GT/IoU/IoP training supervision. The controlled goal is to improve
+    mIoP and Acc&GQA over CRA while preserving the mIoU/VQA strengths observed
+    in V2.1 rather than reproducing V2.3 inward-boundary shrinkage.
+
   cuda: '0'
   seed: 2024

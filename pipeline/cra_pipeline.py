@@ -19,60 +19,38 @@ from utils.misc.misc import (
 )
 
 
-
 class CRAPipeline(BasePipeline):
     """
-    CRA training/evaluation pipeline for Q-Bound V2.1.0.
+    CRA training/evaluation pipeline for Q-Bound V2.4.0.
 
-    V2.1 is intentionally smaller than V2.0.
+    V2.4 makes one answer-free temporal decision:
 
-    Main temporal path
-    ------------------
-        local/generic CLIP features + question TOKEN features
-            -> local temporal primitives
-            -> query-conditioned node relevance u_t
-            -> adjacent relation/cohesion r_t
-            -> one shared variable-scale segment energy E(s,e)
-            -> soft P(s,e) + hard H* from the SAME energy
+        Video + Question
+            -> temporal context + early Q->V interaction
+            -> Evidence Core a_t + Event Continuity j_t
+            -> Core-to-Closure P_Q(s,e)
+            -> HARD MAP interval for ordinary CRA VideoQA
+            -> SOFT frame membership for Q-Bound grounding training.
 
-    Q-BoundCore is answer-free.  Candidate answers and GT answer ids never enter
-    the temporal segment scorer.
+    The only Q-Bound-specific objective is Video-Question grounding:
 
-    Training objective
-    ------------------
-    The repository's ordinary CRA factual objective is retained as the main
-    VideoQA testbed objective.  V2.1 adds exactly ONE new Q-Bound-specific loss:
+        L_total = L_CRA/main + lambda_G * L_ground
 
-        L = L_CRA/main
-            + lambda_A * L_answer_only
+    L_ground compares the differentiable SOFT grounded RAW visual value,
+    projected through the host video projector with stop-gradient weights, with
+    a stop-gradient QUESTION-ONLY representation.  Answer semantics, temporal GT,
+    IoU and IoP are never used to train temporal topology.
 
-    where L_answer_only is cross entropy over answer-only candidates using
-    Q-Bound's straight-through evidence representation.
-
-    The forward value of that representation is the hard selected segment H*,
-    while the backward path follows the soft structured segment posterior
-    P(s,e).  Answer-only candidate embeddings are detached in CRA.py, so this
-    auxiliary loss can improve temporal/visual evidence but cannot solve itself
-    by moving the language targets.
-
-    Deliberately absent
-    -------------------
-      * no V2.0 functional KEEP/MERGE verifier;
-      * no boundary-equilibrium pseudo target;
-      * no cut loss;
-      * no event-count loss;
-      * no start/end pseudo supervision;
-      * no target duration / minimum span;
-      * no temporal GT / IoU / IoP training;
-      * no teacher distribution / distillation.
-
-    The hard segment remains the official inference/evaluation grounding.
+    Removed from V2.3: BoundaryRefiner, adaptive-radius candidate search,
+    answer-only functional critic, hierarchical ST, length/minimality objectives,
+    Gaussian smoothing and event-count logic.
     """
 
     def __init__(self, cfgs) -> None:
         super().__init__(cfgs)
 
-        self.qbound_version = "2.1.0"
+        self.qbound_version = "2.4.0"
+
         if self._qbound_enabled():
             model_cfg = self.cfgs.get("model", {})
             qbound_cfg = model_cfg.get("qbound", {})
@@ -92,26 +70,24 @@ class CRAPipeline(BasePipeline):
                     f"{configured_version!r}."
                 )
 
-            # Do not silently carry V2.0 training mechanisms into V2.1.
-            stale_v20 = [
-                key
-                for key in (
-                    "functional_composition",
-                    "boundary_equilibrium",
-                )
-                if key in qbound_cfg
-            ]
-            if stale_v20:
+            stale_keys = (
+                "functional_critic",
+                "boundary_refiner",
+                "relation_weight",
+                "boundary_weight",
+                "adaptive_radius_ratio",
+                "min_radius",
+                "functional_composition",
+                "boundary_equilibrium",
+                "answer_only_supervision",
+            )
+            stale = sorted(key for key in stale_keys if key in qbound_cfg)
+            if stale:
                 raise ValueError(
-                    "Q-Bound V2.1 config still contains removed V2.0 "
-                    "objective blocks: "
-                    + ", ".join(stale_v20)
-                    + ". Remove them before running V2.1."
+                    "Q-Bound V2.4 config contains removed V2.3/legacy keys: "
+                    + ", ".join(stale)
                 )
 
-    # ------------------------------------------------------------------
-    # General helpers
-    # ------------------------------------------------------------------
     def _model_device(self):
         return next(self.model.parameters()).device
 
@@ -130,7 +106,7 @@ class CRAPipeline(BasePipeline):
         )
 
     def _qbound_handover_settings(self):
-        """Compatibility helper: V2.1 has no CRA -> Q-Bound handover."""
+        """Compatibility helper: V2.4 has no CRA -> Q-Bound handover."""
         return 1.0, 0
 
     def _train_qbound_mix(
@@ -257,53 +233,40 @@ class CRAPipeline(BasePipeline):
         )
         return correct - wrong_lse
 
-    # ------------------------------------------------------------------
-    # V2.1 objective configuration
-    # ------------------------------------------------------------------
-    def _qbound_v210_loss_settings(self):
-        """
-        Minimal V2.1 YAML:
-
-            model:
-              qbound:
-                answer_only_supervision:
-                  loss_weight: 0.10
-
-        V2.1 deliberately introduces only one new loss weight.
-        """
+    def _qbound_v240_loss_settings(self):
+        """Return the minimal V2.4 Video-Question grounding settings."""
         model_cfg = self.cfgs.get("model", {})
         qbound_cfg = model_cfg.get("qbound", {})
         if not isinstance(qbound_cfg, dict):
             qbound_cfg = {}
 
-        answer_cfg = qbound_cfg.get(
-            "answer_only_supervision",
-            {},
-        )
-        if answer_cfg is None:
-            answer_cfg = {}
-        if not isinstance(answer_cfg, dict):
+        grounding_cfg = qbound_cfg.get("grounding_loss", {})
+        if grounding_cfg is None:
+            grounding_cfg = {}
+        if not isinstance(grounding_cfg, dict):
             raise TypeError(
-                "model.qbound.answer_only_supervision must be "
-                "a mapping/dict."
+                "model.qbound.grounding_loss must be a mapping/dict."
             )
 
-        loss_weight = float(
-            answer_cfg.get("loss_weight", 0.10)
-        )
+        enabled = bool(grounding_cfg.get("enabled", True))
+        loss_weight = float(grounding_cfg.get("loss_weight", 1.0))
+        temperature = float(grounding_cfg.get("temperature", 0.07))
+
         if loss_weight < 0.0:
+            raise ValueError("grounding_loss.loss_weight must be >= 0.")
+        if temperature <= 0.0:
+            raise ValueError("grounding_loss.temperature must be > 0.")
+        if not enabled and loss_weight != 0.0:
             raise ValueError(
-                "qbound answer_only_supervision.loss_weight "
-                "must be >= 0."
+                "grounding_loss.enabled=false requires loss_weight=0."
             )
 
         return {
-            "answer_only_weight": loss_weight,
+            "grounding_enabled": enabled,
+            "grounding_weight": loss_weight,
+            "grounding_temperature": temperature,
         }
 
-    # ------------------------------------------------------------------
-    # Repository answer scoring
-    # ------------------------------------------------------------------
     def _score_answer_candidates(
         self,
         answer_proj,
@@ -395,277 +358,269 @@ class CRAPipeline(BasePipeline):
             logits = logits.squeeze(1)
         return logits
 
-    # ------------------------------------------------------------------
-    # V2.1 answer-only objective
-    # ------------------------------------------------------------------
-    def _qbound_answer_only_objective(
+    def _project_qbound_value_with_frozen_host(
         self,
-        qbound_aux,
-        labels,
+        pooled_value,
     ):
         """
-        One clean answer-discriminative supervision signal.
-
-        Uses:
-            qbound_answer_only_training_logits
-
-        Their forward value is identical to hard H* logits, but gradient reaches
-        the shared segment-energy model through V2.1's straight-through soft
-        posterior.  Answer-only embeddings are already detached in CRA.py.
+        Map raw CLIP VALUE evidence into CRA's language-comparison space while
+        stopping gradients into the CRA projection itself.
         """
-        required = {
-            "qbound_answer_only_training_logits",
-            "qbound_answer_only_hard_logits",
-            "qbound_answer_only_soft_logits",
-            "qbound_answer_only_train_hard_logit_max_abs_diff",
-            "qbound_answer_only_supervision_available",
-            "qbound_answer_only_embeddings_stop_gradient",
-            "qbound_answer_only_affects_segment_forward",
-            "grounding_requires_answer_at_inference",
-            "answer_only_used_inside_qbound_core",
-            "temporal_gt_used_in_training",
-        }
-        missing = sorted(
-            required.difference(qbound_aux)
+        if pooled_value.ndim != 2:
+            raise ValueError("pooled_value must be [B,D].")
+
+        model_core = (
+            self.model.module
+            if hasattr(self.model, "module")
+            else self.model
         )
+        decoder = getattr(model_core, "decoder", None)
+        if decoder is None:
+            raise AttributeError(
+                "Q-Bound V2.4 grounding requires model.decoder."
+            )
+
+        projection = getattr(decoder, "video_proj", None)
+        if projection is None:
+            raise AttributeError(
+                "RefineDecoder must expose video_proj for the frozen "
+                "grounding metric adapter."
+            )
+
+        linear = None
+        for module in projection.modules():
+            if isinstance(module, nn.Linear):
+                linear = module
+                break
+
+        if linear is None:
+            raise TypeError(
+                "decoder.video_proj must contain an nn.Linear layer."
+            )
+
+        if pooled_value.size(-1) != linear.in_features:
+            raise ValueError(
+                "Q-Bound pooled VALUE dimension does not match host "
+                f"projection input: {pooled_value.size(-1)} vs "
+                f"{linear.in_features}."
+            )
+
+        weight = linear.weight.detach()
+        bias = (
+            linear.bias.detach()
+            if linear.bias is not None
+            else None
+        )
+
+        return F.linear(
+            pooled_value,
+            weight,
+            bias,
+        )
+
+    def _qbound_video_question_objective(
+        self,
+        model_outputs,
+        qbound_aux,
+        temperature,
+    ):
+        """
+        One-directional in-batch Video->Question contrastive grounding.
+
+        qbound_grounding_pooled_value is the SOFT temporal pooling over raw CLIP
+        VALUE tokens.  It is mapped through CRA's existing video projection with
+        stop-gradient weights only to obtain a compatible metric space.
+        qbound_grounding_question is QUESTION-ONLY and detached.  Therefore the
+        new loss trains temporal selection rather than answer/language/projector
+        shortcuts.
+        """
+        if not isinstance(model_outputs, dict):
+            raise TypeError("model_outputs must be a dict.")
+        if not isinstance(qbound_aux, dict):
+            raise TypeError("qbound_aux must be a dict.")
+
+        required = {
+            "qbound_grounding_pooled_value",
+            "qbound_grounding_question",
+            "qbound_grounding_key",
+        }
+        missing = sorted(required.difference(model_outputs))
         if missing:
             raise KeyError(
-                "Q-Bound V2.1 answer-only interface is missing: "
+                "Q-Bound V2.4 grounding interface is missing: "
                 + ", ".join(missing)
             )
 
-        def _require_flag(name, expected):
-            value = qbound_aux[name]
-            if (
-                not torch.is_tensor(value)
-                or value.numel() != 1
-            ):
-                raise TypeError(
-                    f"Q-Bound flag {name!r} must be scalar tensor."
-                )
-            actual = float(
-                value.detach().item()
-            )
-            if actual != float(expected):
-                raise RuntimeError(
-                    f"V2.1 answer-only contract violation: "
-                    f"{name}={actual}, expected {expected}."
-                )
+        pooled_value = model_outputs["qbound_grounding_pooled_value"]
+        question_target = model_outputs["qbound_grounding_question"]
+        soft_key = model_outputs["qbound_grounding_key"]
 
-        _require_flag(
-            "qbound_answer_only_supervision_available",
-            1.0,
-        )
-        _require_flag(
-            "qbound_answer_only_embeddings_stop_gradient",
-            1.0,
-        )
-        _require_flag(
-            "qbound_answer_only_affects_segment_forward",
-            0.0,
-        )
-        _require_flag(
-            "grounding_requires_answer_at_inference",
-            0.0,
-        )
-        _require_flag(
-            "answer_only_used_inside_qbound_core",
-            0.0,
-        )
-        _require_flag(
-            "temporal_gt_used_in_training",
-            0.0,
-        )
-
-        training_logits = qbound_aux[
-            "qbound_answer_only_training_logits"
-        ]
-        hard_logits = qbound_aux[
-            "qbound_answer_only_hard_logits"
-        ]
-        soft_logits = qbound_aux[
-            "qbound_answer_only_soft_logits"
-        ]
-
-        if training_logits.ndim != 2:
+        if pooled_value.ndim != 2 or question_target.ndim != 2:
             raise ValueError(
-                "qbound_answer_only_training_logits must be [B,C]."
-            )
-        if hard_logits.shape != training_logits.shape:
-            raise ValueError(
-                "Hard/training answer-only logits must have "
-                "the same shape."
-            )
-        if soft_logits.shape != training_logits.shape:
-            raise ValueError(
-                "Soft/training answer-only logits must have "
-                "the same shape."
-            )
-        if labels.numel() != training_logits.size(0):
-            raise ValueError(
-                "Answer labels do not match answer-only logits."
-            )
-        if (
-            labels.min().item() < 0
-            or labels.max().item() >= training_logits.size(-1)
-        ):
-            raise ValueError(
-                "answer_id is outside the answer-only candidate range."
+                "Grounded VALUE and question target must both be [B,D]."
             )
 
-        # This is the ONLY new V2.1 auxiliary training loss.
-        answer_only_loss = F.cross_entropy(
-            training_logits,
-            labels,
+        metric_value = self._project_qbound_value_with_frozen_host(
+            pooled_value
         )
+
+        if metric_value.shape != question_target.shape:
+            raise ValueError(
+                "Frozen host-projected VALUE and question target must have "
+                f"the same [B,D]; got {tuple(metric_value.shape)} and "
+                f"{tuple(question_target.shape)}."
+            )
+        if soft_key.ndim != 2 or soft_key.size(0) != pooled_value.size(0):
+            raise ValueError("qbound_grounding_key must be [B,T].")
+        if question_target.requires_grad:
+            raise RuntimeError(
+                "V2.4 grounding question target must be stop-gradient."
+            )
+        if temperature <= 0.0:
+            raise ValueError("grounding temperature must be positive.")
+
+        batch_size = pooled_value.size(0)
+        if batch_size < 2:
+            zero = pooled_value.sum() * 0.0
+            return zero, {
+                "grounding_batch_size": float(batch_size),
+                "grounding_retrieval_acc": 0.0,
+                "grounding_positive_similarity": 0.0,
+                "grounding_negative_similarity": 0.0,
+                "grounding_hardest_negative_similarity": 0.0,
+                "grounding_margin": 0.0,
+            }
+
+        video_unit = F.normalize(metric_value, p=2, dim=-1, eps=1e-6)
+        question_unit = F.normalize(
+            question_target, p=2, dim=-1, eps=1e-6
+        )
+
+        similarity = torch.matmul(
+            video_unit,
+            question_unit.transpose(0, 1),
+        )
+        logits = similarity / float(temperature)
+        labels = torch.arange(
+            batch_size,
+            device=logits.device,
+            dtype=torch.long,
+        )
+        grounding_loss = F.cross_entropy(logits, labels)
 
         with torch.no_grad():
-            hard_ce = F.cross_entropy(
-                hard_logits,
-                labels,
-            ).item()
-            soft_ce = F.cross_entropy(
-                soft_logits,
-                labels,
-            ).item()
-
-            hard_acc = (
-                hard_logits.argmax(dim=-1) == labels
-            ).float().mean().item()
-            soft_acc = (
-                soft_logits.argmax(dim=-1) == labels
-            ).float().mean().item()
-
-            hard_margin = self._answer_decision_margin(
-                hard_logits,
-                labels,
+            positive = similarity.diag()
+            off_diagonal = ~torch.eye(
+                batch_size,
+                dtype=torch.bool,
+                device=similarity.device,
             )
-            soft_margin = self._answer_decision_margin(
-                soft_logits,
-                labels,
+            negative = similarity[off_diagonal].reshape(
+                batch_size, batch_size - 1
             )
-
-            st_logit_diff = qbound_aux[
-                "qbound_answer_only_train_hard_logit_max_abs_diff"
-            ].detach().float()
+            hardest_negative = negative.max(dim=-1).values
+            predicted = logits.argmax(dim=-1)
 
             diagnostics = {
-                "answer_only_hard_ce": hard_ce,
-                "answer_only_soft_ce": soft_ce,
-                "answer_only_hard_acc": hard_acc,
-                "answer_only_soft_acc": soft_acc,
-                "answer_only_hard_margin": (
-                    hard_margin.mean().item()
+                "grounding_batch_size": float(batch_size),
+                "grounding_retrieval_acc": float(
+                    (predicted == labels).float().mean().item()
                 ),
-                "answer_only_soft_margin": (
-                    soft_margin.mean().item()
+                "grounding_positive_similarity": float(
+                    positive.mean().item()
                 ),
-                "answer_only_soft_minus_hard_margin": (
-                    (soft_margin - hard_margin)
-                    .mean()
-                    .item()
+                "grounding_negative_similarity": float(
+                    negative.mean().item()
                 ),
-                "answer_only_train_hard_logit_max_abs_diff": (
-                    st_logit_diff.max().item()
+                "grounding_hardest_negative_similarity": float(
+                    hardest_negative.mean().item()
+                ),
+                "grounding_margin": float(
+                    (positive - hardest_negative).mean().item()
                 ),
             }
 
-        return answer_only_loss, diagnostics
+        return grounding_loss, diagnostics
 
-    # ------------------------------------------------------------------
-    # V2.1 contract validation
-    # ------------------------------------------------------------------
-    def _validate_v210_contract(self, qbound_aux):
+    def _validate_v240_contract(self, qbound_aux):
         if qbound_aux is None:
-            raise KeyError(
-                "Q-Bound V2.1 must expose qbound_aux."
-            )
+            raise KeyError("Q-Bound V2.4 must expose qbound_aux.")
 
         required = {
             "qbound_version",
-
-            # Provenance / anti-leak.
-            "qbound_input_is_generic",
-            "qbound_input_uses_cra_embedding",
-            "qbound_answer_evidence_uses_local_tokens",
-            "qbound_answer_evidence_uses_cra_context",
-            "functional_verifier_used",
-            "boundary_equilibrium_used",
-            "teacher_distribution_used",
-            "grounding_requires_answer_at_inference",
-            "temporal_gt_used_in_training",
-            "answer_only_used_inside_qbound_core",
-
-            # Architecture.
-            "latent_segment_composition_enabled",
-            "question_token_interaction_enabled",
-            "segment_energy_enabled",
-            "fixed_event_partition_enabled",
-            "dynamic_event_count_enabled",
-            "event_count_cap_enabled",
-            "cut_field_enabled",
-            "boundary_gated_reasoning_enabled",
+            "core_to_closure_enabled",
+            "temporal_context_enabled",
+            "early_question_conditioning_enabled",
+            "evidence_core_enabled",
+            "event_continuity_enabled",
+            "same_interval_model_for_hard_and_soft",
+            "value_where_separation_enabled",
+            "boundary_refiner_enabled",
+            "local_candidate_refinement_enabled",
+            "adaptive_radius_enabled",
+            "learned_routing_gate_enabled",
             "independent_endpoint_heads_enabled",
-            "hypothesis_competition_enabled",
-            "teacher_distillation_enabled",
             "answer_features_used_in_core",
             "temporal_gt_used_in_core",
-
-            # Segment model.
-            "node_relevance",
-            "adjacent_relation",
-            "segment_energy",
+            "answer_conditioned_temporal_critic_enabled",
+            "length_prior_enabled",
+            "gaussian_smoothing_enabled",
+            "fixed_event_count_enabled",
+            "qbound_input_is_generic",
+            "qbound_input_uses_cra_embedding",
+            "qbound_value_uses_question_conditioned_states",
+            "qbound_value_uses_raw_visual_tokens",
+            "qbound_vqa_gradient_to_topology_enabled",
+            "qbound_soft_grounding_feature_exposed",
+            "functional_critic_used_in_decoder",
+            "answer_features_used_in_temporal_inference",
+            "grounding_requires_answer_at_inference",
+            "temporal_gt_used_in_training",
+            "answer_candidates_used_in_qbound_temporal_path",
+            "answer_only_used_in_v24",
+            "functional_critic_enabled",
+            "vqa_gradient_to_qbound_topology_enabled",
+            "question_grounding_objective_expected",
+            "qbound_grounding_question_stop_gradient",
+            "evidence_core",
+            "evidence_core_prob",
+            "evidence_core_entropy_ratio",
+            "evidence_core_top1_prob",
+            "event_continuity",
+            "continuity_mask",
             "segment_prob",
             "segment_entropy_ratio",
             "segment_top1_prob",
-            "soft_temporal_prob",
-            "training_temporal_prob",
-            "main_temporal_prob",
+            "single_frame_prob_mass",
+            "short_span_prob_mass",
             "selected_span_start_frame",
             "selected_span_end_frame",
+            "selected_span_frame_mask",
             "selected_span_length",
             "selected_span_fraction",
             "soft_expected_span_length",
             "soft_expected_span_fraction",
-            "single_frame_prob_mass",
-            "short_span_prob_mass",
-            "selected_single_frame_indicator",
-            "selected_full_video_indicator",
-
-            # Soft/hard feature contract.
-            "qbound_hard_video_proj",
-            "qbound_training_video_proj",
-            "qbound_soft_video_proj",
-            "qbound_st_hard_feature_max_abs_diff",
-
-            # Answer-only auxiliary.
-            "qbound_answer_only_hard_logits",
-            "qbound_answer_only_training_logits",
-            "qbound_answer_only_soft_logits",
-            "qbound_answer_only_train_hard_logit_max_abs_diff",
-            "qbound_answer_only_supervision_available",
-            "qbound_answer_only_embeddings_stop_gradient",
-            "qbound_answer_only_affects_segment_forward",
-
-            # Comparison keys.
-            "cra_key",
             "qbound_key",
             "qbound_training_key",
             "qbound_soft_key",
+            "cra_key",
+            "qbound_value_sequence",
+            "qbound_hard_pooled_value",
+            "qbound_soft_pooled_value",
+            "qbound_training_pooled_value",
+            "qbound_hard_video_proj",
+            "qbound_soft_video_proj",
+            "qbound_training_video_proj",
+            "qbound_soft_training_key_max_abs_diff",
         }
 
-        missing = sorted(
-            required.difference(qbound_aux)
-        )
+        missing = sorted(required.difference(qbound_aux))
         if missing:
             raise KeyError(
-                "Missing Q-Bound V2.1 outputs: "
-                + ", ".join(missing)
+                "Missing Q-Bound V2.4 outputs: " + ", ".join(missing)
             )
 
-        if str(
-            qbound_aux["qbound_version"]
-        ) != self.qbound_version:
+        if str(qbound_aux["qbound_version"]) != self.qbound_version:
             raise RuntimeError(
                 "Pipeline/Core Q-Bound version mismatch: "
                 f"pipeline={self.qbound_version!r}, "
@@ -674,148 +629,129 @@ class CRAPipeline(BasePipeline):
 
         def _flag(name, expected):
             value = qbound_aux[name]
-            if (
-                not torch.is_tensor(value)
-                or value.numel() != 1
-            ):
+            if not torch.is_tensor(value) or value.numel() != 1:
                 raise TypeError(
-                    f"Q-Bound flag {name!r} must be a scalar tensor."
+                    f"Q-Bound flag {name!r} must be scalar tensor."
                 )
-            actual = float(
-                value.detach().item()
-            )
+            actual = float(value.detach().item())
             if actual != float(expected):
                 raise RuntimeError(
-                    f"Q-Bound V2.1 flag {name!r} "
-                    f"must be {expected}; got {actual}."
+                    f"Q-Bound V2.4 flag {name!r} must be "
+                    f"{expected}; got {actual}."
                 )
-
-        expected_flags = {
-            "qbound_input_is_generic": 1.0,
-            "qbound_input_uses_cra_embedding": 0.0,
-            "qbound_answer_evidence_uses_local_tokens": 1.0,
-            "qbound_answer_evidence_uses_cra_context": 0.0,
-            "functional_verifier_used": 0.0,
-            "boundary_equilibrium_used": 0.0,
-            "teacher_distribution_used": 0.0,
-
-            "latent_segment_composition_enabled": 1.0,
-            "question_token_interaction_enabled": 1.0,
-            "segment_energy_enabled": 1.0,
-
-            "fixed_event_partition_enabled": 0.0,
-            "dynamic_event_count_enabled": 0.0,
-            "event_count_cap_enabled": 0.0,
-            "cut_field_enabled": 0.0,
-            "boundary_gated_reasoning_enabled": 0.0,
-            "independent_endpoint_heads_enabled": 0.0,
-            "hypothesis_competition_enabled": 0.0,
-            "teacher_distillation_enabled": 0.0,
-            "answer_features_used_in_core": 0.0,
-            "temporal_gt_used_in_core": 0.0,
-
-            "qbound_answer_only_supervision_available": 1.0,
-            "qbound_answer_only_embeddings_stop_gradient": 1.0,
-            "qbound_answer_only_affects_segment_forward": 0.0,
-            "grounding_requires_answer_at_inference": 0.0,
-            "temporal_gt_used_in_training": 0.0,
-            "answer_only_used_inside_qbound_core": 0.0,
-        }
-        for name, expected in expected_flags.items():
-            _flag(name, expected)
-
-        segment_prob = qbound_aux["segment_prob"]
-        if segment_prob.ndim != 3:
-            raise ValueError(
-                "segment_prob must be [B,T,T]."
-            )
-        batch_size, time_steps, time_steps_2 = (
-            segment_prob.shape
-        )
-        if time_steps != time_steps_2:
-            raise ValueError(
-                "segment_prob must be square over time."
-            )
 
         for name in (
-            "main_temporal_prob",
-            "training_temporal_prob",
-            "soft_temporal_prob",
+            "core_to_closure_enabled",
+            "temporal_context_enabled",
+            "early_question_conditioning_enabled",
+            "evidence_core_enabled",
+            "event_continuity_enabled",
+            "same_interval_model_for_hard_and_soft",
+            "value_where_separation_enabled",
+            "qbound_input_is_generic",
+            "qbound_value_uses_raw_visual_tokens",
+            "qbound_soft_grounding_feature_exposed",
+            "question_grounding_objective_expected",
+            "qbound_grounding_question_stop_gradient",
+        ):
+            _flag(name, 1.0)
+
+        for name in (
+            "boundary_refiner_enabled",
+            "local_candidate_refinement_enabled",
+            "adaptive_radius_enabled",
+            "learned_routing_gate_enabled",
+            "independent_endpoint_heads_enabled",
+            "answer_features_used_in_core",
+            "temporal_gt_used_in_core",
+            "answer_conditioned_temporal_critic_enabled",
+            "length_prior_enabled",
+            "gaussian_smoothing_enabled",
+            "fixed_event_count_enabled",
+            "qbound_input_uses_cra_embedding",
+            "qbound_value_uses_question_conditioned_states",
+            "qbound_vqa_gradient_to_topology_enabled",
+            "functional_critic_used_in_decoder",
+            "answer_features_used_in_temporal_inference",
+            "grounding_requires_answer_at_inference",
+            "temporal_gt_used_in_training",
+            "answer_candidates_used_in_qbound_temporal_path",
+            "answer_only_used_in_v24",
+            "functional_critic_enabled",
+            "vqa_gradient_to_qbound_topology_enabled",
+        ):
+            _flag(name, 0.0)
+
+        segment_prob = qbound_aux["segment_prob"]
+        if (
+            segment_prob.ndim != 3
+            or segment_prob.size(1) != segment_prob.size(2)
+        ):
+            raise ValueError("segment_prob must be [B,T,T].")
+
+        batch_size, time_steps, _ = segment_prob.shape
+
+        for name in (
+            "qbound_key",
+            "qbound_training_key",
+            "qbound_soft_key",
+            "selected_span_frame_mask",
+            "evidence_core",
         ):
             value = qbound_aux[name]
-            if value.shape != (
-                batch_size,
-                time_steps,
-            ):
+            if value.shape != (batch_size, time_steps):
                 raise ValueError(
-                    f"{name} must be [B,T], got "
-                    f"{tuple(value.shape)}."
+                    f"{name} must be [B,T], got {tuple(value.shape)}."
                 )
 
-        if qbound_aux["node_relevance"].shape != (
-            batch_size,
-            time_steps,
-        ):
-            raise ValueError(
-                "node_relevance must be [B,T]."
-            )
-
-        if qbound_aux["adjacent_relation"].shape != (
+        if qbound_aux["event_continuity"].shape != (
             batch_size,
             max(time_steps - 1, 0),
         ):
-            raise ValueError(
-                "adjacent_relation must be [B,T-1]."
+            raise ValueError("event_continuity must be [B,T-1].")
+
+        for name in (
+            "qbound_key",
+            "qbound_training_key",
+            "qbound_soft_key",
+        ):
+            value = qbound_aux[name]
+            if not torch.isfinite(value).all():
+                raise RuntimeError(f"{name} contains non-finite values.")
+            total = value.sum(dim=-1)
+            if not torch.allclose(
+                total,
+                torch.ones_like(total),
+                atol=1e-4,
+                rtol=1e-4,
+            ):
+                raise RuntimeError(f"{name} must sum to one.")
+
+        if not torch.allclose(
+            qbound_aux["qbound_training_key"].detach(),
+            qbound_aux["qbound_soft_key"].detach(),
+            atol=1e-6,
+            rtol=1e-6,
+        ):
+            raise RuntimeError(
+                "V2.4 training key must equal soft key numerically."
             )
 
-        start = qbound_aux[
-            "selected_span_start_frame"
-        ]
-        end = qbound_aux[
-            "selected_span_end_frame"
-        ]
-        if (
-            start.shape != (batch_size,)
-            or end.shape != (batch_size,)
-        ):
-            raise ValueError(
-                "selected span endpoints must be [B]."
-            )
+        start = qbound_aux["selected_span_start_frame"]
+        end = qbound_aux["selected_span_end_frame"]
+        if start.shape != (batch_size,) or end.shape != (batch_size,):
+            raise ValueError("selected span endpoints must be [B].")
         if torch.any(start > end):
-            raise RuntimeError(
-                "Q-Bound V2.1 produced start > end."
-            )
+            raise RuntimeError("Q-Bound V2.4 selected span has start > end.")
 
-        # Hard/ST forward equality.
-        feature_diff = qbound_aux[
-            "qbound_st_hard_feature_max_abs_diff"
+        diff = qbound_aux[
+            "qbound_soft_training_key_max_abs_diff"
         ].detach()
-        logit_diff = qbound_aux[
-            "qbound_answer_only_train_hard_logit_max_abs_diff"
-        ].detach()
+        if not torch.isfinite(diff).all():
+            raise RuntimeError("soft/training key diagnostic is non-finite.")
+        if float(diff.max().item()) > 1e-6:
+            raise RuntimeError("V2.4 training and soft keys diverged.")
 
-        if (
-            not torch.isfinite(feature_diff).all()
-            or not torch.isfinite(logit_diff).all()
-        ):
-            raise RuntimeError(
-                "Q-Bound hard/ST diagnostics are non-finite."
-            )
-
-        if float(feature_diff.max().item()) > 1e-5:
-            raise RuntimeError(
-                "V2.1 training feature differs from hard H* "
-                "in the forward pass."
-            )
-        if float(logit_diff.max().item()) > 1e-5:
-            raise RuntimeError(
-                "V2.1 training answer logits differ from hard H* "
-                "in the forward pass."
-            )
-
-    # ------------------------------------------------------------------
-    # Diagnostics
-    # ------------------------------------------------------------------
     def _collect_qbound_stats(
         self,
         gqa_output,
@@ -825,38 +761,15 @@ class CRAPipeline(BasePipeline):
         if extra_logs:
             stats.update(extra_logs)
 
-        qbound_aux = self._get_qbound_aux(
-            gqa_output
-        )
+        qbound_aux = self._get_qbound_aux(gqa_output)
         if qbound_aux is None:
             return stats
 
-        scalar_keys = (
-            # Input / question interaction.
-            "generic_input_adapter_enabled",
-            "generic_input_token_cosine",
-            "generic_input_delta_ratio",
-            "delta_magnitude",
-            "accel_magnitude",
+        for key in (
+            "temporal_context_delta_ratio",
             "question_interaction_delta_ratio",
-
-            # Architecture flags / provenance.
-            "qbound_input_is_generic",
-            "qbound_input_uses_cra_embedding",
-            "qbound_answer_evidence_uses_local_tokens",
-            "qbound_answer_evidence_uses_cra_context",
-            "latent_segment_composition_enabled",
-            "question_token_interaction_enabled",
-            "segment_energy_enabled",
-            "cut_field_enabled",
-            "independent_endpoint_heads_enabled",
-            "answer_features_used_in_core",
-            "teacher_distribution_used",
-            "temporal_gt_used_in_training",
-
-            # Segment health.
-            "node_relevance",
-            "adjacent_relation",
+            "evidence_core_entropy_ratio",
+            "evidence_core_top1_prob",
             "segment_entropy_ratio",
             "segment_top1_prob",
             "selected_span_length",
@@ -867,107 +780,59 @@ class CRAPipeline(BasePipeline):
             "short_span_prob_mass",
             "selected_single_frame_indicator",
             "selected_full_video_indicator",
-
-            # ST contract.
-            "qbound_st_hard_feature_max_abs_diff",
-            "qbound_answer_only_train_hard_logit_max_abs_diff",
-        )
-        for key in scalar_keys:
-            scalar = self._scalar_mean(
-                qbound_aux.get(key)
-            )
+            "qbound_soft_training_key_max_abs_diff",
+        ):
+            scalar = self._scalar_mean(qbound_aux.get(key))
             if scalar is not None:
-                stats[f"qbound_{key}"] = scalar
+                log_key = (
+                    key
+                    if key.startswith("qbound_")
+                    else f"qbound_{key}"
+                )
+                stats[log_key] = scalar
 
-        # Node/edge spread matters more than only their mean.
         for name in (
-            "node_relevance",
-            "adjacent_relation",
+            "evidence_core",
+            "event_continuity",
+            "visual_continuity_raw",
+            "question_continuity_correction_raw",
         ):
             values = qbound_aux.get(name)
-            if (
-                torch.is_tensor(values)
-                and values.numel() > 0
-            ):
+            if torch.is_tensor(values) and values.numel() > 0:
                 values = values.detach().float()
-                stats[f"qbound_{name}_std"] = (
-                    values.std(unbiased=False).item()
-                )
-                stats[f"qbound_{name}_min"] = (
-                    values.min().item()
-                )
-                stats[f"qbound_{name}_max"] = (
-                    values.max().item()
-                )
+                stats[f"qbound_{name}_mean"] = values.mean().item()
+                stats[f"qbound_{name}_std"] = values.std(
+                    unbiased=False
+                ).item()
+                stats[f"qbound_{name}_min"] = values.min().item()
+                stats[f"qbound_{name}_max"] = values.max().item()
 
-        # Hard vs soft structured grounding.
         hard_key = qbound_aux.get("qbound_key")
         soft_key = qbound_aux.get("qbound_soft_key")
-        training_key = qbound_aux.get(
-            "qbound_training_key"
-        )
         cra_key = qbound_aux.get("cra_key")
 
-        if (
-            torch.is_tensor(hard_key)
-            and torch.is_tensor(soft_key)
-        ):
-            hard = self._normalize_distribution(
-                hard_key.detach()
-            )
-            soft = self._normalize_distribution(
-                soft_key.detach()
-            )
-            stats["qbound_hard_soft_js"] = (
-                self._js_divergence(
-                    hard, soft
-                ).mean().item()
-            )
+        if torch.is_tensor(hard_key) and torch.is_tensor(soft_key):
+            hard = self._normalize_distribution(hard_key.detach())
+            soft = self._normalize_distribution(soft_key.detach())
+            stats["qbound_hard_soft_js"] = self._js_divergence(
+                hard, soft
+            ).mean().item()
             stats["qbound_hard_soft_l1"] = (
-                (hard - soft)
-                .abs()
-                .mean()
-                .item()
-            )
+                hard - soft
+            ).abs().mean().item()
 
-        if (
-            torch.is_tensor(hard_key)
-            and torch.is_tensor(cra_key)
-        ):
-            hard = self._normalize_distribution(
-                hard_key.detach()
-            )
-            cra = self._normalize_distribution(
-                cra_key.detach()
-            )
-            stats["qbound_cra_qbound_js"] = (
-                self._js_divergence(
-                    cra, hard
-                ).mean().item()
-            )
-            stats["qbound_cra_qbound_key_l1"] = (
-                (cra - hard)
-                .abs()
-                .mean()
-                .item()
-            )
-
-        if (
-            torch.is_tensor(training_key)
-            and torch.is_tensor(hard_key)
-        ):
-            stats[
-                "qbound_training_hard_forward_l1"
-            ] = (
-                training_key.detach()
-                - hard_key.detach()
+        if torch.is_tensor(hard_key) and torch.is_tensor(cra_key):
+            hard = self._normalize_distribution(hard_key.detach())
+            cra = self._normalize_distribution(cra_key.detach())
+            stats["qbound_cra_hard_js"] = self._js_divergence(
+                cra, hard
+            ).mean().item()
+            stats["qbound_cra_hard_l1"] = (
+                cra - hard
             ).abs().mean().item()
 
         return stats
 
-    # ------------------------------------------------------------------
-    # Gradient diagnostics
-    # ------------------------------------------------------------------
     def _qbound_grad_norm(self):
         if not self._qbound_enabled():
             return None
@@ -1002,132 +867,107 @@ class CRAPipeline(BasePipeline):
     def _qbound_component_grad_norms(self):
         if not self._qbound_enabled():
             return {
-                "qbound_input_adapter_grad_norm": 0.0,
-                "qbound_primitive_grad_norm": 0.0,
+                "qbound_where_input_grad_norm": 0.0,
+                "qbound_temporal_context_grad_norm": 0.0,
                 "qbound_question_interaction_grad_norm": 0.0,
-                "qbound_node_grad_norm": 0.0,
-                "qbound_edge_grad_norm": 0.0,
+                "qbound_core_head_grad_norm": 0.0,
+                "qbound_visual_continuity_grad_norm": 0.0,
+                "qbound_question_continuity_grad_norm": 0.0,
             }
 
         totals = {
-            "input": 0.0,
-            "primitive": 0.0,
+            "where_input": 0.0,
+            "temporal": 0.0,
             "question": 0.0,
-            "node": 0.0,
-            "edge": 0.0,
+            "core": 0.0,
+            "visual_cont": 0.0,
+            "question_cont": 0.0,
         }
 
-        for name, parameter in (
-            self.model.named_parameters()
-        ):
-            if (
-                parameter.grad is None
-                or "qbound" not in name.lower()
-            ):
+        for name, parameter in self.model.named_parameters():
+            if parameter.grad is None or "qbound" not in name.lower():
                 continue
 
             lower = name.lower()
             grad_sq = (
-                parameter.grad
-                .detach()
-                .float()
-                .pow(2)
-                .sum()
-                .item()
+                parameter.grad.detach().float().pow(2).sum().item()
             )
 
-            if "generic_input_" in lower:
-                totals["input"] += grad_sq
-
+            if "where_input_proj" in lower:
+                totals["where_input"] += grad_sq
             if any(
                 token in lower
                 for token in (
-                    "state_proj",
-                    "delta_proj",
-                    "accel_proj",
-                    "position_proj",
-                    "primitive_fuse",
+                    "temporal_norm",
+                    "temporal_attn",
+                    "temporal_ff",
                 )
             ):
-                totals["primitive"] += grad_sq
-
+                totals["temporal"] += grad_sq
             if any(
                 token in lower
                 for token in (
                     "question_token_proj",
-                    "visual_to_question_attn",
-                    "question_cross_norm",
-                    "question_ff",
-                    "question_ff_norm",
+                    "qv_norm",
+                    "qv_attn",
+                    "qv_ff",
                 )
             ):
                 totals["question"] += grad_sq
-
-            if (
-                "node_encoder" in lower
-                or "node_score" in lower
-            ):
-                totals["node"] += grad_sq
-
-            if (
-                "edge_encoder" in lower
-                or "edge_score" in lower
-            ):
-                totals["edge"] += grad_sq
+            if "core_encoder" in lower or "core_score" in lower:
+                totals["core"] += grad_sq
+            if "visual_continuity" in lower:
+                totals["visual_cont"] += grad_sq
+            if "question_continuity" in lower:
+                totals["question_cont"] += grad_sq
 
         return {
-            "qbound_input_adapter_grad_norm": float(
-                totals["input"] ** 0.5
-            ),
-            "qbound_primitive_grad_norm": float(
-                totals["primitive"] ** 0.5
-            ),
-            "qbound_question_interaction_grad_norm": float(
-                totals["question"] ** 0.5
-            ),
-            "qbound_node_grad_norm": float(
-                totals["node"] ** 0.5
-            ),
-            "qbound_edge_grad_norm": float(
-                totals["edge"] ** 0.5
-            ),
+            "qbound_where_input_grad_norm":
+                float(totals["where_input"] ** 0.5),
+            "qbound_temporal_context_grad_norm":
+                float(totals["temporal"] ** 0.5),
+            "qbound_question_interaction_grad_norm":
+                float(totals["question"] ** 0.5),
+            "qbound_core_head_grad_norm":
+                float(totals["core"] ** 0.5),
+            "qbound_visual_continuity_grad_norm":
+                float(totals["visual_cont"] ** 0.5),
+            "qbound_question_continuity_grad_norm":
+                float(totals["question_cont"] ** 0.5),
         }
 
     @staticmethod
     def _qbound_monitor_keys():
         return [
             "qbound_grad_norm",
-            "qbound_input_adapter_grad_norm",
-            "qbound_primitive_grad_norm",
+            "qbound_where_input_grad_norm",
+            "qbound_temporal_context_grad_norm",
             "qbound_question_interaction_grad_norm",
-            "qbound_node_grad_norm",
-            "qbound_edge_grad_norm",
-
-            "qbound_answer_only_weight",
-            "qbound_answer_only_discrimination_loss",
-            "qbound_answer_only_weighted_loss",
-            "qbound_answer_only_hard_ce",
-            "qbound_answer_only_soft_ce",
-            "qbound_answer_only_hard_acc",
-            "qbound_answer_only_soft_acc",
-            "qbound_answer_only_hard_margin",
-            "qbound_answer_only_soft_margin",
-            "qbound_answer_only_soft_minus_hard_margin",
-            "qbound_answer_only_train_hard_logit_max_abs_diff",
-
-            "qbound_generic_input_token_cosine",
-            "qbound_generic_input_delta_ratio",
+            "qbound_core_head_grad_norm",
+            "qbound_visual_continuity_grad_norm",
+            "qbound_question_continuity_grad_norm",
+            "qbound_grounding_weight",
+            "qbound_grounding_temperature",
+            "qbound_grounding_loss",
+            "qbound_grounding_weighted_loss",
+            "qbound_grounding_batch_size",
+            "qbound_grounding_retrieval_acc",
+            "qbound_grounding_positive_similarity",
+            "qbound_grounding_negative_similarity",
+            "qbound_grounding_hardest_negative_similarity",
+            "qbound_grounding_margin",
+            "qbound_temporal_context_delta_ratio",
             "qbound_question_interaction_delta_ratio",
-
-            "qbound_node_relevance",
-            "qbound_node_relevance_std",
-            "qbound_node_relevance_min",
-            "qbound_node_relevance_max",
-            "qbound_adjacent_relation",
-            "qbound_adjacent_relation_std",
-            "qbound_adjacent_relation_min",
-            "qbound_adjacent_relation_max",
-
+            "qbound_evidence_core_entropy_ratio",
+            "qbound_evidence_core_top1_prob",
+            "qbound_evidence_core_mean",
+            "qbound_evidence_core_std",
+            "qbound_event_continuity_mean",
+            "qbound_event_continuity_std",
+            "qbound_visual_continuity_raw_mean",
+            "qbound_visual_continuity_raw_std",
+            "qbound_question_continuity_correction_raw_mean",
+            "qbound_question_continuity_correction_raw_std",
             "qbound_segment_entropy_ratio",
             "qbound_segment_top1_prob",
             "qbound_selected_span_length",
@@ -1138,83 +978,49 @@ class CRAPipeline(BasePipeline):
             "qbound_short_span_prob_mass",
             "qbound_selected_single_frame_indicator",
             "qbound_selected_full_video_indicator",
-
             "qbound_hard_soft_js",
             "qbound_hard_soft_l1",
-            "qbound_cra_qbound_js",
-            "qbound_cra_qbound_key_l1",
-            "qbound_training_hard_forward_l1",
-            "qbound_qbound_st_hard_feature_max_abs_diff",
-            "qbound_qbound_answer_only_train_hard_logit_max_abs_diff",
+            "qbound_cra_hard_js",
+            "qbound_cra_hard_l1",
+            "qbound_soft_training_key_max_abs_diff",
         ]
 
-    # ------------------------------------------------------------------
-    # Training
-    # ------------------------------------------------------------------
     def get_loss(self, batch, qbound_mix=1.0):
         del qbound_mix
         device = self._model_device()
 
         answer_id = batch["answer_id"]
-        answer = batch["answer"].to(
-            device,
-            non_blocking=True,
+        answer = batch["answer"].to(device, non_blocking=True)
+        video_frames = batch["video_frames"].to(
+            device, non_blocking=True
         )
-        video_frames = batch[
-            "video_frames"
-        ].to(
-            device,
-            non_blocking=True,
-        )
-        question = batch[
-            "question"
-        ].to(
-            device,
-            non_blocking=True,
+        question = batch["question"].to(
+            device, non_blocking=True
         )
         qsns_id = batch["qsns_id"]
-        qsns_token_ids = batch[
-            "qsns_token_ids"
-        ]
+        qsns_token_ids = batch["qsns_token_ids"]
         video_len = batch["video_len"]
 
-        answer_only = batch.get("answer_only")
-        if self._qbound_enabled():
-            if answer_only is None:
-                raise KeyError(
-                    "Q-Bound V2.1 requires batch['answer_only']. "
-                    "Use dataset_qbound_v2_1.py and "
-                    "dataloaders_qbound_v2_1.py."
-                )
-            answer_only = answer_only.to(
-                device,
-                non_blocking=True,
-            )
+        settings = self._qbound_v240_loss_settings()
 
         video_mask = (
             get_mask(
                 video_len,
                 self.cfgs["dataset"]["max_feats"],
-            ).to(
-                device,
-                non_blocking=True,
-            )
+            ).to(device, non_blocking=True)
             if self.cfgs["dataset"]["max_feats"] > 0
             else None
         )
 
         batch_size = answer_id.size(0)
         answer_id_device = self._prepare_labels(
-            answer_id,
-            device,
+            answer_id, device
         )
 
         prediction_dict = {}
         target_dict = {}
 
-        # --------------------------------------------------------------
-        # Original CRA VQ objective remains unchanged and Q-Bound-free.
-        # --------------------------------------------------------------
+        # Original CRA VQ objective remains Q-Bound-free.
         if self.cfgs["model"]["vg_loss"]:
             vq_output = self.model(
                 video_frames,
@@ -1224,9 +1030,7 @@ class CRAPipeline(BasePipeline):
                 mode="VQ",
             )
 
-            vq_video_proj = (
-                vq_output[0].unsqueeze(-1)
-            )
+            vq_video_proj = vq_output[0].unsqueeze(-1)
             vq_predicts = torch.bmm(
                 vq_output[1],
                 vq_video_proj,
@@ -1238,33 +1042,18 @@ class CRAPipeline(BasePipeline):
                 -1,
             ).mean(dim=1)
 
-            prediction_dict[
-                "vq_pred"
-            ] = vq_predicts
-            target_dict[
-                "vq_target"
-            ] = qsns_id.to(
+            prediction_dict["vq_pred"] = vq_predicts
+            target_dict["vq_target"] = qsns_id.to(
                 device=device,
                 dtype=torch.long,
                 non_blocking=True,
             ).reshape(-1)
-
-            prediction_dict[
-                "vq_align_pred"
-            ] = (
-                vq_output[2]["time_param"][
-                    "grounding_feature"
-                ]
+            prediction_dict["vq_align_pred"] = (
+                vq_output[2]["time_param"]["grounding_feature"]
             )
-            target_dict[
-                "vq_align_gt"
-            ] = vq_output[2]["align_gt"]
+            target_dict["vq_align_gt"] = vq_output[2]["align_gt"]
 
-        # --------------------------------------------------------------
-        # Main VQA.
-        # Forward numerics use hard H*.  Backward reaches the shared
-        # segment-energy model through the ST temporal distribution.
-        # --------------------------------------------------------------
+        # Main VQA uses the detached HARD MAP temporal key.
         gqa_output = self.model(
             video_frames,
             video_mask,
@@ -1273,15 +1062,14 @@ class CRAPipeline(BasePipeline):
             mode="VQA",
             question=question,
             qbound_mix=(
-                1.0
-                if self._qbound_enabled()
-                else 0.0
+                1.0 if self._qbound_enabled() else 0.0
             ),
-            answer_only=answer_only,
+            answer_only=None,
         )
 
         main_video_proj = gqa_output[0]
         answer_proj = gqa_output[1]
+        model_outputs = gqa_output[2]
 
         main_logits = self._score_answer_candidates(
             answer_proj=answer_proj,
@@ -1289,112 +1077,84 @@ class CRAPipeline(BasePipeline):
             detach_answer=False,
         )
 
-        prediction_dict[
-            "vqa_pred"
-        ] = main_logits
-        target_dict[
-            "vqa_target"
-        ] = answer_id_device
+        prediction_dict["vqa_pred"] = main_logits
+        target_dict["vqa_target"] = answer_id_device
 
-        # Preserve repository main objective exactly as a CRA testbed.
-        prediction_dict[
-            "vqa_align_pred"
-        ] = (
-            gqa_output[2]["time_param"][
-                "grounding_feature"
-            ]
+        prediction_dict["vqa_align_pred"] = (
+            model_outputs["time_param"]["grounding_feature"]
         )
-        target_dict[
-            "vqa_align_gt"
-        ] = gqa_output[2]["align_gt"]
+        target_dict["vqa_align_gt"] = model_outputs["align_gt"]
 
         loss = self.criterion(
             prediction_dict,
             target_dict,
         )
 
-        settings = (
-            self._qbound_v210_loss_settings()
-        )
-        qbound_aux = self._get_qbound_aux(
-            gqa_output
-        )
+        qbound_aux = self._get_qbound_aux(gqa_output)
         qbound_logs = {}
 
         if self._qbound_enabled():
-            self._validate_v210_contract(
-                qbound_aux
-            )
+            self._validate_v240_contract(qbound_aux)
 
-            # Exactly ONE new V2.1 auxiliary objective.
             if (
-                settings["answer_only_weight"]
-                > 0.0
+                settings["grounding_enabled"]
+                and settings["grounding_weight"] > 0.0
             ):
-                (
-                    answer_only_loss,
-                    answer_diag,
-                ) = (
-                    self._qbound_answer_only_objective(
+                grounding_loss, grounding_diag = (
+                    self._qbound_video_question_objective(
+                        model_outputs=model_outputs,
                         qbound_aux=qbound_aux,
-                        labels=answer_id_device,
+                        temperature=settings[
+                            "grounding_temperature"
+                        ],
                     )
                 )
 
-                weighted_answer_only = (
-                    settings["answer_only_weight"]
-                    * answer_only_loss
+                weighted_grounding = (
+                    settings["grounding_weight"]
+                    * grounding_loss
                 )
 
+                loss["qbound_grounding_loss"] = grounding_loss
                 loss[
-                    "qbound_answer_only_discrimination_loss"
-                ] = answer_only_loss
-                loss[
-                    "qbound_answer_only_weighted_loss"
-                ] = weighted_answer_only
-                loss[
-                    "total_loss"
-                ] = (
+                    "qbound_grounding_weighted_loss"
+                ] = weighted_grounding
+                loss["total_loss"] = (
                     loss["total_loss"]
-                    + weighted_answer_only
+                    + weighted_grounding
                 )
 
                 qbound_logs.update(
                     {
                         f"qbound_{name}": value
                         for name, value
-                        in answer_diag.items()
+                        in grounding_diag.items()
                     }
                 )
 
-            qbound_logs[
-                "qbound_answer_only_weight"
-            ] = settings[
-                "answer_only_weight"
-            ]
+            qbound_logs["qbound_grounding_weight"] = (
+                settings["grounding_weight"]
+            )
+            qbound_logs["qbound_grounding_temperature"] = (
+                settings["grounding_temperature"]
+            )
 
         predicted = (
-            main_logits.argmax(
-                dim=-1
-            ).detach().cpu()
+            main_logits.argmax(dim=-1)
+            .detach()
+            .cpu()
         )
         running_accuracy = (
             predicted
             == answer_id.reshape(-1).cpu()
         ).float().mean().item()
 
-        qbound_stats = (
-            self._collect_qbound_stats(
-                gqa_output,
-                extra_logs=qbound_logs,
-            )
+        qbound_stats = self._collect_qbound_stats(
+            gqa_output,
+            extra_logs=qbound_logs,
         )
 
-        return (
-            loss,
-            running_accuracy,
-            qbound_stats,
-        )
+        return loss, running_accuracy, qbound_stats
 
     def _train_epoch(self, epoch):
         self.monitor.log_info(
@@ -1426,10 +1186,10 @@ class CRAPipeline(BasePipeline):
 
         if self._qbound_enabled():
             self.monitor.reset_kv(
-                "qbound_answer_only_discrimination_loss"
+                "qbound_grounding_loss"
             )
             self.monitor.reset_kv(
-                "qbound_answer_only_weighted_loss"
+                "qbound_grounding_weighted_loss"
             )
             for key in (
                 self._qbound_monitor_keys()
@@ -1662,103 +1422,60 @@ class CRAPipeline(BasePipeline):
             test_result,
         )
 
-    # ------------------------------------------------------------------
-    # Reporting / visualization
-    # ------------------------------------------------------------------
     def print_score(self, score):
-        def _print_score(
-            score_dict
-        ):
+        def _print_score(score_dict):
             self.monitor.log_info("\n")
-            for key in (
-                score_dict.keys()
-            ):
-                self.monitor.log_info(
-                    f"{key}  "
-                )
+            for key in score_dict.keys():
+                self.monitor.log_info(f"{key}  ")
             self.monitor.log_info("\n")
-            for key in (
-                score_dict.keys()
-            ):
+            for key in score_dict.keys():
                 self.monitor.log_info(
                     f"{score_dict[key]:.1f} \t "
                 )
 
-        for split in (
-            "val",
-            "test",
-        ):
+        for split in ("val", "test"):
             acc_key = f"{split}_acc"
             if acc_key in score:
                 self.monitor.log_info(
                     f"\n{split.title()} Set\t "
-                    f"Q-Bound V2.1 latent-segment "
-                    f"acc: {score[acc_key]:.2%}"
+                    f"Q-Bound V2.4 acc: {score[acc_key]:.2%}"
                 )
 
-            prehoc_key = (
-                f"{split}_pre-hoc"
-            )
+            prehoc_key = f"{split}_pre-hoc"
             if prehoc_key in score:
                 self.monitor.log_info(
-                    f"\n========== "
-                    f"{split} V2.1 hard H* "
-                    f"=========="
+                    f"\n========== {split} V2.4 hard MAP =========="
                 )
-                _print_score(
-                    score[prehoc_key]
-                )
+                _print_score(score[prehoc_key])
 
-            posthoc_key = (
-                f"{split}_post-hoc"
-            )
+            posthoc_key = f"{split}_post-hoc"
             if posthoc_key in score:
                 self.monitor.log_info(
-                    f"\n========== "
-                    f"{split} post-hoc "
-                    f"=========="
+                    f"\n========== {split} CRA post-hoc =========="
                 )
-                _print_score(
-                    score[posthoc_key]
-                )
+                _print_score(score[posthoc_key])
 
-            merge_key = (
-                f"{split}_merge"
-            )
+            merge_key = f"{split}_merge"
             if merge_key in score:
                 self.monitor.log_info(
-                    f"\n========== "
-                    f"{split} merge "
-                    f"=========="
+                    f"\n========== {split} merge diagnostic =========="
                 )
-                _print_score(
-                    score[merge_key]
-                )
+                _print_score(score[merge_key])
 
         qbound_keys = [
-            key
-            for key in score
+            key for key in score
             if (
-                key.startswith(
-                    "val_qbound_"
-                )
-                or key.startswith(
-                    "test_qbound_"
-                )
+                key.startswith("val_qbound_")
+                or key.startswith("test_qbound_")
             )
         ]
         if qbound_keys:
             self.monitor.log_info(
-                "\n================ "
-                "Q-Bound V2.1 diagnostics "
-                "================"
+                "\n================ Q-Bound V2.4 diagnostics ================"
             )
-            for key in sorted(
-                qbound_keys
-            ):
+            for key in sorted(qbound_keys):
                 self.monitor.log_info(
-                    f"{key}: "
-                    f"{score[key]:.6f}"
+                    f"{key}: {score[key]:.6f}"
                 )
 
         temporal_prefixes = (
@@ -1770,24 +1487,16 @@ class CRAPipeline(BasePipeline):
             "test_CRA-",
         )
         temporal_keys = [
-            key
-            for key in score
-            if key.startswith(
-                temporal_prefixes
-            )
+            key for key in score
+            if key.startswith(temporal_prefixes)
         ]
         if temporal_keys:
             self.monitor.log_info(
-                "\n============ "
-                "Temporal-key faithfulness "
-                "============"
+                "\n============ Temporal-key faithfulness ============"
             )
-            for key in sorted(
-                temporal_keys
-            ):
+            for key in sorted(temporal_keys):
                 self.monitor.log_info(
-                    f"{key}: "
-                    f"{score[key]:.6f}"
+                    f"{key}: {score[key]:.6f}"
                 )
 
         print("\n")
@@ -1907,9 +1616,6 @@ class CRAPipeline(BasePipeline):
             )
             plt.close(figure)
 
-    # ------------------------------------------------------------------
-    # Evaluation
-    # ------------------------------------------------------------------
     def eval(
         self,
         data_loader,
@@ -1922,34 +1628,27 @@ class CRAPipeline(BasePipeline):
         device = self._model_device()
 
         count = 0
-        score = {
-            "acc": 0.0
-        }
+        score = {"acc": 0.0}
+
         results = {}
         ground_res = {}
         ground_pre = {}
+
         keyframe = {}
         ori_keyframe = {}
         qbound_keyframe = {}
         qbound_soft_keyframe = {}
         cra_keyframe = {}
 
-        qbound_stat_sums = (
-            collections.defaultdict(float)
-        )
+        qbound_stat_sums = collections.defaultdict(float)
         qbound_stat_count = 0
         saw_time_param = False
 
         with torch.no_grad():
-            if not self.cfgs[
-                "dataset"
-            ]["mc"]:
+            if not self.cfgs["dataset"]["mc"]:
                 model_core = (
                     self.model.module
-                    if hasattr(
-                        self.model,
-                        "module",
-                    )
+                    if hasattr(self.model, "module")
                     else self.model
                 )
                 if not hasattr(
@@ -1957,93 +1656,35 @@ class CRAPipeline(BasePipeline):
                     "_compute_answer_embedding",
                 ):
                     raise AttributeError(
-                        "Non-multiple-choice evaluation "
-                        "requires "
-                        "_compute_answer_embedding "
-                        "on the model."
+                        "Non-multiple-choice evaluation requires "
+                        "_compute_answer_embedding on the model."
                     )
-                model_core._compute_answer_embedding(
-                    self.a2v
-                )
+                model_core._compute_answer_embedding(self.a2v)
 
-            for (
-                index,
-                batch,
-            ) in enumerate(
-                data_loader
-            ):
-                answer_id = batch[
-                    "answer_id"
-                ]
-                answer = batch[
-                    "answer"
-                ].to(
-                    device,
-                    non_blocking=True,
+            for index, batch in enumerate(data_loader):
+                answer_id = batch["answer_id"]
+                answer = batch["answer"].to(
+                    device, non_blocking=True
                 )
-                video_frames = batch[
-                    "video_frames"
-                ].to(
-                    device,
-                    non_blocking=True,
+                video_frames = batch["video_frames"].to(
+                    device, non_blocking=True
                 )
-                question = batch[
-                    "question"
-                ].to(
-                    device,
-                    non_blocking=True,
+                question = batch["question"].to(
+                    device, non_blocking=True
                 )
+                question_id = batch["question_id"]
+                video_len = batch["video_len"]
 
-                answer_only = batch.get(
-                    "answer_only"
-                )
-                if self._qbound_enabled():
-                    if answer_only is None:
-                        raise KeyError(
-                            "Q-Bound V2.1 evaluation "
-                            "requires batch['answer_only']."
-                        )
-                    answer_only = (
-                        answer_only.to(
-                            device,
-                            non_blocking=True,
-                        )
-                    )
-
-                question_id = batch[
-                    "question_id"
-                ]
-                video_len = batch[
-                    "video_len"
-                ]
                 video_mask = get_mask(
                     video_len,
                     video_frames.size(1),
-                ).to(
-                    device,
-                    non_blocking=True,
-                )
+                ).to(device, non_blocking=True)
 
                 batch_size = answer_id.size(0)
                 count += batch_size
+                labels_cpu = answer_id.reshape(-1).cpu()
 
-                labels_device = (
-                    self._prepare_labels(
-                        answer_id,
-                        device,
-                    )
-                )
-                labels_cpu = (
-                    answer_id
-                    .reshape(-1)
-                    .cpu()
-                )
-
-                (
-                    fusion_proj,
-                    answer_proj,
-                    model_outputs,
-                ) = self.model(
+                fusion_proj, answer_proj, model_outputs = self.model(
                     video_frames,
                     video_mask,
                     answer=answer,
@@ -2051,112 +1692,51 @@ class CRAPipeline(BasePipeline):
                     mode="VQA",
                     question=question,
                     qbound_mix=(
-                        1.0
-                        if self._qbound_enabled()
-                        else 0.0
+                        1.0 if self._qbound_enabled() else 0.0
                     ),
-                    answer_only=answer_only,
+                    answer_only=None,
                 )
 
-                main_logits = (
-                    self._score_answer_candidates(
-                        answer_proj=answer_proj,
-                        representation=fusion_proj,
-                        detach_answer=False,
-                    )
+                main_logits = self._score_answer_candidates(
+                    answer_proj=answer_proj,
+                    representation=fusion_proj,
+                    detach_answer=False,
                 )
-                predicted = (
-                    main_logits.argmax(
-                        dim=-1
-                    ).cpu()
-                )
+                predicted = main_logits.argmax(dim=-1).cpu()
+
                 score["acc"] += (
-                    predicted
-                    == labels_cpu
+                    predicted == labels_cpu
                 ).sum().item()
 
-                time_param = (
-                    model_outputs.get(
-                        "time_param"
-                    )
-                )
+                time_param = model_outputs.get("time_param")
                 qbound_aux = None
                 eval_wrapper = None
 
-                if isinstance(
-                    time_param,
-                    dict,
-                ):
+                if isinstance(time_param, dict):
                     saw_time_param = True
                     eval_wrapper = (
                         None,
                         None,
-                        {
-                            "time_param":
-                                time_param
-                        },
+                        {"time_param": time_param},
                     )
-                    qbound_aux = (
-                        time_param.get(
-                            "qbound_aux",
-                            time_param.get(
-                                "gpeb_aux"
-                            ),
-                        )
+                    qbound_aux = time_param.get(
+                        "qbound_aux",
+                        time_param.get("gpeb_aux"),
                     )
 
-                extra_logs = {}
                 if (
                     self._qbound_enabled()
                     and qbound_aux is not None
                 ):
-                    self._validate_v210_contract(
-                        qbound_aux
+                    self._validate_v240_contract(qbound_aux)
+                    batch_stats = self._collect_qbound_stats(
+                        eval_wrapper
                     )
-
-                    # Evaluation-only diagnostics of the SAME answer-only
-                    # interface. No loss is added here.
-                    (
-                        aux_loss,
-                        aux_diag,
-                    ) = (
-                        self._qbound_answer_only_objective(
-                            qbound_aux=qbound_aux,
-                            labels=labels_device,
+                    for name, value in batch_stats.items():
+                        qbound_stat_sums[name] += (
+                            float(value) * batch_size
                         )
-                    )
-                    extra_logs[
-                        "qbound_answer_only_discrimination_loss"
-                    ] = float(
-                        aux_loss.item()
-                    )
-                    extra_logs.update(
-                        {
-                            f"qbound_{name}": value
-                            for name, value
-                            in aux_diag.items()
-                        }
-                    )
-
-                    batch_stats = (
-                        self._collect_qbound_stats(
-                            eval_wrapper,
-                            extra_logs=extra_logs,
-                        )
-                    )
-                    for (
-                        name,
-                        value,
-                    ) in batch_stats.items():
-                        qbound_stat_sums[
-                            name
-                        ] += (
-                            float(value)
-                            * batch_size
-                        )
-                    qbound_stat_count += (
-                        batch_size
-                    )
+                    qbound_stat_count += batch_size
 
                 video_attention = (
                     model_outputs["fatt"]
@@ -2166,28 +1746,20 @@ class CRAPipeline(BasePipeline):
                 )
                 if (
                     video_attention.ndim == 3
-                    and video_attention.shape[-1]
-                    == 1
+                    and video_attention.shape[-1] == 1
                 ):
-                    video_attention = (
-                        video_attention.squeeze(-1)
-                    )
+                    video_attention = video_attention.squeeze(-1)
                 if video_attention.ndim == 1:
-                    video_attention = (
-                        video_attention[None, :]
-                    )
+                    video_attention = video_attention[None, :]
 
                 batch_ground_pre = None
                 batch_keyframe = None
                 batch_ori_keyframe = None
                 batch_qbound_key = None
-                batch_soft_key = None
+                batch_qbound_soft_key = None
                 batch_cra_key = None
 
-                if isinstance(
-                    time_param,
-                    dict,
-                ):
+                if isinstance(time_param, dict):
                     start_time = (
                         time_param["start"]
                         .detach()
@@ -2200,14 +1772,10 @@ class CRAPipeline(BasePipeline):
                         .cpu()
                         .numpy()
                     )
-                    batch_ground_pre = (
-                        np.column_stack(
-                            (
-                                start_time,
-                                end_time,
-                            )
-                        )
+                    batch_ground_pre = np.column_stack(
+                        (start_time, end_time)
                     )
+
                     batch_keyframe = (
                         time_param["key"]
                         .detach()
@@ -2222,189 +1790,99 @@ class CRAPipeline(BasePipeline):
                     )
 
                     if qbound_aux is not None:
-                        q_key = qbound_aux.get(
-                            "qbound_key"
-                        )
-                        c_key = qbound_aux.get(
-                            "cra_key"
-                        )
-                        soft_key = qbound_aux.get(
-                            "qbound_soft_key",
-                            qbound_aux.get(
-                                "soft_temporal_prob"
-                            ),
-                        )
+                        hard_key = qbound_aux.get("qbound_key")
+                        soft_key = qbound_aux.get("qbound_soft_key")
+                        c_key = qbound_aux.get("cra_key")
 
-                        if torch.is_tensor(
-                            q_key
-                        ):
+                        if torch.is_tensor(hard_key):
                             batch_qbound_key = (
-                                q_key
-                                .detach()
-                                .cpu()
-                                .numpy()
+                                hard_key.detach().cpu().numpy()
                             )
-                        if torch.is_tensor(
-                            c_key
-                        ):
-                            batch_cra_key = (
-                                c_key
-                                .detach()
-                                .cpu()
-                                .numpy()
-                            )
-                        if torch.is_tensor(
-                            soft_key
-                        ):
-                            soft_key = (
+                        if torch.is_tensor(soft_key):
+                            batch_qbound_soft_key = (
                                 self._normalize_distribution(
                                     soft_key.detach()
-                                )
+                                ).cpu().numpy()
                             )
-                            batch_soft_key = (
-                                soft_key
-                                .cpu()
-                                .numpy()
+                        if torch.is_tensor(c_key):
+                            batch_cra_key = (
+                                c_key.detach().cpu().numpy()
                             )
 
-                for (
-                    batch_index,
-                    qid,
-                ) in enumerate(
-                    question_id
-                ):
+                for batch_index, qid in enumerate(question_id):
                     results[qid] = {
                         "prediction": int(
-                            predicted.numpy()[
-                                batch_index
-                            ]
+                            predicted.numpy()[batch_index]
                         ),
                         "answer": int(
-                            labels_cpu.numpy()[
-                                batch_index
-                            ]
+                            labels_cpu.numpy()[batch_index]
                         ),
                     }
 
-                    ground_res[qid] = (
-                        video_attention[
+                    ground_res[qid] = video_attention[
+                        batch_index
+                    ].tolist()
+
+                    if batch_ground_pre is not None:
+                        ground_pre[qid] = batch_ground_pre[
                             batch_index
                         ].tolist()
-                    )
-
-                    if (
-                        batch_ground_pre
-                        is not None
-                    ):
-                        ground_pre[qid] = (
-                            batch_ground_pre[
-                                batch_index
-                            ].tolist()
-                        )
                     if batch_keyframe is not None:
-                        keyframe[qid] = (
-                            batch_keyframe[
+                        keyframe[qid] = batch_keyframe[
+                            batch_index
+                        ].tolist()
+                    if batch_ori_keyframe is not None:
+                        ori_keyframe[qid] = batch_ori_keyframe[
+                            batch_index
+                        ].tolist()
+                    if batch_qbound_key is not None:
+                        qbound_keyframe[qid] = batch_qbound_key[
+                            batch_index
+                        ].tolist()
+                    if batch_qbound_soft_key is not None:
+                        qbound_soft_keyframe[qid] = (
+                            batch_qbound_soft_key[
                                 batch_index
                             ].tolist()
                         )
-                    if (
-                        batch_ori_keyframe
-                        is not None
-                    ):
-                        ori_keyframe[qid] = (
-                            batch_ori_keyframe[
-                                batch_index
-                            ].tolist()
-                        )
-                    if (
-                        batch_qbound_key
-                        is not None
-                    ):
-                        qbound_keyframe[qid] = (
-                            batch_qbound_key[
-                                batch_index
-                            ].tolist()
-                        )
-                    if (
-                        batch_soft_key
-                        is not None
-                    ):
-                        qbound_soft_keyframe[
-                            qid
-                        ] = (
-                            batch_soft_key[
-                                batch_index
-                            ].tolist()
-                        )
-                    if (
-                        batch_cra_key
-                        is not None
-                    ):
-                        cra_keyframe[qid] = (
-                            batch_cra_key[
-                                batch_index
-                            ].tolist()
-                        )
+                    if batch_cra_key is not None:
+                        cra_keyframe[qid] = batch_cra_key[
+                            batch_index
+                        ].tolist()
 
-                progress = float(
-                    index + 1
-                ) / len(
-                    data_loader
-                )
+                progress = float(index + 1) / len(data_loader)
                 print(
-                    f"\rProgress: "
-                    f"{progress:.2%}",
+                    f"\rProgress: {progress:.2%}",
                     end="",
                     flush=True,
                 )
 
         if count == 0:
-            raise RuntimeError(
-                "Evaluation data loader is empty."
-            )
+            raise RuntimeError("Evaluation data loader is empty.")
 
         score["acc"] /= count
 
         if qbound_stat_count > 0:
-            for (
-                name,
-                total,
-            ) in qbound_stat_sums.items():
-                score[name] = (
-                    total
-                    / qbound_stat_count
-                )
+            for name, total in qbound_stat_sums.items():
+                score[name] = total / qbound_stat_count
 
         split = data_loader.dataset.split
-        csv_path = self.cfgs[
-            "dataset"
-        ]["csv_path"]
+        csv_path = self.cfgs["dataset"]["csv_path"]
 
         ground_truth = load_file(
-            os.path.join(
-                csv_path,
-                f"gsub_{split}.json",
-            )
+            os.path.join(csv_path, f"gsub_{split}.json")
         )
         segments = load_file(
-            os.path.join(
-                csv_path,
-                f"frame2time_{split}.json",
-            )
+            os.path.join(csv_path, f"frame2time_{split}.json")
         )
         questions = load_file(
-            os.path.join(
-                csv_path,
-                f"{split}.csv",
-            )
+            os.path.join(csv_path, f"{split}.csv")
         )
 
-        post_hoc_ground = (
-            self.metric.generate_ground(
-                ground_res,
-                segments,
-                questions,
-            )
+        post_hoc_ground = self.metric.generate_ground(
+            ground_res,
+            segments,
+            questions,
         )
         score["post-hoc"] = self.metric(
             post_hoc_ground,
@@ -2414,15 +1892,11 @@ class CRAPipeline(BasePipeline):
         )
 
         if qbound_keyframe:
-            if not hasattr(
-                self.metric,
-                "temporal_key_metrics",
-            ):
+            if not hasattr(self.metric, "temporal_key_metrics"):
                 raise AttributeError(
-                    "Q-Bound V2.1 requires "
+                    "Q-Bound V2.4 requires "
                     "Metric.temporal_key_metrics()."
                 )
-
             score.update(
                 self.metric.temporal_key_metrics(
                     qbound_keyframe,
@@ -2458,28 +1932,33 @@ class CRAPipeline(BasePipeline):
             "gt_ground": ground_truth,
             "ph_attn": ground_res,
             "qbound_key": qbound_keyframe,
-            "qbound_soft_key":
-                qbound_soft_keyframe,
+            "qbound_soft_key": qbound_soft_keyframe,
             "cra_key": cra_keyframe,
         }
 
-        if (
-            saw_time_param
-            and ground_pre
-        ):
-            score["pre-hoc"] = self.metric(
+        if saw_time_param and ground_pre:
+            hard_metric = self.metric(
                 ground_pre,
                 ground_truth,
                 results,
                 gs=True,
             )
+            score["pre-hoc"] = hard_metric
+            result.update(
+                {
+                    "tg": ground_pre,
+                    "qbound_tg": ground_pre,
+                    "key": keyframe,
+                    "ori_key": ori_keyframe,
+                }
+            )
 
-            merge_ground = (
-                self.metric.combine(
-                    ground_pre,
-                    post_hoc_ground,
-                    ground_truth,
-                )
+        # Historical CRA post-hoc merge remains diagnostic only.
+        if saw_time_param and ground_pre:
+            merge_ground = self.metric.combine(
+                ground_pre,
+                post_hoc_ground,
+                ground_truth,
             )
             score["merge"] = self.metric(
                 merge_ground,
@@ -2487,16 +1966,7 @@ class CRAPipeline(BasePipeline):
                 results,
                 gs=False,
             )
-
-            result.update(
-                {
-                    "tg": ground_pre,
-                    "key": keyframe,
-                    "ori_key":
-                        ori_keyframe,
-                    "merge": merge_ground,
-                }
-            )
+            result["merge"] = merge_ground
 
         return score, result
 
