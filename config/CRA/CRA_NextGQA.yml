@@ -1,54 +1,92 @@
-# Q-Bound V2.4.0 — Question-Conditioned Core-to-Closure Grounding
+# Q-Bound V2.8.0 — Semantic Seed + Video-Only Predictive Support
 #
-# Design goal:
-#   Preserve the useful semantic content of frozen CLIP-L while changing only
-#   the temporal decision mechanism that failed in V2.1 / V2.3.
+# Controlled research goal:
+#   Separate query relevance from temporal extent/support so that Question can
+#   identify WHAT is relevant without directly learning span extent, while a
+#   video-only predictive branch discovers which adjacent frames belong to the
+#   same temporally coherent support.
 #
-# WHERE path:
-#   frozen/generic CLIP-L temporal features
+# RELEVANCE / WHERE path:
+#   frozen generic CLIP-L video + question-only token features
 #       -> light WHERE projection
+#       -> Structured Visual Evidence
+#            State
+#            + within-video Distinctiveness
+#            + explicit adjacent Transition
 #       -> one shallow Temporal Context block
-#       -> early token-level Q -> V cross-attention
-#       -> question-conditioned WHERE representation
-#       -> Evidence Core a_t
-#       + Event Continuity j_t
-#       -> Core-to-Closure energy E_Q(s,e)
-#       -> one shared posterior P_Q(s,e)
+#       -> token-resolved Question-to-Visual relevance interaction
+#       -> semantic_seed_prob
+#
+# EXTENT / SUPPORT path (VIDEO ONLY):
+#   detached frozen generic CLIP-L video
+#       -> forward causal predictor: context <= t predicts frame t+1
+#       -> backward causal predictor: context >= t+1 predicts frame t
+#       -> bidirectional adjacent predictive surprise
+#       -> parameter-free edge affinity
+#       -> detached symmetric adjacent graph / normalized Laplacian L
+#
+# NO-BYPASS composition:
+#   semantic_seed_prob + detached support graph
+#       -> solve (I + L) support = semantic_seed
+#       -> support_temporal_prob
+#
+# The Question never scores spans directly. The support graph may shape the
+# semantic seed, but L_ground cannot update that graph because graph affinity
+# and the Laplacian are detached before propagation.
 #
 # VALUE path:
-#   original/masked CLIP-L features
-#       -> pooled by temporal support from P_Q(s,e)
+#   original masked CLIP-L features
+#       -> pooled with support_temporal_prob
 #
-# Hard / soft use:
-#   hard MAP span from P_Q(s,e)
-#       -> detached temporal key
-#       -> ordinary CRA VideoQA host
+# One numerical Support Field, two gradient views:
+#   support_temporal_prob.detach()
+#       -> ordinary CRA VideoQA / existing CRA alignment losses
+#       -> VQA gradients cannot train Q-Bound topology
 #
-#   soft temporal membership from the SAME P_Q(s,e)
+#   support_temporal_prob
 #       -> Video-Question grounding objective
-#       -> gradient trains Q-Bound temporal topology
+#       -> gradient trains semantic relevance only
 #
-# Final training:
-#   L = L_CRA/main + lambda_G * L_ground
+# Analytic interval metadata:
+#   support_temporal_prob
+#       -> parameter-free start/end boundary evidence
+#       -> analytic P(s,e)
+#       -> posterior-barycentric endpoints for evaluation/compatibility only
 #
-# Important:
-#   - temporal inference is strictly Video + Question;
-#   - answers NEVER enter QBoundCore or temporal topology;
-#   - VQA gradients NEVER train Q-Bound temporal topology;
-#   - no BoundaryRefiner / adaptive local radius;
-#   - no answer-only functional critic;
-#   - no independent start/end heads;
-#   - no learned routing gate;
-#   - no event-count target/cap;
-#   - no length/minimality/sparsity/entropy temporal objective;
-#   - no Gaussian temporal smoothing inside Q-Bound;
-#   - no temporal GT / IoU / IoP training supervision;
-#   - CRA remains only the controlled downstream VideoQA testbed/reference.
+# There is no hard MAP decision. The rounded barycentric interval is never the
+# temporal representation used by either training or inference.
 #
-# V2.4 research hypothesis:
-#   discriminative evidence core != complete supporting-event extent.
-#   Core identifies WHERE the strongest question evidence lies;
-#   Continuity determines HOW FAR the supporting event should extend.
+# Final objective:
+#   L_total = L_CRA/main + lambda_G * L_ground + lambda_P * L_pred
+#
+#   L_CRA/main:
+#     Existing CRA VQA/VQ/alignment objectives using the detached-support QA
+#     view. It cannot update Q-Bound relevance or support structure.
+#
+#   L_ground:
+#     In-batch Video -> Question grounding. Raw CLIP VALUE is pooled with the
+#     differentiable support, mapped by detached host-projector weights, and
+#     compared with a detached QUESTION-ONLY target. It trains semantic
+#     relevance, not the support predictor.
+#
+#   L_pred:
+#     Bidirectional adjacent-frame predictive loss. This is the ONLY objective
+#     allowed to train the video-only support predictor.
+#
+# Explicitly absent:
+#   - Query-Routed Visual Context from V2.6;
+#   - Evidence Core / Joint Continuity / Core-to-Closure;
+#   - hard-MAP-vs-soft temporal split;
+#   - direct Question -> span scorer;
+#   - learned start/end heads or learned span scorer;
+#   - BoundaryRefiner / adaptive local-radius search;
+#   - answer-only or answer-conditioned temporal critic;
+#   - target leakage into either directional predictor;
+#   - grounding gradient into the support graph;
+#   - visual enrichment in the downstream VALUE stream;
+#   - length/minimality/sparsity/entropy temporal losses;
+#   - Gaussian temporal smoothing or event-count constraints;
+#   - temporal GT / IoU / IoP training supervision.
 
 dataset:
   name: nextgqa
@@ -80,7 +118,7 @@ model:
   dropout: 0.3
   vocab_size: 50265
 
-  # Keep the CRA host/testbed settings unchanged for a controlled comparison.
+  # Preserve the original CRA host/testbed for a controlled comparison.
   n_negs: 1
   prop_num: 1
   sigma: 3.0
@@ -99,47 +137,61 @@ model:
 
   qbound:
     enabled: true
-    version: 2.4.0
+    version: 2.8.0
 
-    # ------------------------------------------------------------
-    # Controlled Q-Bound input contract.
-    # ------------------------------------------------------------
+    # ----------------------------------------------------------
+    # Controlled Q-Bound inputs.
+    # ----------------------------------------------------------
     require_question_only: true
     require_token_question: true
 
-    # Keep the frozen/generic visual source fixed. Q-Bound learns WHERE,
-    # rather than silently fine-tuning the backbone/content representation.
+    # External CLIP/CRA feature producers stay fixed with respect to Q-Bound.
+    # Q-Bound trains its own relevance and support modules only.
     detach_backbone_inputs: true
 
-    # ------------------------------------------------------------
-    # V2.4 WHERE representation.
-    # One light temporal-context block + early Q -> V interaction.
-    # ------------------------------------------------------------
+    # ----------------------------------------------------------
+    # Compact V2.8 representation and predictor capacity.
+    #
+    # These dimensions are shared by Structured Visual Evidence,
+    # token-resolved semantic relevance, and the bidirectional video-only
+    # predictor. There is deliberately no segment/span temperature or learned
+    # propagation weight: graph construction and seed propagation are
+    # structural and parameter-free after predictive surprise is obtained.
+    # ----------------------------------------------------------
     hidden_dim: 256
     dropout: 0.3
     num_question_heads: 4
     question_ff_multiplier: 2
 
-    # Shared Core-to-Closure span posterior temperature.
-    # No relation_weight / boundary_weight / length prior is used.
-    segment_temperature: 1.0
-
-    # ------------------------------------------------------------
-    # The ONLY V2.4-specific temporal learning objective.
+    # ----------------------------------------------------------
+    # lambda_G: semantic Video-Question grounding.
     #
-    # Soft evidence from P_Q(s,e) is contrasted against QUESTION-ONLY
-    # representations. Answer candidates and temporal GT are not used.
-    # ------------------------------------------------------------
+    # Positive and mandatory in canonical V2.8. The question target and host
+    # projector weights are stop-gradient; the detached graph prevents this
+    # loss from training temporal support structure.
+    # ----------------------------------------------------------
     grounding_loss:
       enabled: true
       loss_weight: 1.0
       temperature: 0.07
 
+    # ----------------------------------------------------------
+    # lambda_P: video-only predictive support learning.
+    #
+    # Positive and mandatory in canonical V2.8. This is the sole gradient
+    # source for support_input_proj, the two directional GRU cells, and the two
+    # adjacent-frame predictors.
+    # ----------------------------------------------------------
+    predictive_loss:
+      enabled: true
+      loss_weight: 1.0
+
 optim:
   pipeline: cra
   optimizer: Adam
 
-  # Preserve the original CRA downstream objectives as the controlled host.
+  # Original CRA downstream objectives. In cra_pipeline.py, VQA alignment now
+  # consumes the detached-support QA feature, never the grounding feature.
   loss:
     ce:
       vq: 1
@@ -152,8 +204,10 @@ optim:
   weight_decay: 0
   amsgrad: true
 
-  # All trainable V2.4 temporal components under decoder.qbound.*
-  # use this dedicated learning rate.
+  # All trainable modules under decoder.qbound.* share this controlled LR.
+  # base.py verifies that both semantic-relevance and support-predictor tensors
+  # are present exactly once in this optimizer group. decoder.video_proj stays
+  # in the base-model optimizer group.
   qbound_lr: 5.0e-05
 
   epochs: 15
@@ -170,32 +224,47 @@ stat:
     vis: false
     display_port: 8099
 
-  record_dir: ./output
+  record_dir: /content/drive/MyDrive/QBound_V28_R1R2
   resume: null
 
+  # When resuming an actual V2.8 run, require matching model keys, loss
+  # weights, optimizer-group signature, and checkpoint version metadata.
+  resume_strict: true
+  resume_optimizer_strict: true
+
 misc:
-  running_name: CRA/NextGQA/QBound_v2.4.0_core_to_closure_seed2024
+  running_name: CRA/NextGQA/QBound_v2.8.0_semantic_seed_predictive_support_seed2024
 
   info: >-
-    CRA downstream testbed + Q-Bound V2.4.0.
-    Frozen/generic CLIP-L visual features are preserved as the VALUE source,
-    while a dedicated WHERE representation is learned through one shallow
-    temporal-context block followed by early token-level Question-to-Video
-    interaction. The temporal decision is factorized into question-specific
-    Evidence Core a_t and Event Continuity j_t. All contiguous span scores are
-    derived structurally by a single Core-to-Closure energy E_Q(s,e), producing
-    one shared posterior P_Q(s,e). Hard MAP grounding from this posterior is
-    detached before the ordinary CRA VideoQA host, so VQA gradients cannot shape
-    Q-Bound temporal topology. The soft frame membership from the same posterior
-    is used by one additional Video-Question grounding objective only
-    (lambda_G=1.0, temperature=0.07). Answers never enter QBoundCore or temporal
-    inference/training. There is no BoundaryRefiner, adaptive local radius,
-    functional answer critic, answer-only temporal supervision, learned routing
-    gate, independent start/end heads, event-count target, length/minimality/
-    sparsity/entropy temporal objective, Gaussian smoothing inside Q-Bound, or
-    temporal GT/IoU/IoP training supervision. The controlled goal is to improve
-    mIoP and Acc&GQA over CRA while preserving the mIoU/VQA strengths observed
-    in V2.1 rather than reproducing V2.3 inward-boundary shrinkage.
+    CRA downstream testbed plus Q-Bound V2.8.0. Frozen generic CLIP-L features
+    remain the downstream VALUE source. The relevance path first builds
+    Structured Visual Evidence from projected visual state, within-video
+    distinctiveness, explicit adjacent transitions, and one shallow temporal
+    context block. Question-only token features interact with this visual WHERE
+    stream only to produce semantic_seed_prob; Question does not route visual
+    VALUE and never scores a span directly. In parallel, an independent
+    video-only bidirectional predictive branch estimates adjacent-frame
+    surprise by predicting the next raw CLIP frame from forward context and the
+    previous raw CLIP frame from backward context. Predictive surprise produces
+    a parameter-free adjacent affinity graph. The affinity and normalized
+    Laplacian are detached before semantic-seed propagation, so L_ground cannot
+    train extent structure. Solving the structural propagation system yields
+    one continuous support_temporal_prob. The exact same numerical Support Field
+    is used for training, inference, grounding, and VideoQA: grounding keeps the
+    semantic-seed gradient, whereas CRA VideoQA receives a detached support
+    view. Analytic boundaries, P(s,e), and posterior-barycentric endpoints are
+    evaluation metadata only, never a hard-MAP training or inference path. The
+    total objective is L_CRA/main + lambda_G L_ground + lambda_P L_pred, with
+    lambda_G=1.0, grounding temperature=0.07, and lambda_P=1.0. L_ground aligns
+    differentiable raw-CLIP evidence with a detached question-only target and
+    trains semantic relevance only. L_pred is the sole objective for the
+    video-only support predictor. Answer candidates never enter QBoundCore;
+    VQA gradients never train Q-Bound topology; temporal GT, IoU, and IoP are
+    evaluation-only. The controlled V2.8 question is whether a semantically
+    precise Question-derived seed, expanded through independently learned
+    video support, improves Acc&GQA and temporal localization over both CRA and
+    the unpropagated semantic seed without reintroducing answer or span-scoring
+    shortcuts.
 
   cuda: '0'
   seed: 2024
