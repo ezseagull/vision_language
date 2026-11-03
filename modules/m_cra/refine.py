@@ -125,9 +125,20 @@ class DecoderLayer(nn.Module):
 
 class Decoder(nn.Module):
     """
-    CRA downstream decoder with Q-Bound V2.8.0.
+    CRA downstream decoder with Q-Bound R2-C/V3.5 pairing and H1 EQ-PTC.
 
-    V2.8 factorizes temporal grounding into two causal roles:
+    V3.7 optionally adds a question-conditioned interval candidate comparator
+    to the EQ-PTC Semantic Seed. Only the Seed is modified: the fixed R2-C
+    support graph, CLIP VALUE, QA/grounding gradient separation, and analytic
+    interval posterior are unchanged. Language masked pooling is configured
+    in CRA/LanModel, not in this decoder.
+    V3.5 train-only Q1/Q2 uses separate question-conditioned temporal states
+    while sharing the same video evidence/global context and fixed graph.
+    qbound_version remains "2.8.0" for the existing CRA ABI; architecture
+    selection is controlled by model.qbound.temporal_context_mode.
+
+    V2.8/R2 factorizes temporal grounding into two causal roles. In R2-C
+    the video-only predictor is removed and fixed adjacent edges are used:
 
         raw/generic CLIP + Question -> semantic seed       (WHERE)
         detached raw/generic CLIP   -> predictive graph    (EXTENT)
@@ -150,9 +161,9 @@ class Decoder(nn.Module):
     * Posterior-barycentric endpoints are compatibility/evaluation metadata;
       neither training nor QA uses a hard-MAP span.
 
-    V2.8 has no Question-to-span scorer, Core-to-Closure, Joint Continuity,
-    event proposal bank, BoundaryRefiner, answer critic, learned duration
-    prior, Gaussian smoothing, or event-count target.
+    In event_relative mode, the core scores question-conditioned candidate
+    intervals BEFORE the Seed-to-Support propagation. It does not use direct
+    MAP span decisions, learned boundary heads, temporal GT, or answers.
     """
 
     def __init__(
@@ -226,6 +237,94 @@ class Decoder(nn.Module):
                 ),
             )
         )
+
+        # R2-A/B controlled ablation. Default reproduces original V2.8.
+        # This switch changes ONLY the edge affinities used by the temporal
+        # Laplacian in QBoundCore. The predictive branch and L_pred stay active
+        # in both arms. No R1 decoder change is introduced here.
+        graph_mode = qbound_cfg.get("support_graph_mode", "learned")
+        if not isinstance(graph_mode, str) or graph_mode not in ("learned", "fixed"):
+            raise ValueError(
+                "model.qbound.support_graph_mode must be exactly "
+                "'learned' (R2-A) or 'fixed' (R2-B)."
+            )
+        self.qbound_support_graph_mode = graph_mode
+        predictor_enabled = qbound_cfg.get("support_predictor_enabled", True)
+        if not isinstance(predictor_enabled, bool):
+            raise TypeError("model.qbound.support_predictor_enabled must be boolean.")
+        if not predictor_enabled and graph_mode != "fixed":
+            raise ValueError("R2-C requires fixed graph when predictor is disabled.")
+        self.qbound_support_predictor_enabled = predictor_enabled
+
+        # H1 B+C experiment is an explicit architecture switch, separate
+        # from the stable QBound V2.8.0 CRA/Refine interface version.
+        # eq_ptc is the intended mode for this patched core; legacy is the
+        # exact V3.5 B+C control. No new loss or temporal GT input is added.
+        temporal_mode = qbound_cfg.get("temporal_context_mode", "eq_ptc")
+        if not isinstance(temporal_mode, str) or temporal_mode not in ("legacy", "eq_ptc"):
+            raise ValueError(
+                "model.qbound.temporal_context_mode must be 'legacy' or 'eq_ptc'."
+            )
+        self.qbound_temporal_context_mode = temporal_mode
+        self.qbound_eqptc_scales = {}
+        for field in ("eqptc_early_scale", "eqptc_position_scale", "eqptc_temporal_scale"):
+            value = qbound_cfg.get(field, 0.25)
+            if isinstance(value, bool):
+                raise TypeError(f"model.qbound.{field} must be a float in [0,1].")
+            try:
+                value = float(value)
+            except (ValueError, TypeError) as exc:
+                raise TypeError(
+                    f"model.qbound.{field} must be a numeric value in [0,1]."
+                ) from exc
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ValueError(f"model.qbound.{field} must be finite and in [0,1].")
+            self.qbound_eqptc_scales[field] = value
+
+        # V3.7: explicit Event-Relative Grounding configuration. Defaults to
+        # legacy to preserve old checkpoint/initialization and inference ABI.
+        event_mode = qbound_cfg.get("event_grounding_mode", "legacy")
+        if not isinstance(event_mode, str) or event_mode not in (
+            "legacy", "event_relative",
+        ):
+            raise ValueError(
+                "model.qbound.event_grounding_mode must be 'legacy' "
+                "or 'event_relative'."
+            )
+        self.qbound_event_grounding_mode = event_mode
+        self.qbound_event_kwargs = {"event_grounding_mode": event_mode}
+        for field, default in (
+            ("event_residual_scale", 0.10),
+            ("event_relation_temperature", 0.20),
+        ):
+            value = qbound_cfg.get(field, default)
+            if isinstance(value, bool):
+                raise TypeError(f"model.qbound.{field} must be numeric.")
+            try:
+                value = float(value)
+            except (ValueError, TypeError) as exc:
+                raise TypeError(f"model.qbound.{field} must be numeric.") from exc
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"model.qbound.{field} must be finite and > 0.")
+            if field == "event_residual_scale" and value > 1.0:
+                raise ValueError("model.qbound.event_residual_scale must be <= 1.")
+            self.qbound_event_kwargs[field] = value
+        max_length = qbound_cfg.get("event_candidate_max_length", None)
+        if max_length is not None and (
+            isinstance(max_length, bool)
+            or not isinstance(max_length, int)
+            or max_length < 1
+        ):
+            raise TypeError(
+                "model.qbound.event_candidate_max_length must be null "
+                "or an integer >= 1."
+            )
+        self.qbound_event_kwargs["event_candidate_max_length"] = max_length
+        if self.qbound_enabled and event_mode == "event_relative":
+            if self.qbound_temporal_context_mode != "eq_ptc":
+                raise ValueError("V3.7 event_relative requires EQ-PTC temporal context.")
+            if self.qbound_support_graph_mode != "fixed" or self.qbound_support_predictor_enabled:
+                raise ValueError("V3.7 event_relative requires R2-C: fixed graph, predictor disabled.")
 
         self.qbound_require_question_only = bool(
             qbound_cfg.get(
@@ -313,22 +412,101 @@ class Decoder(nn.Module):
                     "temporal mechanism."
                 )
 
-            self.qbound = QBoundCore(
-                input_dim=embed_dim,
-                hidden_dim=self.qbound_hidden_dim,
-                dropout=float(
+            core_kwargs = {
+                "input_dim": embed_dim,
+                "hidden_dim": self.qbound_hidden_dim,
+                "dropout": float(
                     qbound_cfg.get(
                         "dropout",
                         model_cfg.get("qbound_dropout", dropout),
                     )
                 ),
-                num_question_heads=int(
+                "num_question_heads": int(
                     qbound_cfg.get("num_question_heads", 4)
                 ),
-                question_ff_multiplier=int(
+                "question_ff_multiplier": int(
                     qbound_cfg.get("question_ff_multiplier", 2)
                 ),
-            )
+            }
+            # Learned mode keeps the exact original constructor call: it can
+            # still load canonical V2.8 weights without any new parameters.
+            # Fixed mode requires the matching graph-mode-aware core.py.
+            if self.qbound_support_graph_mode == "fixed":
+                import inspect
+
+                if "support_graph_mode" not in inspect.signature(
+                    QBoundCore.__init__
+                ).parameters:
+                    raise RuntimeError(
+                        "R2-B fixed graph requires the updated "
+                        "modules/qbound/core.py with a support_graph_mode "
+                        "constructor argument. Do not run R2-B using the "
+                        "original V2.8 core.py."
+                    )
+                core_kwargs["support_graph_mode"] = "fixed"
+
+            if not self.qbound_support_predictor_enabled:
+                import inspect
+                if "support_predictor_enabled" not in inspect.signature(
+                    QBoundCore.__init__
+                ).parameters:
+                    raise RuntimeError("R2-C requires the matching updated core.py")
+                core_kwargs["support_predictor_enabled"] = False
+
+            # Fail fast instead of silently selecting the core's default
+            # mode when YAML and core.py do not match. Always pass the new
+            # switches explicitly, INCLUDING the legacy control.
+            import inspect
+            signature = inspect.signature(QBoundCore.__init__).parameters
+            eqptc_kwargs = {
+                "temporal_context_mode": self.qbound_temporal_context_mode,
+                **self.qbound_eqptc_scales,
+            }
+            missing_args = sorted(set(eqptc_kwargs).difference(signature))
+            if missing_args:
+                raise RuntimeError(
+                    "EQ-PTC refine.py requires the matching updated "
+                    "modules/qbound/core.py; constructor args missing: "
+                    + ", ".join(missing_args)
+                )
+            core_kwargs.update(eqptc_kwargs)
+            # Fail fast if core.py is older than the V3.7 event-aware interface.
+            event_missing = sorted(set(self.qbound_event_kwargs).difference(signature))
+            if event_missing:
+                raise RuntimeError(
+                    "V3.7 refine.py requires matching modules/qbound/core.py; "
+                    "missing event constructor args: " + ", ".join(event_missing)
+                )
+            core_kwargs.update(self.qbound_event_kwargs)
+            self.qbound = QBoundCore(**core_kwargs)
+            if self.qbound.event_grounding_mode != self.qbound_event_grounding_mode:
+                raise RuntimeError("RefineDecoder/Core event grounding mode mismatch.")
+            for field, expected in self.qbound_event_kwargs.items():
+                if field == "event_grounding_mode":
+                    continue
+                actual = getattr(self.qbound, field)
+                if expected is None:
+                    if actual is not None:
+                        raise RuntimeError(f"RefineDecoder/Core {field} mismatch.")
+                elif isinstance(expected, float):
+                    if not math.isclose(float(actual), expected, abs_tol=1e-8, rel_tol=1e-7):
+                        raise RuntimeError(f"RefineDecoder/Core {field} mismatch.")
+                elif actual != expected:
+                    raise RuntimeError(f"RefineDecoder/Core {field} mismatch.")
+            if self.qbound.temporal_context_mode != self.qbound_temporal_context_mode:
+                raise RuntimeError("RefineDecoder/Core temporal context mode mismatch.")
+            for name, expected_scale in self.qbound_eqptc_scales.items():
+                if float(getattr(self.qbound, name)) != expected_scale:
+                    raise RuntimeError(f"RefineDecoder/Core EQ-PTC scale mismatch: {name}.")
+            if bool(getattr(self.qbound, "support_predictor_enabled", True)) != self.qbound_support_predictor_enabled:
+                raise RuntimeError("RefineDecoder/Core predictor-enabled mismatch.")
+            actual_graph_mode = getattr(self.qbound, "support_graph_mode", "learned")
+            if actual_graph_mode != self.qbound_support_graph_mode:
+                raise RuntimeError(
+                    "RefineDecoder/QBoundCore support graph mode mismatch: "
+                    f"config={self.qbound_support_graph_mode!r}, "
+                    f"core={actual_graph_mode!r}."
+                )
 
             core_version = str(
                 getattr(self.qbound, "qbound_version", "")
@@ -566,6 +744,173 @@ class Decoder(nn.Module):
         if float(invalid_mass.detach().item()) > atol:
             raise RuntimeError(f"{name} assigns mass to padded frames.")
 
+    def _validate_eqptc_outputs(
+        self, output, batch_size, time_steps, q_len, valid_mask
+    ):
+        """Validate the extra WHERE-only diagnostics of the EQ-PTC B+C branch."""
+        if self.qbound_temporal_context_mode != "eq_ptc":
+            return
+        expected = {
+            "eqptc_global_context_states": (batch_size, time_steps, self.qbound_hidden_dim),
+            "eqptc_conditioned_visual_states": (batch_size, time_steps, self.qbound_hidden_dim),
+            "eqptc_early_question_attention":
+                (batch_size, self.qbound.num_question_heads, time_steps, q_len),
+            "eqptc_temporal_attention":
+                (batch_size, self.qbound.num_question_heads, time_steps, time_steps),
+            "eqptc_early_delta_ratio": (batch_size,),
+            "eqptc_temporal_delta_ratio": (batch_size,),
+        }
+        for name, shape in expected.items():
+            if name not in output:
+                raise KeyError(f"EQ-PTC is active but {name!r} is missing.")
+            self._assert_shape(name, output[name], shape)
+            self._assert_finite(name, output[name])
+        for name in ("eqptc_global_context_states", "eqptc_conditioned_visual_states"):
+            invalid_values = output[name] * (~valid_mask).to(output[name].dtype).unsqueeze(-1)
+            if invalid_values.detach().abs().amax() > 1e-5:
+                raise RuntimeError(f"EQ-PTC WHERE state {name} includes padded visual tokens.")
+        for name in ("eqptc_early_delta_ratio", "eqptc_temporal_delta_ratio"):
+            if (output[name].detach() < 0).any():
+                raise RuntimeError(f"EQ-PTC delta ratio must be nonnegative: {name}.")
+
+    def _validate_event_relative_outputs(
+        self, output, batch_size, time_steps, valid_mask,
+        geometry_source=None,
+    ):
+        """V3.7 interval/Seed residual contract; paired Q2 reuses Q1 geometry.
+
+        Validation is tensor-based, never uses labels or answers, and does not
+        detach anything in the main computational graph.
+        """
+        geometry = output if geometry_source is None else geometry_source
+        geometry_keys = (
+            "event_candidate_starts", "event_candidate_ends",
+            "event_candidate_lengths", "event_candidate_valid",
+            "event_candidate_frame_weights",
+        )
+        required = (
+            "legacy_semantic_seed_logits", "legacy_semantic_seed_prob",
+            "event_candidate_scores", "event_candidate_prob",
+            "event_candidate_count", "event_candidate_top_index",
+            "event_candidate_top_start_frame", "event_candidate_top_end_frame",
+            "event_candidate_top1_prob", "event_frame_prob",
+            "event_geometry_frame_prior", "event_seed_residual_logits",
+            "event_residual_rms", "event_residual_to_legacy_std_ratio",
+        )
+        missing = [k for k in required if k not in output]
+        missing += [k for k in geometry_keys if k not in geometry]
+        if missing:
+            raise KeyError("V3.7 event-relative output missing: " + ", ".join(missing))
+
+        starts, ends, lengths = (geometry[k] for k in geometry_keys[:3])
+        if starts.ndim != 1 or ends.ndim != 1 or lengths.ndim != 1:
+            raise ValueError("V3.7 event interval geometry must be [K].")
+        K = starts.numel()
+        if K < 1:
+            raise ValueError("V3.7 event candidate bank must not be empty.")
+        expected_max = self.qbound_event_kwargs["event_candidate_max_length"]
+        candidate_lengths = torch.arange(1, time_steps + 1, device=starts.device)
+        if expected_max is not None:
+            candidate_lengths = candidate_lengths[:expected_max]
+        expected_K = int((time_steps - candidate_lengths + 1).sum().item())
+        if K != expected_K:
+            raise RuntimeError(f"V3.7 expected {expected_K} intervals, got {K}.")
+        for name, tensor in (("starts", starts), ("ends", ends), ("lengths", lengths)):
+            self._assert_shape("event_candidate_" + name, tensor, (K,))
+            if tensor.dtype not in (torch.int32, torch.int64):
+                raise TypeError("V3.7 interval indices must have integer dtype.")
+        if (starts < 0).any() or (ends >= time_steps).any() or (ends < starts).any():
+            raise RuntimeError("V3.7 candidate boundaries outside [0,T).")
+        if not torch.equal(lengths, ends - starts + 1):
+            raise RuntimeError("V3.7 candidate interval lengths are inconsistent.")
+
+        candidate_valid = geometry["event_candidate_valid"]
+        frame_weights = geometry["event_candidate_frame_weights"]
+        self._assert_shape("event_candidate_valid", candidate_valid, (batch_size, K))
+        self._assert_shape("event_candidate_frame_weights", frame_weights, (K, time_steps))
+        if candidate_valid.dtype != torch.bool:
+            raise TypeError("V3.7 event_candidate_valid must be bool.")
+        self._assert_finite("event_candidate_frame_weights", frame_weights)
+        if not torch.allclose(frame_weights.sum(dim=-1),
+                              torch.ones_like(frame_weights.sum(dim=-1)), atol=1e-5):
+            raise RuntimeError("V3.7 candidate frame weights must sum to 1.")
+        idx = torch.arange(time_steps, device=valid_mask.device)
+        membership = (idx.unsqueeze(0) >= starts.unsqueeze(1)) & (
+            idx.unsqueeze(0) <= ends.unsqueeze(1)
+        )
+        expected_weights = membership.to(frame_weights.dtype) / lengths.to(
+            frame_weights.dtype
+        ).unsqueeze(1)
+        if not torch.allclose(frame_weights, expected_weights, atol=1e-6, rtol=1e-6):
+            raise RuntimeError("V3.7 candidate geometry weights do not match boundaries.")
+        expected_valid = (
+            (membership.unsqueeze(0) & ~valid_mask.unsqueeze(1)).sum(dim=-1) == 0
+        )
+        if not torch.equal(candidate_valid, expected_valid):
+            raise RuntimeError("V3.7 candidate validity crosses a padded video frame.")
+        if not torch.all(candidate_valid.any(dim=-1)):
+            raise RuntimeError("V3.7 every sample must have >=1 valid candidate.")
+
+        for name in ("event_candidate_scores", "event_candidate_prob"):
+            self._assert_shape(name, output[name], (batch_size, K))
+            self._assert_finite(name, output[name])
+        probs = output["event_candidate_prob"]
+        if (probs.detach() < -1e-6).any() or (
+            (probs.detach() * ~candidate_valid).abs().amax() > 1e-5
+        ):
+            raise RuntimeError("V3.7 event candidates assign probability to invalid intervals.")
+        if not torch.allclose(probs.sum(dim=-1), torch.ones_like(probs.sum(dim=-1)),
+                              atol=1e-4, rtol=1e-4):
+            raise RuntimeError("V3.7 event candidate probabilities must sum to 1.")
+
+        for name in (
+            "event_candidate_count", "event_candidate_top_index",
+            "event_candidate_top_start_frame", "event_candidate_top_end_frame",
+            "event_candidate_top1_prob", "event_residual_rms",
+            "event_residual_to_legacy_std_ratio",
+        ):
+            self._assert_shape(name, output[name], (batch_size,))
+            self._assert_finite(name, output[name])
+        if not torch.equal(output["event_candidate_count"], candidate_valid.sum(dim=-1)):
+            raise RuntimeError("V3.7 reported candidate count mismatch.")
+        top_index = output["event_candidate_top_index"]
+        if not torch.equal(top_index, probs.argmax(dim=-1)):
+            raise RuntimeError("V3.7 reported top candidate index mismatch.")
+        if not torch.equal(output["event_candidate_top_start_frame"], starts[top_index]):
+            raise RuntimeError("V3.7 top candidate start mismatch.")
+        if not torch.equal(output["event_candidate_top_end_frame"], ends[top_index]):
+            raise RuntimeError("V3.7 top candidate end mismatch.")
+        if not torch.allclose(output["event_candidate_top1_prob"],
+                              probs.max(dim=-1).values, atol=1e-5, rtol=1e-5):
+            raise RuntimeError("V3.7 event top1 probability mismatch.")
+
+        self._assert_distribution("legacy_semantic_seed_prob",
+                                  output["legacy_semantic_seed_prob"], valid_mask)
+        self._assert_distribution("event_frame_prob", output["event_frame_prob"], valid_mask)
+        self._assert_distribution("event_geometry_frame_prior",
+                                  output["event_geometry_frame_prior"], valid_mask)
+        for name in ("legacy_semantic_seed_logits", "event_seed_residual_logits"):
+            self._assert_shape(name, output[name], (batch_size, time_steps))
+            self._assert_finite(name, output[name])
+        residual = output["event_seed_residual_logits"]
+        if (residual.detach() * ~valid_mask).abs().amax() > 1e-5:
+            raise RuntimeError("V3.7 event residual must be zero on padded frames.")
+        expected_frame = torch.matmul(probs, frame_weights)
+        if not torch.allclose(output["event_frame_prob"], expected_frame,
+                              atol=1e-5, rtol=1e-5):
+            raise RuntimeError("V3.7 event-to-frame mass is inconsistent.")
+        if output["event_residual_rms"].detach().min().item() < -1e-8:
+            raise RuntimeError("V3.7 event residual RMS must be nonnegative.")
+        if output["event_residual_to_legacy_std_ratio"].detach().min().item() < -1e-8:
+            raise RuntimeError("V3.7 residual/legacy std ratio must be nonnegative.")
+        # The canonical Seed is the fused one; no alternate inference shortcut.
+        if not torch.allclose(
+            output["semantic_seed_logits"].masked_fill(~valid_mask, 0.0),
+            (output["legacy_semantic_seed_logits"] + residual).masked_fill(~valid_mask, 0.0),
+            atol=1e-5, rtol=1e-5,
+        ):
+            raise RuntimeError("V3.7 fused Seed logits must equal legacy + residual.")
+
     def _validate_qbound_core(
         self,
         qbound_aux,
@@ -700,6 +1045,51 @@ class Decoder(nn.Module):
                 f"core={qbound_aux['qbound_version']!r}."
             )
 
+        # V3.7 activation contract: assert actual Seed path, never just YAML.
+        event_active = self.qbound_event_grounding_mode == "event_relative"
+        if "event_relative_enabled_flag" not in qbound_aux:
+            raise KeyError("V3.7 core output missing event_relative_enabled_flag.")
+        if self._flag(qbound_aux, "event_relative_enabled_flag") != float(event_active):
+            raise RuntimeError("Configured V3.7 event mode differs from executed QBoundCore.")
+        for field in ("event_residual_scale", "event_relation_temperature"):
+            reported_name = field + "_used"
+            if reported_name not in qbound_aux:
+                raise KeyError(f"V3.7 core output missing {reported_name!r}.")
+            if not math.isclose(
+                self._flag(qbound_aux, reported_name),
+                self.qbound_event_kwargs[field], rel_tol=1e-5, abs_tol=1e-6,
+            ):
+                raise RuntimeError(f"V3.7 event parameter mismatch: {reported_name}.")
+        if event_active:
+            self._validate_event_relative_outputs(
+                qbound_aux, batch_size, time_steps, valid_mask,
+            )
+        elif "event_candidate_prob" in qbound_aux:
+            raise RuntimeError("Legacy core should not compute event candidates.")
+
+        # H1 activation contract. Merely configuring eq_ptc is NOT enough:
+        # enforce that the actual core forward ran the new B+C branch.
+        if "eqptc_enabled_flag" not in qbound_aux:
+            raise KeyError("Expected EQ-PTC-aware core.py output 'eqptc_enabled_flag'.")
+        eqptc_active = self.qbound_temporal_context_mode == "eq_ptc"
+        if self._flag(qbound_aux, "eqptc_enabled_flag") != float(eqptc_active):
+            raise RuntimeError("Configured EQ-PTC mode differs from executed QBoundCore mode.")
+        for name, scale in self.qbound_eqptc_scales.items():
+            output_name = name + "_used"
+            if output_name not in qbound_aux:
+                raise KeyError(f"EQ-PTC core output missing {output_name!r}.")
+            reported = self._flag(qbound_aux, output_name)
+            if not math.isclose(reported, scale, rel_tol=1e-5, abs_tol=1e-6):
+                raise RuntimeError(f"EQ-PTC core scale mismatch: {output_name}.")
+        if eqptc_active:
+            self._validate_eqptc_outputs(
+                qbound_aux,
+                batch_size=batch_size,
+                time_steps=time_steps,
+                q_len=q_len,
+                valid_mask=valid_mask,
+            )
+
         required_on = {
             "structured_visual_evidence_enabled",
             "visual_distinctiveness_enabled",
@@ -745,6 +1135,19 @@ class Decoder(nn.Module):
             "fixed_event_count_enabled",
             "minimum_event_duration_enabled",
         }
+        # In V3.7 these three flags correctly identify interval scoring.
+        # They MUST NOT be reported as zero merely to bypass this validator.
+        event_flags = {
+            "question_direct_span_scoring_enabled",
+            "neural_span_scorer_enabled",
+            "event_candidate_selector_enabled",
+        }
+        if event_active:
+            required_off -= event_flags
+            required_on |= event_flags
+        if not self.qbound_support_predictor_enabled:
+            required_on -= {"video_only_support_branch_enabled", "predictive_support_graph_enabled"}
+            required_off |= {"video_only_support_branch_enabled", "predictive_support_graph_enabled"}
         for name in required_on:
             if self._flag(qbound_aux, name) != 1.0:
                 raise RuntimeError(
@@ -872,6 +1275,21 @@ class Decoder(nn.Module):
                 "support_graph_laplacian must be detached before propagation."
             )
 
+        # Ensure the two R2 arms really consume different graph definitions.
+        # A/B must not silently revert to learned affinities in fixed mode.
+        used_edges = qbound_aux["support_edge_affinity"].detach()
+        if self.qbound_support_graph_mode == "fixed":
+            expected_edges = qbound_aux["support_edge_mask"].to(used_edges.dtype)
+        else:
+            expected_edges = qbound_aux["support_edge_affinity_raw"].detach()
+        if not torch.allclose(
+            used_edges, expected_edges, atol=1e-6, rtol=1e-6
+        ):
+            raise RuntimeError(
+                "R2 graph contract violated: propagation does not use "
+                f"the expected {self.qbound_support_graph_mode!r} edges."
+            )
+
         adjacency = qbound_aux["support_graph_adjacency"]
         laplacian = qbound_aux["support_graph_laplacian"]
         if not torch.allclose(
@@ -941,8 +1359,83 @@ class Decoder(nn.Module):
 
         predictive_loss = qbound_aux["support_predictive_loss"]
         if not torch.is_tensor(predictive_loss) or predictive_loss.numel() != 1:
-            raise TypeError("support_predictive_loss must be a scalar tensor.")
+            raise TypeError("support_predictive_loss compatibility slot must be scalar.")
         self._assert_finite("support_predictive_loss", predictive_loss)
+        if not self.qbound_support_predictor_enabled:
+            if predictive_loss.requires_grad or predictive_loss.detach().item() != 0.0:
+                raise RuntimeError("R2-C must not compute L_pred.")
+            for name in ("support_input_proj", "support_forward_cell",
+                         "support_backward_cell", "support_forward_predictor",
+                         "support_backward_predictor"):
+                if hasattr(self.qbound, name):
+                    raise RuntimeError(f"R2-C still contains predictor {name}.")
+
+    # ------------------------------------------------------------------
+    # V3.5 paired evidence (auxiliary TRAINING interface only)
+    # ------------------------------------------------------------------
+    def _validate_v35_pair(
+        self, pair, pair_valid_mask, valid_mask, pair_length, primary=None,
+    ):
+        """Fail fast if paired grounding violates the R2-C firewall.
+
+        No answer/temporal GT is accepted by this method. This method never
+        changes the Q1 time distribution or produces a second QA prediction.
+        """
+        batch_size, time_steps = valid_mask.shape
+        required = (
+            "semantic_seed_logits",
+            "semantic_seed_prob",
+            "support_temporal_prob",
+            "question_mask",
+            "video_mask",
+        )
+        absent = [name for name in required if name not in pair]
+        if absent:
+            raise KeyError("V3.5 paired core output missing: " + ", ".join(absent))
+        self._assert_shape(
+            "pair_valid_mask", pair_valid_mask, (batch_size,)
+        )
+        if pair_valid_mask.dtype != torch.bool:
+            raise TypeError("V3.5 pair_valid_mask must be boolean.")
+        if not torch.equal(pair["video_mask"], valid_mask):
+            raise RuntimeError("V3.5 Q1/Q2 must use the SAME video mask.")
+        if self.qbound_temporal_context_mode == "eq_ptc":
+            # IMPORTANT: Q2 must compute its OWN question-conditioned Bq
+            # states. Reusing Q1's where_context_states would silently break
+            # the very H1 question-disambiguation experiment.
+            self._validate_eqptc_outputs(
+                pair,
+                batch_size=batch_size,
+                time_steps=time_steps,
+                q_len=pair_length,
+                valid_mask=valid_mask,
+            )
+        if self.qbound_event_grounding_mode == "event_relative":
+            if primary is None:
+                raise RuntimeError("V3.7 paired validation needs Q1 candidate geometry.")
+            self._validate_event_relative_outputs(
+                pair, batch_size, time_steps, valid_mask, geometry_source=primary,
+            )
+        elif "event_candidate_prob" in pair:
+            raise RuntimeError("Legacy Q2 must not compute event candidates.")
+        self._assert_shape(
+            "paired_question_mask", pair["question_mask"],
+            (batch_size, pair_length),
+        )
+        self._assert_shape(
+            "paired_semantic_seed_logits", pair["semantic_seed_logits"],
+            (batch_size, time_steps),
+        )
+        self._assert_finite("paired_semantic_seed_logits", pair["semantic_seed_logits"])
+        for name in ("semantic_seed_prob", "support_temporal_prob"):
+            self._assert_distribution(
+                "paired_" + name, pair[name], valid_mask
+            )
+        if not pair["support_temporal_prob"].requires_grad:
+            raise RuntimeError(
+                "V3.5 paired Support must retain its gradient to the "
+                "shared Semantic Seed during training."
+            )
 
     # ------------------------------------------------------------------
     # Temporal contract
@@ -1012,8 +1505,37 @@ class Decoder(nn.Module):
         qbound_mix=1.0,
         use_gpeb=None,
         question_mask=None,
+        # Q-Bound V3.5 / QDTG: all three inputs below are train-only.
+        # Both questions refer to the SAME video; invalid/unpaired rows may
+        # be padded and are excluded downstream with pair_valid_mask.
+        paired_question_feature=None,
+        paired_question_mask=None,
+        pair_valid_mask=None,
     ):
         del gsub, qbound_mix, window_sizes
+
+        paired_requested = paired_question_feature is not None
+        if not paired_requested and (
+            paired_question_mask is not None or pair_valid_mask is not None
+        ):
+            raise ValueError(
+                "V3.5 paired_question_mask/pair_valid_mask requires "
+                "paired_question_feature."
+            )
+        if paired_requested:
+            if not self.training:
+                raise RuntimeError(
+                    "V3.5 paired-question computation is training-only; "
+                    "do not pass paired_question_feature to eval/test."
+                )
+            if not bool(self.qbound_enabled and (use_qbound or use_gpeb)):
+                raise RuntimeError(
+                    "V3.5 paired-question computation requires active Q-Bound."
+                )
+            if not hasattr(self.qbound, "forward_paired"):
+                raise RuntimeError(
+                    "V3.5 requires modules/qbound/core.py with forward_paired()."
+                )
 
         if use_gpeb is not None:
             use_qbound = bool(use_qbound or use_gpeb)
@@ -1152,12 +1674,65 @@ class Decoder(nn.Module):
             video_for_qbound = qbound_video_tokens.detach()
             language_for_qbound = qbound_language.detach()
 
-            qbound_aux = self.qbound(
-                video_tokens=video_for_qbound,
-                question_features=language_for_qbound,
-                video_mask=valid_mask,
-                question_mask=normalized_question_mask,
-            )
+            # Both branches preserve the same external V3.5 ABI. In EQ-PTC,
+            # Q1/Q2 share video evidence, B0 global temporal context and the
+            # detached fixed graph, but each computes its own C-pre/Bq context.
+            # In legacy mode, Q1/Q2 additionally share B0 as their WHERE.
+            qbound_pair_aux = None
+            normalized_pair_valid_mask = None
+            if paired_requested:
+                if not torch.is_tensor(paired_question_feature):
+                    raise TypeError("paired_question_feature must be a tensor.")
+                if paired_question_feature.ndim != 3:
+                    raise ValueError(
+                        "V3.5 paired_question_feature must be question-only "
+                        "token embeddings [B,L2,D], not Q+A embeddings."
+                    )
+                if (
+                    paired_question_feature.size(0) != batch_size
+                    or paired_question_feature.size(-1) != self.embed_dim
+                    or paired_question_feature.size(1) < 1
+                ):
+                    raise ValueError(
+                        "V3.5 paired_question_feature must be [B,L2,D], "
+                        "matching primary batch and feature dimension."
+                    )
+                pair_language = paired_question_feature.to(
+                    device=x_bar.device, dtype=x_bar.dtype
+                )
+                pair_question_mask = self._normalize_question_mask(
+                    paired_question_mask, pair_language, x_bar.device
+                )
+                if pair_valid_mask is None:
+                    normalized_pair_valid_mask = torch.ones(
+                        batch_size, dtype=torch.bool, device=x_bar.device
+                    )
+                else:
+                    if not torch.is_tensor(pair_valid_mask):
+                        raise TypeError("pair_valid_mask must be a boolean tensor [B].")
+                    if pair_valid_mask.dtype != torch.bool:
+                        raise TypeError("pair_valid_mask must have dtype torch.bool.")
+                    if pair_valid_mask.shape != (batch_size,):
+                        raise ValueError(
+                            "pair_valid_mask must be [B]; got "
+                            f"{tuple(pair_valid_mask.shape)}."
+                        )
+                    normalized_pair_valid_mask = pair_valid_mask.to(x_bar.device)
+                qbound_aux, qbound_pair_aux = self.qbound.forward_paired(
+                    video_tokens=video_for_qbound,
+                    question_features=language_for_qbound,
+                    paired_question_features=pair_language.detach(),
+                    video_mask=valid_mask,
+                    question_mask=normalized_question_mask,
+                    paired_question_mask=pair_question_mask,
+                )
+            else:
+                qbound_aux = self.qbound(
+                    video_tokens=video_for_qbound,
+                    question_features=language_for_qbound,
+                    video_mask=valid_mask,
+                    question_mask=normalized_question_mask,
+                )
 
             self._validate_qbound_core(
                 qbound_aux=qbound_aux,
@@ -1166,6 +1741,58 @@ class Decoder(nn.Module):
                 q_len=qbound_language.size(1),
                 valid_mask=valid_mask,
             )
+            if qbound_pair_aux is not None:
+                self._validate_v35_pair(
+                    qbound_pair_aux,
+                    normalized_pair_valid_mask,
+                    valid_mask,
+                    pair_language.size(1),
+                    primary=qbound_aux,
+                )
+                # Separate training-only companion output: never overwrites
+                # Q1's support, QA projection, time_param or metric decoder.
+                # The pipeline will implement L_pair (NOT this decoder).
+                # Use explicit qbound_ prefix so CRA.forward()'s ordinary
+                # key forwarding exposes them in model_outputs.
+                qbound_aux["qbound_pair_aux"] = qbound_pair_aux
+                qbound_aux["qbound_pair_valid_mask"] = normalized_pair_valid_mask
+                qbound_aux["qbound_pair_question_mask"] = qbound_pair_aux[
+                    "question_mask"
+                ]
+                qbound_aux["qbound_pair_semantic_seed_logits"] = qbound_pair_aux[
+                    "semantic_seed_logits"
+                ]
+                qbound_aux["qbound_pair_semantic_seed_prob"] = qbound_pair_aux[
+                    "semantic_seed_prob"
+                ]
+                qbound_aux["qbound_pair_support_temporal_prob"] = qbound_pair_aux[
+                    "support_temporal_prob"
+                ]
+                qbound_aux["qbound_pair_support_entropy_ratio"] = qbound_pair_aux[
+                    "support_entropy_ratio"
+                ]
+                qbound_aux["qbound_pair_support_effective_frames"] = qbound_pair_aux[
+                    "support_effective_frames"
+                ]
+                # V3.7 paired diagnostic tensors are Q2-specific; never mix
+                # Q1 candidate probabilities/residual with Q2's evidence.
+                if self.qbound_event_grounding_mode == "event_relative":
+                    for event_key in (
+                        "event_candidate_scores", "event_candidate_prob",
+                        "event_candidate_count", "event_candidate_top_index",
+                        "event_candidate_top_start_frame", "event_candidate_top_end_frame",
+                        "event_candidate_top1_prob", "event_frame_prob",
+                        "event_seed_residual_logits", "event_residual_rms",
+                        "event_residual_to_legacy_std_ratio",
+                    ):
+                        qbound_aux["qbound_pair_" + event_key] = qbound_pair_aux[event_key]
+
+            # Diagnostics only. No tensor, loss or gradient is changed here.
+            # Copied to time_param as "qbound_support_graph_mode" below.
+            qbound_aux["support_graph_mode"] = self.qbound_support_graph_mode
+            qbound_aux["support_predictor_enabled"] = self.qbound_support_predictor_enabled
+            qbound_aux["temporal_context_mode"] = self.qbound_temporal_context_mode
+            qbound_aux["event_grounding_mode"] = self.qbound_event_grounding_mode
 
             # ----------------------------------------------------------
             # One V2.8 Support Field, with two gradient views.
@@ -1371,7 +1998,7 @@ class Decoder(nn.Module):
             qbound_aux[
                 "qbound_grounding_gradient_to_support_graph_enabled"
             ] = zero
-            qbound_aux["qbound_predictive_loss_exposed"] = one
+            qbound_aux["qbound_predictive_loss_exposed"] = one if self.qbound_support_predictor_enabled else zero
             qbound_aux["qbound_soft_grounding_feature_exposed"] = one
             qbound_aux[
                 "qbound_value_uses_question_conditioned_states"
@@ -1390,9 +2017,15 @@ class Decoder(nn.Module):
             qbound_aux[
                 "qbound_question_conditions_semantic_relevance"
             ] = one
+            # Historical routing flag refers to an older removed module;
+            # do not reuse its name for EQ-PTC. New context diagnostic below
+            # explicitly records early question-conditioned Bq interaction.
             qbound_aux[
                 "qbound_question_routes_visual_context"
             ] = zero
+            qbound_aux["qbound_eqptc_question_conditions_temporal_context"] = (
+                one if self.qbound_temporal_context_mode == "eq_ptc" else zero
+            )
             qbound_aux[
                 "qbound_question_used_as_visual_value"
             ] = zero

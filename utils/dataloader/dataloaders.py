@@ -167,6 +167,62 @@ def videoqa_collate_fn(
         )
 
     # --------------------------------------------------------------
+    # V3.5 / EQ-PTC: Q2 is training-only, and always padded independently
+    # of Q1. Fail closed if *any* row includes incomplete pair metadata.
+    # Otherwise default_collate() can silently discard Q2 when row 0 lacks it.
+    # --------------------------------------------------------------
+    pair_fields = ("paired_question", "pair_valid_mask", "paired_video_id",
+                   "paired_question_id")
+    presence = [any(key in sample for key in pair_fields) for sample in batch]
+    if any(presence):
+        for sample_index, sample in enumerate(batch):
+            missing = [key for key in pair_fields if key not in sample]
+            if missing:
+                raise KeyError(f"V3.5 batch row {sample_index} has incomplete Q2: {missing}")
+
+        pair_max_len = 0
+        for sample_index, sample in enumerate(batch):
+            question2 = sample["paired_question"]
+            valid2 = sample["pair_valid_mask"]
+            if (not torch.is_tensor(question2) or question2.ndim != 1
+                    or question2.dtype != torch.long or question2.numel() < 1):
+                raise TypeError("V3.5 paired_question must be LongTensor[L>=1].")
+            if (not torch.is_tensor(valid2) or valid2.dtype != torch.bool
+                    or valid2.ndim != 0):
+                raise TypeError("V3.5 pair_valid_mask must be a bool scalar tensor.")
+            if not isinstance(sample["paired_video_id"], str) or not isinstance(
+                    sample["paired_question_id"], str):
+                raise TypeError("V3.5 paired_video_id/paired_question_id must be strings.")
+            # A valid Q2 must not be the same question or another video.
+            if bool(valid2):
+                if sample.get("video_id") != sample["paired_video_id"]:
+                    raise ValueError(f"Q1/Q2 video ID mismatch at batch row {sample_index}.")
+                if sample.get("question_id") == sample["paired_question_id"]:
+                    raise ValueError(f"Q1/Q2 question ID identical at batch row {sample_index}.")
+                # Trim only trailing padding: a leading special token may
+                # legitimately share PAD=0 in some tokenizer families.
+                def _trim_trailing_pad(tokens):
+                    end = tokens.numel()
+                    while end > 0 and int(tokens[end - 1]) == pad_token_id:
+                        end -= 1
+                    return tokens[:end]
+                if torch.equal(
+                    _trim_trailing_pad(sample["question"]),
+                    _trim_trailing_pad(question2),
+                ):
+                    raise ValueError(f"Q1/Q2 token IDs identical at batch row {sample_index}.")
+            pair_max_len = max(pair_max_len, question2.numel())
+
+        for sample in batch:
+            question2 = sample["paired_question"]
+            if question2.size(0) < pair_max_len:
+                padding = torch.full(
+                    (pair_max_len - question2.size(0),), pad_token_id,
+                    dtype=question2.dtype, device=question2.device,
+                )
+                sample["paired_question"] = torch.cat([question2, padding], dim=0)
+
+    # --------------------------------------------------------------
     # Existing CRA QA-candidate view: [Question SEP Answer_i].
     # In non-MC settings `answer` may be an integer/id, so only pad tensors.
     # --------------------------------------------------------------
@@ -280,6 +336,20 @@ def build_dataloaders(
         "num_thread_reader"
     ]
 
+    # H1 fair comparison: independently seeded train/val/test generators.
+    # EQ-PTC consumes extra torch RNG at initialization; do not let that
+    # perturb data order or DataLoader worker seeds relative to legacy.
+    qbound = cfgs.get("model", {}).get("qbound", {})
+    controlled_mode = qbound.get("temporal_context_mode") if isinstance(qbound, dict) else None
+    h1_controlled = controlled_mode in ("legacy", "eq_ptc")
+    data_seed = cfgs.get("misc", {}).get("seed", 0)
+    if h1_controlled and (not isinstance(data_seed, int) or isinstance(data_seed, bool)):
+        raise TypeError("H1 dataset RNG requires integer misc.seed.")
+
+    def _rng(offset):
+        return (torch.Generator().manual_seed(int(data_seed) + offset)
+                if h1_controlled else None)
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -293,6 +363,7 @@ def build_dataloaders(
         drop_last=True,
         collate_fn=collate_fn,
         pin_memory=bool(ddp),
+        generator=_rng(101),
     )
 
     val_loader = DataLoader(
@@ -304,6 +375,7 @@ def build_dataloaders(
         drop_last=False,
         collate_fn=collate_fn,
         pin_memory=bool(ddp),
+        generator=_rng(202),
     )
 
     test_loader = (
@@ -316,6 +388,7 @@ def build_dataloaders(
             drop_last=False,
             collate_fn=collate_fn,
             pin_memory=bool(ddp),
+            generator=_rng(303),
         )
         if test_dataset is not None
         else None

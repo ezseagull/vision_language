@@ -13,8 +13,10 @@ class LanModel(nn.Module):
     """
     Language embedding module.
 
-    Version 1.0 keeps the original pooling behavior for compatibility,
-    while exposing explicit question-only and candidate encoding methods.
+    V3.7 uses padding-masked learned attention pooling by default.
+    Select pooling_mode="legacy" to reproduce the previous unmasked
+    pooling behavior for controlled ablations. Question-only and
+    multiple-choice candidate encoding interfaces are unchanged.
 
     Supported inputs:
         question token ids:
@@ -40,14 +42,16 @@ class LanModel(nn.Module):
         word_dim=768,
         out_dim=512,
         debug_device=False,
+        pooling_mode="masked",
     ):
         super().__init__()
 
         self.bert = Bert(tokenizer, lan)
         self.linear_text = nn.Linear(word_dim, out_dim)
 
-        # Keep the original learned word-attention pooling so that
-        # the CRA baseline behavior is not changed by Ver1.0.
+        # Retain the original parameter names for strict checkpoint loading.
+        # V3.7 applies a PAD mask before Softmax in the masked mode;
+        # the original Sequential remains intact for legacy ablations.
         self.word_attn = nn.Sequential(
             nn.Linear(out_dim, 1),
             nn.Softmax(dim=-2),
@@ -55,6 +59,20 @@ class LanModel(nn.Module):
 
         self.out_dim = out_dim
         self.debug_device = bool(debug_device)
+        self.set_pooling_mode(pooling_mode)
+
+    def set_pooling_mode(self, pooling_mode):
+        """Switch pooling for V3.7 ablations without changing model weights.
+
+        ``masked`` is the corrected V3.7 behavior; ``legacy`` reproduces
+        the original unmasked learned attention pooling exactly.
+        """
+        if pooling_mode not in ("masked", "legacy"):
+            raise ValueError(
+                "pooling_mode must be 'masked' or 'legacy', got "
+                f"{pooling_mode!r}."
+            )
+        self.pooling_mode = pooling_mode
 
     def _check_device(self, x):
         """
@@ -102,7 +120,33 @@ class LanModel(nn.Module):
         token_features = self.bert(token_ids)
         token_features = self.linear_text(token_features)
 
-        word_weights = self.word_attn(token_features)
+        if self.pooling_mode == "legacy":
+            # Exact V3.5 behavior, retained for apples-to-apples comparisons.
+            word_weights = self.word_attn(token_features)
+        else:
+            # RoBERTa/BERT attention masks do not zero the hidden states at
+            # PAD positions. Mask the *pooling* logits explicitly.
+            pad_token_id = self.bert.tokenizer.pad_token_id
+            if pad_token_id is None:
+                raise ValueError(
+                    "V3.7 masked pooling requires tokenizer.pad_token_id."
+                )
+            valid_tokens = token_ids.ne(pad_token_id)
+            if not bool(valid_tokens.any(dim=1).all()):
+                raise ValueError(
+                    "V3.7 masked pooling received an all-PAD token sequence."
+                )
+
+            scores = self.word_attn[0](token_features)  # [B, L, 1]
+            scores = scores.masked_fill(
+                ~valid_tokens.unsqueeze(-1),
+                torch.finfo(scores.dtype).min,
+            )
+            word_weights = torch.softmax(scores, dim=1)
+            word_weights = word_weights.masked_fill(
+                ~valid_tokens.unsqueeze(-1), 0.0
+            )
+
         pooled = torch.sum(
             token_features * word_weights,
             dim=1,

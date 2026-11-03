@@ -7,7 +7,14 @@ import torch.nn.functional as F
 
 class QBoundCore(nn.Module):
     """
-    Q-Bound V2.8.0 -- Decoupled Relevance-to-Extent Grounding.
+    Q-Bound V2.8.0 ABI / V3.7 optional Event-Relative Grounding.
+
+    V3.7 adds a question-conditioned comparator over deterministic contiguous
+    candidate intervals. It modifies ONLY Semantic Seed logits through a
+    small residual; the R2-C graph, continuous Support Field and original
+    CLIP VALUE path remain unchanged. All candidates are constructed without
+    answers or temporal GT. ``event_grounding_mode='legacy'`` reproduces the
+    previous EQ-PTC forward path and state_dict architecture exactly.
 
     Research diagnosis
     ------------------
@@ -17,23 +24,30 @@ class QBoundCore(nn.Module):
     temporal support should extend.  When Question semantics directly score
     temporal spans, optimization can prefer a minimum-sufficient snippet.
 
-    V2.8 therefore enforces a no-bypass factorization:
+    V2.8 enforces a no-bypass factorization. R2-C specifically disables the
+    predictive VIDEO-only branch and retains the same normalized fixed chain
+    Laplacian as R2-B, with no predictive objective:
 
         Video + Question  -> Semantic Evidence Seed r_Q(t)        [RELEVANCE]
         Video only        -> Adjacent Support Graph w_t           [EXTENT STRUCTURE]
         r_Q + stopgrad(w) -> Structural Support p_Q(t)            [GROUNDING]
 
-    The Question NEVER directly scores [s,e].  The support graph NEVER consumes
+    In the original V2.8 branch, the Question never scores [s,e]. V3.7
+    explicitly adds question-conditioned interval *candidate* scores that feed
+    back into frame-level Seed logits, not a direct interval-decoding bypass.
+    The support graph NEVER consumes
     Question/answer features and is detached from L_ground.  It is learned by a
-    separate, video-only, leakage-free predictive objective using frozen/raw
-    visual targets.
+    separate, video-only, leakage-free predictive objective in A/B; in R2-C
+    the predictor is absent and adjacent graph weights are fixed.
 
     WHERE path
     ----------
       frozen/local CLIP
         -> Structured Visual Evidence (kept from V2.6)
-        -> shallow Temporal Context (kept from V2.6)
-        -> token-resolved visual-to-question interaction
+        -> original global Temporal Context (kept from V2.6)
+        -> [EQ-PTC optional] early Question->Visual fusion + positional
+           question-conditioned temporal context, with global residual
+        -> original token-resolved visual-to-question interaction
         -> Semantic Evidence Seed r_Q(t)
         -> structural propagation through a detached video-only support graph
         -> Support Field p_Q(t)
@@ -59,14 +73,17 @@ class QBoundCore(nn.Module):
     -------------------
       * Video + Question only at temporal inference.
       * Answers and temporal GT never enter QBoundCore.
-      * Question semantics may discover seeds, but cannot directly score spans.
+      * Legacy mode: question semantics only score frame-level Seeds.
+      * V3.7 mode: question-conditioned candidate comparison modifies those
+        same Seeds before the SAME detached support-graph propagation.
       * L_ground cannot update the video-only support predictor/graph.
       * L_pred cannot update the Question relevance branch.
       * Support prediction has no target leakage: x[t+1] is predicted only from
         left context <=t; x[t] is predicted only from right context >=t+1.
-      * No neural span scorer, Event candidate selector, Core-to-Closure,
-        Joint Continuity, BoundaryRefiner, learned start/end heads, length prior,
-        Gaussian smoothing, event-count target, or minimum-duration constraint.
+      * V3.7 optionally contains neural interval-candidate scoring (not MAP
+        selection or learned start/end boundary heads); no Core-to-Closure,
+        Joint Continuity, BoundaryRefiner, length prior, Gaussian smoothing,
+        event-count target or minimum-duration constraint.
       * Training and inference use the SAME Support Field p_Q(t).
     """
 
@@ -77,6 +94,16 @@ class QBoundCore(nn.Module):
         dropout: float = 0.1,
         num_question_heads: int = 4,
         question_ff_multiplier: int = 2,
+        support_graph_mode: str = "learned",
+        support_predictor_enabled: bool = True,
+        temporal_context_mode: str = "eq_ptc",
+        eqptc_early_scale: float = 0.25,
+        eqptc_position_scale: float = 0.25,
+        eqptc_temporal_scale: float = 0.25,
+        event_grounding_mode: str = "legacy",
+        event_residual_scale: float = 0.10,
+        event_relation_temperature: float = 0.20,
+        event_candidate_max_length: Optional[int] = None,
     ) -> None:
         super().__init__()
 
@@ -88,13 +115,58 @@ class QBoundCore(nn.Module):
             raise ValueError("hidden_dim must be divisible by num_question_heads.")
         if question_ff_multiplier < 1:
             raise ValueError("question_ff_multiplier must be >= 1.")
+        if support_graph_mode not in ("learned", "fixed"):
+            raise ValueError("support_graph_mode must be 'learned' or 'fixed'.")
 
+        if not isinstance(support_predictor_enabled, bool):
+            raise TypeError("support_predictor_enabled must be a boolean.")
+        if not support_predictor_enabled and support_graph_mode != "fixed":
+            raise ValueError("R2-C requires fixed graph when predictor is disabled.")
+        self.support_graph_mode = support_graph_mode
+        self.support_predictor_enabled = support_predictor_enabled
         self.input_dim = int(input_dim)
         self.hidden_dim = int(hidden_dim)
         self.dropout_p = float(dropout)
         self.num_question_heads = int(num_question_heads)
         self.question_ff_multiplier = int(question_ff_multiplier)
-        self.qbound_version = "2.8.0"
+        self.qbound_version = "2.8.0"  # CRA/Refine compatibility ABI, NOT experiment name.
+        if temporal_context_mode not in ("legacy", "eq_ptc"):
+            raise ValueError("temporal_context_mode must be 'legacy' or 'eq_ptc'.")
+        for name, value in (
+            ("eqptc_early_scale", eqptc_early_scale),
+            ("eqptc_position_scale", eqptc_position_scale),
+            ("eqptc_temporal_scale", eqptc_temporal_scale),
+        ):
+            if not 0.0 <= float(value) <= 1.0:
+                raise ValueError(f"{name} must be in [0,1].")
+        self.temporal_context_mode = temporal_context_mode
+        self.eqptc_early_scale = float(eqptc_early_scale)
+        self.eqptc_position_scale = float(eqptc_position_scale)
+        self.eqptc_temporal_scale = float(eqptc_temporal_scale)
+
+        # V3.7 is opt-in. The legacy/default constructor creates no extra
+        # parameter keys and preserves exact legacy initialization/RNG usage.
+        if event_grounding_mode not in ("legacy", "event_relative"):
+            raise ValueError(
+                "event_grounding_mode must be 'legacy' or 'event_relative'."
+            )
+        if not 0.0 < float(event_residual_scale) <= 1.0:
+            raise ValueError("event_residual_scale must be in (0,1].")
+        if float(event_relation_temperature) <= 0.0:
+            raise ValueError("event_relation_temperature must be positive.")
+        if event_candidate_max_length is not None and (
+            not isinstance(event_candidate_max_length, int)
+            or isinstance(event_candidate_max_length, bool)
+            or event_candidate_max_length < 1
+        ):
+            raise ValueError("event_candidate_max_length must be None or an int >= 1.")
+        self.event_grounding_mode = event_grounding_mode
+        self.event_residual_scale = float(event_residual_scale)
+        self.event_relation_temperature = float(event_relation_temperature)
+        # None = exhaustive 1..T intervals; T=32 -> 528 candidates.
+        # Pruning by a smaller max length is an optional COMPUTE ablation,
+        # never a ground-truth-dependent top-K proposal selection.
+        self.event_candidate_max_length = event_candidate_max_length
 
         # ------------------------------------------------------------------
         # A. Structured Visual Evidence (kept from V2.6)
@@ -203,6 +275,54 @@ class QBoundCore(nn.Module):
         )
 
         self._initialize_v280()
+        if not self.support_predictor_enabled:
+            # Preserve EXACT initialization/RNG consumption of R2-B, then
+            # remove the predictor completely before optimizer/model.to().
+            # The live R2-C module has no predictor parameters or forward ops.
+            for name in (
+                "support_input_proj", "support_forward_cell",
+                "support_backward_cell", "support_forward_predictor",
+                "support_backward_predictor",
+            ):
+                delattr(self, name)
+
+        # Register NEW EQ-PTC parameters AFTER legacy initialization. This
+        # preserves the legacy RNG/parameter initialization order. Legacy
+        # state_dict keys and all original modules are left intact.
+        if self.temporal_context_mode == "eq_ptc":
+            self.eqptc_early_visual_norm = nn.LayerNorm(self.hidden_dim)
+            self.eqptc_early_question_attn = nn.MultiheadAttention(
+                embed_dim=self.hidden_dim,
+                num_heads=self.num_question_heads,
+                dropout=self.dropout_p,
+                batch_first=True,
+            )
+            self.eqptc_early_delta = nn.Linear(self.hidden_dim, self.hidden_dim)
+            self.eqptc_temporal_norm = nn.LayerNorm(self.hidden_dim)
+            self.eqptc_temporal_attn = nn.MultiheadAttention(
+                embed_dim=self.hidden_dim,
+                num_heads=self.num_question_heads,
+                dropout=self.dropout_p,
+                batch_first=True,
+            )
+            self.eqptc_temporal_delta = nn.Linear(self.hidden_dim, self.hidden_dim)
+            # A small, NON-ZERO residual at initialization: keeps the baseline
+            # behavior close while allowing gradients into BOTH new attentions.
+            for layer in (self.eqptc_early_delta, self.eqptc_temporal_delta):
+                nn.init.normal_(layer.weight, mean=0.0, std=0.02)
+                nn.init.zeros_(layer.bias)
+
+        # Register optional V3.7 parameters strictly AFTER all legacy/EQ-PTC
+        # initialization. Legacy state_dict keys and RNG order are unchanged.
+        if self.event_grounding_mode == "event_relative":
+            self.event_comparator = nn.Sequential(
+                nn.Linear(6 * self.hidden_dim + 4, self.hidden_dim),
+                nn.GELU(),
+                nn.LayerNorm(self.hidden_dim),
+                nn.Linear(self.hidden_dim, 1),
+            )
+            nn.init.normal_(self.event_comparator[-1].weight, mean=0.0, std=0.02)
+            nn.init.zeros_(self.event_comparator[-1].bias)
 
     # ==================================================================
     # Initialization
@@ -582,6 +702,111 @@ class QBoundCore(nn.Module):
         }
 
     # ==================================================================
+    # H1/EQ-PTC: question-conditioned temporal context BEFORE Seed scoring.
+    # The original global context remains intact as a separate residual path.
+    # No frames are pruned; no GT, answer or learned span scorer is introduced.
+    # ==================================================================
+    @staticmethod
+    def _eqptc_sinusoidal_position(
+        video_mask: torch.Tensor,
+        hidden_dim: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Ordinal sampled-frame positions [B,T,H]; NOT true timestamps.
+
+        Masked positions do not count toward position indices and are zeroed.
+        Uses the ordinary sinusoidal encoding so order is explicit without
+        extra trainable position parameters or assumptions about video duration.
+        """
+        device = video_mask.device
+        batch_size, time_steps = video_mask.shape
+        idx = (video_mask.long().cumsum(dim=1) - 1).clamp_min(0)
+        # Compute frequencies in float32 for robust mixed precision.
+        freq_idx = torch.arange(0, hidden_dim, 2, device=device, dtype=torch.float32)
+        frequency = torch.exp(-torch.log(torch.tensor(10000.0, device=device))
+                              * freq_idx / max(hidden_dim, 1))
+        phase = idx.to(torch.float32).unsqueeze(-1) * frequency.view(1, 1, -1)
+        pos = torch.zeros(batch_size, time_steps, hidden_dim,
+                          device=device, dtype=torch.float32)
+        pos[..., 0::2] = torch.sin(phase)
+        # Also handle odd hidden_dim (although valid multihead dims are usually even).
+        pos[..., 1::2] = torch.cos(phase[..., :hidden_dim // 2])
+        return pos.to(dtype) * video_mask.unsqueeze(-1).to(dtype)
+
+    def _encode_eqptc_temporal_context(
+        self,
+        visual_evidence: torch.Tensor,
+        global_context: torch.Tensor,
+        question_features: torch.Tensor,
+        question_mask: torch.Tensor,
+        video_mask: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Early Q->V, explicit temporal order, Q-conditioned T x T attention.
+
+        B0 global context is computed independently of question; it is kept
+        as an untouched residual. The new branch does NOT use a relevance gate
+        or Top-K and never replaces downstream video VALUE tokens.
+        """
+        if self.temporal_context_mode != "eq_ptc":
+            raise RuntimeError("EQ-PTC context requested in legacy mode.")
+        valid = video_mask.to(visual_evidence.dtype).unsqueeze(-1)
+        q_tokens = self.question_token_proj(question_features)
+        q_tokens = q_tokens * question_mask.unsqueeze(-1).to(q_tokens.dtype)
+
+        # C-pre: every visual query attends to Q tokens before video-video mixing.
+        early_q_ctx, early_q_attn = self.eqptc_early_question_attn(
+            query=self.eqptc_early_visual_norm(visual_evidence),
+            key=q_tokens,
+            value=q_tokens,
+            key_padding_mask=~question_mask,
+            need_weights=True,
+            average_attn_weights=False,
+        )
+        early_delta = self.eqptc_early_scale * self.eqptc_early_delta(early_q_ctx)
+        conditioned = (visual_evidence + early_delta) * valid
+
+        # Explicit ordinal position enters the temporal ATTENTION query/key.
+        # Value is the question-conditioned visual representation without
+        # positional contamination. Every valid frame remains available.
+        normed = self.eqptc_temporal_norm(conditioned)
+        positions = self._eqptc_sinusoidal_position(
+            video_mask=video_mask,
+            hidden_dim=self.hidden_dim,
+            dtype=normed.dtype,
+        )
+        temporal_qk = normed + self.eqptc_position_scale * positions
+        temporal_ctx, temporal_attn = self.eqptc_temporal_attn(
+            query=temporal_qk,
+            key=temporal_qk,
+            value=normed,
+            key_padding_mask=~video_mask,
+            need_weights=True,
+            average_attn_weights=False,
+        )
+        contextual_delta = self.eqptc_temporal_scale * self.eqptc_temporal_delta(
+            temporal_ctx
+        )
+        where = (global_context + contextual_delta) * valid
+
+        # Graph-friendly differentiable per-video diagnostics. Ratio 0 on
+        # all-zero evidence (which cannot happen after a valid mask check).
+        den = (torch.linalg.vector_norm(visual_evidence, dim=-1) *
+               video_mask.to(visual_evidence.dtype)).sum(dim=-1).clamp_min(1e-6)
+        early_ratio = (torch.linalg.vector_norm(early_delta * valid, dim=-1) *
+                       video_mask.to(visual_evidence.dtype)).sum(dim=-1) / den
+        context_ratio = (torch.linalg.vector_norm(contextual_delta * valid, dim=-1) *
+                         video_mask.to(visual_evidence.dtype)).sum(dim=-1) / den
+        return {
+            "where_context_states": where,
+            "eqptc_global_context_states": global_context,
+            "eqptc_conditioned_visual_states": conditioned,
+            "eqptc_early_question_attention": early_q_attn,
+            "eqptc_temporal_attention": temporal_attn,
+            "eqptc_early_delta_ratio": early_ratio,
+            "eqptc_temporal_delta_ratio": context_ratio,
+        }
+
+    # ==================================================================
     # B. Question-conditioned RELEVANCE only
     # ==================================================================
     def _discover_semantic_seed(
@@ -675,6 +900,223 @@ class QBoundCore(nn.Module):
         }
 
     # ==================================================================
+    # V3.7: deterministic interval candidates + event-relative comparison.
+    # ------------------------------------------------------------------
+    # This is ONLY a WHERE/Seed residual. It never sees answers, ground-truth
+    # timestamps, CLIP VALUE used by QA, or the support graph weights.
+    # ==================================================================
+    def _event_candidate_geometry(
+        self,
+        video_mask: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> Dict[str, torch.Tensor]:
+        """Enumerate every contiguous valid interval [s,e] (no GT/top-K).
+
+        With T=32 and max_length=None there are exactly 528 candidates.
+        The candidate mask excludes intervals crossing padded/invalid tokens.
+        """
+        batch_size, time_steps = video_mask.shape
+        starts, ends = torch.triu_indices(
+            time_steps, time_steps, offset=0, device=video_mask.device,
+        )
+        lengths = ends - starts + 1
+        if self.event_candidate_max_length is not None:
+            keep = lengths <= self.event_candidate_max_length
+            starts, ends, lengths = starts[keep], ends[keep], lengths[keep]
+        # At least one valid single-frame interval exists per sample.
+        valid_prefix = F.pad(
+            video_mask.to(torch.long).cumsum(dim=1), (1, 0), value=0,
+        )
+        valid_counts = valid_prefix[:, ends + 1] - valid_prefix[:, starts]
+        candidate_valid = valid_counts == lengths.unsqueeze(0)
+        if not torch.all(candidate_valid.any(dim=-1)):
+            raise RuntimeError("Every video needs a valid interval candidate.")
+
+        frame_idx = torch.arange(time_steps, device=video_mask.device)
+        membership = (
+            (frame_idx.unsqueeze(0) >= starts.unsqueeze(1))
+            & (frame_idx.unsqueeze(0) <= ends.unsqueeze(1))
+        )
+        # [K,T], fixed and independent of question, answers and GT.
+        frame_weights = membership.to(dtype) / lengths.to(dtype).unsqueeze(1)
+        return {
+            "event_candidate_starts": starts,
+            "event_candidate_ends": ends,
+            "event_candidate_lengths": lengths,
+            "event_candidate_valid": candidate_valid,
+            "event_candidate_frame_weights": frame_weights,
+        }
+
+    @staticmethod
+    def _event_masked_attention(
+        scores: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> torch.Tensor:
+        """Masked softmax that returns all zeros for a row with no peers."""
+        scores = scores.masked_fill(~valid, torch.finfo(scores.dtype).min)
+        weights = torch.softmax(scores, dim=-1)
+        weights = weights.masked_fill(~valid, 0.0)
+        return weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
+    def _apply_event_relative_seed(
+        self,
+        relevance: Dict[str, torch.Tensor],
+        question_features: torch.Tensor,
+        question_mask: torch.Tensor,
+        video_mask: torch.Tensor,
+        candidate_geometry: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Compare non-overlapping candidate intervals and fuse into Seed.
+
+        The candidate bank is exhaustive by default; peer comparison uses
+        strictly BEFORE and AFTER non-overlapping candidates. Overlapping
+        proposals are not treated as distinct repeated event instances.
+        Computational cost is O(B*K^2 + B*K*H), without a K*K*H tensor.
+        """
+        if self.event_grounding_mode != "event_relative":
+            return relevance
+
+        hidden = relevance["semantic_seed_hidden"]        # [B,T,H]
+        legacy_logits = relevance["semantic_seed_logits"]  # [B,T]
+        legacy_prob = relevance["semantic_seed_prob"]      # [B,T]
+        batch_size, time_steps, hidden_dim = hidden.shape
+        geometry = candidate_geometry or self._event_candidate_geometry(
+            video_mask, hidden.dtype
+        )
+        starts = geometry["event_candidate_starts"]
+        ends = geometry["event_candidate_ends"]
+        lengths = geometry["event_candidate_lengths"]
+        candidate_valid = geometry["event_candidate_valid"]
+        frame_weights = geometry["event_candidate_frame_weights"]
+        n_candidates = starts.numel()
+
+        # Prefix pooling: vectorized O(B*T*H + B*K*H), not B*K*T*H.
+        valid_hidden = hidden * video_mask.to(hidden.dtype).unsqueeze(-1)
+        prefix = F.pad(valid_hidden.cumsum(dim=1), (0, 0, 1, 0), value=0.0)
+        event_vec = (
+            prefix[:, ends + 1, :] - prefix[:, starts, :]
+        ) / lengths.to(hidden.dtype).view(1, -1, 1)
+        event_vec = event_vec * candidate_valid.unsqueeze(-1).to(hidden.dtype)
+
+        # Query tokens (not pooled-with-PAD global text) supply the comparator
+        # query; the very same question-only mask is applied here.
+        q_tokens = self.question_token_proj(question_features)
+        q_mean = self._masked_mean(q_tokens, question_mask, dim=1)
+        q_expanded = q_mean.unsqueeze(1).expand(-1, n_candidates, -1)
+
+        # Semantic similarity between interval candidates. The BEFORE/AFTER
+        # masks require strict disjointness, not merely different indices.
+        normed = F.normalize(event_vec, dim=-1, eps=1e-6)
+        similarity = torch.bmm(normed, normed.transpose(1, 2))
+        similarity = similarity / self.event_relation_temperature
+        valid_pairs = (
+            candidate_valid.unsqueeze(-1) & candidate_valid.unsqueeze(-2)
+        )
+        before_geometry = ends.view(1, -1) < starts.view(-1, 1)
+        after_geometry = starts.view(1, -1) > ends.view(-1, 1)
+        before_mask = valid_pairs & before_geometry.unsqueeze(0)
+        after_mask = valid_pairs & after_geometry.unsqueeze(0)
+        before_attn = self._event_masked_attention(similarity, before_mask)
+        after_attn = self._event_masked_attention(similarity, after_mask)
+        before_context = torch.bmm(before_attn, event_vec)
+        after_context = torch.bmm(after_attn, event_vec)
+
+        # Explicit relative order, interval center and width. This is a
+        # candidate-comparison feature, not an assumed fixed event count.
+        denom = float(max(time_steps - 1, 1))
+        center = (starts.to(hidden.dtype) + ends.to(hidden.dtype)) / (2.0 * denom)
+        width = lengths.to(hidden.dtype) / float(time_steps)
+        relative = torch.stack([
+            center.unsqueeze(0).expand(batch_size, -1),
+            width.unsqueeze(0).expand(batch_size, -1),
+            before_mask.any(dim=-1).to(hidden.dtype),
+            after_mask.any(dim=-1).to(hidden.dtype),
+        ], dim=-1)
+
+        comparator_input = torch.cat([
+            event_vec,
+            q_expanded,
+            event_vec * q_expanded,
+            torch.abs(event_vec - q_expanded),
+            before_context,
+            after_context,
+            relative,
+        ], dim=-1)
+        scores = self.event_comparator(comparator_input).squeeze(-1)
+        scores = scores.masked_fill(~candidate_valid, -1e4)
+        candidate_prob = torch.softmax(scores, dim=-1)
+        candidate_prob = candidate_prob * candidate_valid.to(candidate_prob.dtype)
+        candidate_prob = candidate_prob / candidate_prob.sum(
+            dim=-1, keepdim=True
+        ).clamp_min(1e-8)
+
+        # A uniform probability over candidates is not uniform over frames:
+        # central frames belong to more windows. Normalize by this geometry
+        # prior so a non-discriminative comparator contributes ZERO residual.
+        uniform_candidate = candidate_valid.to(candidate_prob.dtype)
+        uniform_candidate = uniform_candidate / uniform_candidate.sum(
+            dim=-1, keepdim=True
+        ).clamp_min(1.0)
+        event_frame_prob = torch.matmul(candidate_prob, frame_weights)
+        geometry_prior = torch.matmul(uniform_candidate, frame_weights)
+        raw_bias = torch.log(event_frame_prob.clamp_min(1e-8)) - torch.log(
+            geometry_prior.clamp_min(1e-8)
+        )
+        frame_mask = video_mask.to(raw_bias.dtype)
+        bias_center = (raw_bias * frame_mask).sum(dim=-1, keepdim=True) / (
+            frame_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        )
+        residual_logits = self.event_residual_scale * (raw_bias - bias_center)
+        residual_logits = residual_logits * frame_mask
+        fused_logits = (legacy_logits + residual_logits).masked_fill(
+            ~video_mask, -1e4
+        )
+        fused_prob = torch.softmax(fused_logits, dim=-1)
+        fused_prob = fused_prob * frame_mask
+        fused_prob = fused_prob / fused_prob.sum(
+            dim=-1, keepdim=True
+        ).clamp_min(1e-8)
+        fused_diag = self._distribution_diagnostics(fused_prob, video_mask)
+
+        top_index = candidate_prob.argmax(dim=-1)
+        valid_count = candidate_valid.sum(dim=-1)
+        residual_rms = torch.sqrt(
+            self._masked_mean(residual_logits.square(), video_mask, dim=1)
+        )
+        base_center = self._masked_mean(legacy_logits, video_mask, dim=1)
+        base_rms = torch.sqrt(self._masked_mean(
+            (legacy_logits - base_center.unsqueeze(1)).square(),
+            video_mask, dim=1,
+        )).clamp_min(1e-6)
+
+        return {
+            **relevance,
+            # The canonical keys consumed by Refine/CRA are the FUSED Seed.
+            "semantic_seed_logits": fused_logits,
+            "semantic_seed_prob": fused_prob,
+            "semantic_seed_entropy": fused_diag["entropy"],
+            "semantic_seed_entropy_ratio": fused_diag["entropy_ratio"],
+            "semantic_seed_top1_prob": fused_diag["top1_prob"],
+            "semantic_seed_effective_frames": fused_diag["effective_count"],
+            # Explicit legacy branch for controlled ablations and diagnostics.
+            "legacy_semantic_seed_logits": legacy_logits,
+            "legacy_semantic_seed_prob": legacy_prob,
+            "event_candidate_scores": scores,
+            "event_candidate_prob": candidate_prob,
+            "event_candidate_count": valid_count,
+            "event_candidate_top_index": top_index,
+            "event_candidate_top_start_frame": starts[top_index],
+            "event_candidate_top_end_frame": ends[top_index],
+            "event_candidate_top1_prob": candidate_prob.max(dim=-1).values,
+            "event_frame_prob": event_frame_prob,
+            "event_geometry_frame_prior": geometry_prior,
+            "event_seed_residual_logits": residual_logits,
+            "event_residual_rms": residual_rms,
+            "event_residual_to_legacy_std_ratio": residual_rms / base_rms,
+            **geometry,
+        }
+
+    # ==================================================================
     # C. VIDEO-ONLY predictive support branch
     # ==================================================================
     def _masked_directional_gru(
@@ -758,6 +1200,7 @@ class QBoundCore(nn.Module):
                 "support_edge_surprise_mean": zero,
                 "support_edge_surprise_std": zero,
                 "support_edge_affinity_raw": empty,
+                "support_edge_affinity_learned": empty,
                 "support_edge_affinity": empty,
                 "support_edge_affinity_mean": zero,
                 "support_edge_affinity_std": zero,
@@ -812,12 +1255,24 @@ class QBoundCore(nn.Module):
         # This is a deterministic structural mapping, not a learned gate.
         edge_affinity_raw = torch.sigmoid(-standardized_surprise) * edge_mask_f
 
-        # Hard gradient firewall: final grounding may USE this graph but may not
-        # modify it through L_ground.
-        edge_affinity = edge_affinity_raw.detach()
+        # R2 controlled experiment: predictor and L_pred are computed for BOTH
+        # modes; only the edge weights consumed by propagation are switched.
+        # Detaching either edge source protects the same grounding firewall.
+        learned_affinity = edge_affinity_raw.detach()
+        edge_affinity = (
+            learned_affinity
+            if self.support_graph_mode == "learned"
+            else edge_mask_f.detach()
+        )
 
-        affinity_mean, affinity_std = self._masked_stats_1d(
+        # Used-edge statistics must reflect the actual graph in R2-B.
+        # Retain separately the learned-affinity diagnostics for auditing.
+        learned_affinity_mean, learned_affinity_std = self._masked_stats_1d(
             edge_affinity_raw,
+            edge_mask,
+        )
+        affinity_mean, affinity_std = self._masked_stats_1d(
+            edge_affinity,
             edge_mask,
         )
 
@@ -842,11 +1297,62 @@ class QBoundCore(nn.Module):
             "support_edge_surprise_mean": surprise_mean,
             "support_edge_surprise_std": surprise_std,
             "support_edge_affinity_raw": edge_affinity_raw,
+            "support_edge_affinity_learned": learned_affinity,
             "support_edge_affinity": edge_affinity,
             "support_edge_affinity_mean": affinity_mean,
             "support_edge_affinity_std": affinity_std,
+            "support_edge_affinity_learned_mean": learned_affinity_mean,
+            "support_edge_affinity_learned_std": learned_affinity_std,
             "support_predictive_loss_per_sample": predictive_loss_per_sample,
             "support_predictive_loss": predictive_loss,
+            "support_graph_adjacency": adjacency,
+            "support_graph_laplacian": laplacian,
+        }
+
+    def _fixed_video_support_structure(self, video_tokens, video_mask):
+        """R2-C: fixed chain graph, NO predictor computation or L_pred.
+
+        Zero-valued predictive fields are compatibility-only placeholders for
+        the original CRA/Refine interface. They are NOT trained, logged as
+        learned edges or added to the objective. Their presence does not mean
+        that a predictor was instantiated or executed.
+        """
+        batch_size, time_steps, input_dim = video_tokens.shape
+        dtype, device = video_tokens.dtype, video_tokens.device
+        edge_mask = video_mask[:, :-1] & video_mask[:, 1:]
+        edge_affinity = edge_mask.to(dtype)
+        adjacency, laplacian = self._build_chain_laplacian(
+            edge_affinity=edge_affinity, video_mask=video_mask, dtype=dtype
+        )
+        empty_hidden = video_tokens.new_zeros(batch_size, time_steps, self.hidden_dim)
+        empty_pred = video_tokens.new_zeros(batch_size, time_steps, input_dim)
+        empty_edge = video_tokens.new_zeros(batch_size, max(time_steps-1, 0))
+        zero_batch = video_tokens.new_zeros(batch_size)
+        zero_scalar = video_tokens.new_zeros(())
+        affinity_mean, affinity_std = self._masked_stats_1d(edge_affinity, edge_mask)
+        return {
+            "support_states": empty_hidden,
+            "support_forward_context": empty_hidden,
+            "support_backward_context": empty_hidden,
+            "support_forward_prediction": empty_pred,
+            "support_backward_prediction": empty_pred,
+            "support_edge_mask": edge_mask,
+            "support_forward_prediction_cosine": empty_edge,
+            "support_backward_prediction_cosine": empty_edge,
+            "support_edge_forward_error": empty_edge,
+            "support_edge_backward_error": empty_edge,
+            "support_edge_surprise": empty_edge,
+            "support_edge_surprise_mean": zero_batch,
+            "support_edge_surprise_std": zero_batch,
+            "support_edge_affinity_raw": empty_edge,
+            "support_edge_affinity_learned": empty_edge,
+            "support_edge_affinity": edge_affinity,
+            "support_edge_affinity_mean": affinity_mean,
+            "support_edge_affinity_std": affinity_std,
+            "support_edge_affinity_learned_mean": zero_batch,
+            "support_edge_affinity_learned_std": zero_batch,
+            "support_predictive_loss_per_sample": zero_batch,
+            "support_predictive_loss": zero_scalar,
             "support_graph_adjacency": adjacency,
             "support_graph_laplacian": laplacian,
         }
@@ -935,10 +1441,14 @@ class QBoundCore(nn.Module):
             if dtype in (torch.float16, torch.bfloat16)
             else dtype
         )
+        # Diagnostic CUDA/cuBLAS workaround for small T x T systems.
+        # Intentionally DO NOT detach semantic_seed_prob: autograd must still
+        # backpropagate through CPU solve and device transfers to the seed.
+        # The graph Laplacian was already detached in the support branch.
         solved = torch.linalg.solve(
-            system.to(solve_dtype),
-            semantic_seed_prob.to(solve_dtype).unsqueeze(-1),
-        ).squeeze(-1).to(dtype)
+            system.to(device="cpu", dtype=solve_dtype),
+            semantic_seed_prob.to(device="cpu", dtype=solve_dtype).unsqueeze(-1),
+        ).squeeze(-1).to(device=device, dtype=dtype)
 
         support_prob = solved.clamp_min(0.0)
         support_prob = support_prob * video_mask.to(dtype)
@@ -1200,19 +1710,42 @@ class QBoundCore(nn.Module):
             visual_evidence=visual["visual_evidence_states"],
             video_mask=video_mask,
         )
+        if self.temporal_context_mode == "eq_ptc":
+            eq_context = self._encode_eqptc_temporal_context(
+                visual_evidence=visual["visual_evidence_states"],
+                global_context=temporal["where_context_states"],
+                question_features=question_features,
+                question_mask=question_mask,
+                video_mask=video_mask,
+            )
+            # Preserve legacy temporal_self_attention as the B0 diagnostic.
+            # Only the WHERE context sent to the existing C-post/Seed changes.
+            temporal = {**temporal, **eq_context}
+
         relevance = self._discover_semantic_seed(
             where_context=temporal["where_context_states"],
             question_features=question_features,
             question_mask=question_mask,
             video_mask=video_mask,
         )
+        if self.event_grounding_mode == "event_relative":
+            relevance = self._apply_event_relative_seed(
+                relevance=relevance,
+                question_features=question_features,
+                question_mask=question_mask,
+                video_mask=video_mask,
+            )
 
         # --------------------------------------------------------------
         # Extent/support branch: VIDEO ONLY -> structural graph.
         # --------------------------------------------------------------
-        support_structure = self._learn_video_support_structure(
-            video_tokens=video_tokens,
-            video_mask=video_mask,
+        support_structure = (
+            self._learn_video_support_structure(
+                video_tokens=video_tokens, video_mask=video_mask,
+            ) if self.support_predictor_enabled else
+            self._fixed_video_support_structure(
+                video_tokens=video_tokens, video_mask=video_mask,
+            )
         )
 
         # --------------------------------------------------------------
@@ -1245,15 +1778,23 @@ class QBoundCore(nn.Module):
             "visual_distinctiveness_enabled": one,
             "visual_transition_enabled": one,
             "temporal_context_enabled": one,
+            "eqptc_enabled_flag": one if self.temporal_context_mode == "eq_ptc" else zero,
+            "eqptc_early_scale_used": video_tokens.new_tensor(self.eqptc_early_scale),
+            "eqptc_position_scale_used": video_tokens.new_tensor(self.eqptc_position_scale),
+            "eqptc_temporal_scale_used": video_tokens.new_tensor(self.eqptc_temporal_scale),
+            "event_relative_enabled_flag": one if self.event_grounding_mode == "event_relative" else zero,
+            "event_residual_scale_used": video_tokens.new_tensor(self.event_residual_scale),
+            "event_relation_temperature_used": video_tokens.new_tensor(self.event_relation_temperature),
 
             "relevance_extent_decoupling_enabled": one,
             "token_resolved_question_relevance_enabled": one,
             "semantic_evidence_seed_enabled": one,
-            "question_direct_span_scoring_enabled": zero,
+            "question_direct_span_scoring_enabled": one if self.event_grounding_mode == "event_relative" else zero,
             "question_as_visual_value_enabled": zero,
 
-            "video_only_support_branch_enabled": one,
-            "predictive_support_graph_enabled": one,
+            "video_only_support_branch_enabled": one if self.support_predictor_enabled else zero,
+            "predictive_support_graph_enabled": one if self.support_predictor_enabled else zero,
+            "support_predictor_enabled_flag": one if self.support_predictor_enabled else zero,
             "support_predictor_target_leakage_enabled": zero,
             "support_branch_uses_question_enabled": zero,
             "grounding_gradient_to_support_graph_enabled": zero,
@@ -1272,8 +1813,8 @@ class QBoundCore(nn.Module):
             "joint_transition_continuity_enabled": zero,
             "core_to_closure_enabled": zero,
             "additive_extent_energy_enabled": zero,
-            "neural_span_scorer_enabled": zero,
-            "event_candidate_selector_enabled": zero,
+            "neural_span_scorer_enabled": one if self.event_grounding_mode == "event_relative" else zero,
+            "event_candidate_selector_enabled": one if self.event_grounding_mode == "event_relative" else zero,
             "hard_map_temporal_decision_enabled": zero,
             "boundary_refiner_enabled": zero,
             "local_candidate_refinement_enabled": zero,
@@ -1370,3 +1911,140 @@ class QBoundCore(nn.Module):
             ],
             "qbound_segment_top1_prob": intervals["segment_top1_prob"],
         }
+
+    # ==================================================================
+    # V3.5 / T2: optional same-video paired-question training interface.
+    # ==================================================================
+    def forward_paired(
+        self,
+        video_tokens: torch.Tensor,
+        question_features: torch.Tensor,
+        paired_question_features: torch.Tensor,
+        video_mask: Optional[torch.Tensor] = None,
+        question_mask: Optional[torch.Tensor] = None,
+        paired_question_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        """Run two questions against ONE shared visual representation/graph.
+
+        V3.5 / QDTG contract:
+          * ``primary`` is EXACTLY the canonical R2-C ``forward()`` output.
+          * For LEGACY, Q2 reuses the video-only context as in V3.5.
+          * For EQ-PTC, Q2 MUST recompute its own early Q-V fusion AND its
+            question-conditioned temporal attention (but reuse B0/context,
+            visual evidence and fixed graph from Q1). Otherwise Q1's temporal
+            representation would leak into Q2 and silently invalidate L_pair.
+          * In V3.7, Q2 also recomputes its own event scores/residual, reusing
+            ONLY question-independent interval geometry from Q1.
+          * Both supports remain differentiable all the way to the SAME Seed
+            scorer; neither support nor its logits are detached here.
+          * No answers, ground-truth intervals, pseudo labels, learned graph,
+            second selector, extra parameters, or modified decoder are used.
+          * This method is opt-in: normal ``forward()``/inference is unchanged.
+
+        The caller (RefineDecoder / pipeline) must form legitimate same-video
+        question pairs, apply any QDTG loss, and implement pair filtering.
+        No QDTG supervision, projection, or losses are computed in QBoundCore.
+
+        Returns:
+            (primary, paired)
+            primary: complete unchanged R2-C output dictionary.
+            paired: dictionary with the paired question's Seed and Support,
+                    plus masks/diagnostics; no redundant interval posterior.
+        """
+        primary = self.forward(
+            video_tokens=video_tokens,
+            question_features=question_features,
+            video_mask=video_mask,
+            question_mask=question_mask,
+        )
+
+        batch_size = primary["video_mask"].size(0)
+        paired_features, paired_mask = self._normalize_question_features(
+            paired_question_features,
+            paired_question_mask,
+            batch_size=batch_size,
+            device=video_tokens.device,
+        )
+        if paired_features.device != video_tokens.device:
+            raise ValueError(
+                "paired_question_features must be on the same device as video_tokens."
+            )
+
+        # Reuse B0 video-only context (and its dropout mask), but EQ-PTC's
+        # temporal context is CONDITIONED on each separate question. Never
+        # accidentally feed Q1's conditioned WHERE states into Q2 scoring.
+        if self.temporal_context_mode == "eq_ptc":
+            paired_temporal = self._encode_eqptc_temporal_context(
+                visual_evidence=primary["visual_evidence_states"],
+                global_context=primary["eqptc_global_context_states"],
+                question_features=paired_features,
+                question_mask=paired_mask,
+                video_mask=primary["video_mask"],
+            )
+            paired_where = paired_temporal["where_context_states"]
+        else:
+            paired_temporal = {}
+            paired_where = primary["where_context_states"]
+
+        paired_relevance = self._discover_semantic_seed(
+            where_context=paired_where,
+            question_features=paired_features,
+            question_mask=paired_mask,
+            video_mask=primary["video_mask"],
+        )
+        if self.event_grounding_mode == "event_relative":
+            # Reuse ONLY question-independent candidate geometry. Q2 has its
+            # OWN event representations/scores/residual; Q1 cannot leak in.
+            candidate_geometry = {
+                key: primary[key] for key in (
+                    "event_candidate_starts", "event_candidate_ends",
+                    "event_candidate_lengths", "event_candidate_valid",
+                    "event_candidate_frame_weights",
+                )
+            }
+            paired_relevance = self._apply_event_relative_seed(
+                relevance=paired_relevance,
+                question_features=paired_features,
+                question_mask=paired_mask,
+                video_mask=primary["video_mask"],
+                candidate_geometry=candidate_geometry,
+            )
+
+        # R2-C propagation is parameter-free and uses the exact SAME fixed
+        # Laplacian as primary. Autograd still flows to paired Seed logits.
+        paired_support = self._propagate_seed_to_support(
+            semantic_seed_prob=paired_relevance["semantic_seed_prob"],
+            support_laplacian=primary["support_graph_laplacian"],
+            video_mask=primary["video_mask"],
+        )
+
+        paired = {
+            "video_mask": primary["video_mask"],
+            "question_mask": paired_mask,
+            "semantic_seed_logits": paired_relevance["semantic_seed_logits"],
+            "semantic_seed_prob": paired_relevance["semantic_seed_prob"],
+            "semantic_seed_entropy_ratio": paired_relevance[
+                "semantic_seed_entropy_ratio"
+            ],
+            "support_temporal_prob": paired_support["support_temporal_prob"],
+            "support_entropy_ratio": paired_support["support_entropy_ratio"],
+            "support_effective_frames": paired_support["support_effective_frames"],
+            # Canonical aliases consumed by the future V3.5 adapter.
+            "qbound_semantic_seed_logits": paired_relevance["semantic_seed_logits"],
+            "qbound_semantic_seed_prob": paired_relevance["semantic_seed_prob"],
+            "qbound_support_temporal_prob": paired_support["support_temporal_prob"],
+            **paired_temporal,
+        }
+        if self.event_grounding_mode == "event_relative":
+            # Optional audit outputs, absent in the old paired interface.
+            for key in (
+                "legacy_semantic_seed_logits", "legacy_semantic_seed_prob",
+                "event_candidate_scores", "event_candidate_prob",
+                "event_candidate_count", "event_candidate_top_index",
+                "event_candidate_top_start_frame", "event_candidate_top_end_frame",
+                "event_candidate_top1_prob", "event_frame_prob",
+                "event_geometry_frame_prior", "event_seed_residual_logits",
+                "event_residual_rms", "event_residual_to_legacy_std_ratio",
+            ):
+                paired[key] = paired_relevance[key]
+        return primary, paired
