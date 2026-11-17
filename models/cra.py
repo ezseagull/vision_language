@@ -11,7 +11,13 @@ from modules.m_cra.causal_module import LinguisticInterventionGraph
 
 class CRA(nn.Module):
     """
-    CRA answer host and controlled downstream wrapper for Q-Bound V2.8.0.
+    CRA answer host and controlled downstream wrapper for R2-C / V3.5.
+
+    V3.5 QDTG adds a TRAIN-ONLY second question for the SAME video.
+    It reuses the same LanModel question-only encoder and the shared
+    QBoundCore. The second question never enters CRA QA, original InfoNCE,
+    temporal inference, or checkpoint parameters. Loss is implemented later
+    in cra_pipeline.py, not in this wrapper.
 
     V2.8 factorizes temporal grounding as:
 
@@ -20,8 +26,8 @@ class CRA(nn.Module):
         seed + stopgrad(graph)           -> continuous Support Field
         Support Field + raw CLIP VALUE   -> Grounding and QA evidence
 
-    Wrapper contract
-    ----------------
+    Legacy wrapper contract (including the QBoundCore in M1)
+    ---------------------------------------------------------
     1. Q-Bound receives raw/generic video features, never CRA x_bar.
     2. Q-Bound receives question-only token features, never
        [Question SEP Answer] candidate features.
@@ -31,13 +37,33 @@ class CRA(nn.Module):
        the ordinary answer-space projection/classifier.
     6. The grounding view remains differentiable to semantic relevance.
     7. The support graph is video-only and detached from L_ground.
-    8. Its predictor is trained only through qbound_support_predictive_loss.
+    8. A/B predictor is trained by L_pred; R2-C has no predictor or L_pred.
     9. Raw masked CLIP remains VALUE; WHERE/support states are never pooled.
    10. Barycentric span endpoints are metadata/evaluation views only.
    11. Temporal GT, IoU, IoP, and answers never enter Q-Bound.
+   12. V3.5's Q2 uses question-only tokens, is training-only, and its
+        question-global embedding is detached as a contrastive target.
 
     CRA therefore remains the multiple-choice answer host without becoming
     part of Q-Bound's relevance or extent decision.
+
+    V3.8-Minimal (M0), enabled explicitly with model.qbound.version='3.8-minimal':
+      * Preserve all the above R2-C / V3.5 outputs and old CRA QA path.
+      * Attach a separate, fixed multiscale event bank to the unchanged core H.
+      * Score ALL five existing [Question SEP Answer_i] text candidates jointly
+        with every event, WITHOUT answer labels or temporal ground truth.
+      * Derive evidence-only answer logits and all WHERE posteriors from the
+        SAME joint evidence matrix. CE(ev) is added by cra_pipeline.py, never
+        by replacing CRA logits here.
+      * Diagnose old Support, question-only, marginal, and answer-conditional
+        temporal posteriors using EXACTLY the same decoder/R1 implementation.
+      * Never silently mix the new event posterior with old support.
+      * The labels '3.8-minimal' (experiment) and '2.8.0' (core wire) are
+        deliberately distinct so old checkpoints and interfaces remain valid.
+
+    V3.8-M1 ('3.8-m1') attaches an isolated, factorized MIL scorer to
+    pre-Core video features. The CRA answer logits and Old Support remain
+    the legacy outputs above. M1 receives no answer labels or temporal GT.
     """
 
     def __init__(self, cfgs, tokenizer) -> None:
@@ -76,12 +102,41 @@ class CRA(nn.Module):
                 ),
             )
         )
-        if self.qbound_enabled and self.qbound_version != "2.8.0":
+        self.qbound_core_wire_version = "2.8.0"
+        self.qbound_v38_minimal_enabled = bool(
+            self.qbound_enabled and self.qbound_version == "3.8-minimal"
+        )
+        self.qbound_v38_m1_enabled = bool(
+            self.qbound_enabled and self.qbound_version == "3.8-m1"
+        )
+        if self.qbound_version in ("3.8-minimal", "3.8-m1") and not self.qbound_enabled:
+            raise ValueError(f"{self.qbound_version} requires model.qbound.enabled=true.")
+        if self.qbound_enabled and self.qbound_version not in (
+            self.qbound_core_wire_version, "3.8-minimal", "3.8-m1",
+        ):
             raise ValueError(
-                "Q-Bound is enabled, but this CRA wrapper expects "
-                "model.qbound.version='2.8.0'; got "
+                "Q-Bound version must be '2.8.0' (R2-C/V3.5), "
+                "'3.8-minimal' (M0), or '3.8-m1', got "
                 f"{self.qbound_version!r}."
             )
+        # M2 is a WHERE evaluation overlay, not a new CRA/Core version.
+        m2_cfg = qbound_cfg.get("m2_mbr", {}) if self.qbound_enabled else {}
+        if not isinstance(m2_cfg, dict):
+            raise TypeError("model.qbound.m2_mbr must be a mapping.")
+        m2_enabled = m2_cfg.get("enabled", False)
+        m2_learned = m2_cfg.get("learned", False)
+        if type(m2_enabled) is not bool or type(m2_learned) is not bool:
+            raise TypeError("model.qbound.m2_mbr.enabled and .learned must be booleans.")
+        self.qbound_v38_m2_learned_eval = m2_enabled and m2_learned
+        if self.qbound_v38_m2_learned_eval and (
+            not self.qbound_v38_m1_enabled or self.max_feats != 32
+        ):
+            raise ValueError("Learned M2 evaluation needs the M1 backbone with max_feats=32.")
+
+        v38_config = qbound_cfg.get("v38", {})
+        if not isinstance(v38_config, dict):
+            raise TypeError("model.qbound.v38 must be a dictionary.")
+        self.qbound_v38_config = v38_config
 
         self.qbound_require_question_only = bool(
             qbound_cfg.get(
@@ -130,10 +185,20 @@ class CRA(nn.Module):
         )
 
         d_model = model_cfg["d_model"]
+        # The V3.7 PAD-aware learned attention pooling is the default in
+        # only_trans.py. Expose the mode explicitly for fair V3.5 comparisons;
+        # do NOT silently claim that 'masked' reproduces a legacy checkpoint.
+        self.language_pooling_mode = str(
+            qbound_cfg.get("language_pooling_mode",
+                           model_cfg.get("language_pooling_mode", "masked"))
+        )
+        if self.language_pooling_mode not in ("masked", "legacy"):
+            raise ValueError("language_pooling_mode must be 'masked' or 'legacy'.")
         self.lang_model = LanModel(
             tokenizer,
             lan=model_cfg["lan"],
             out_dim=d_model,
+            pooling_mode=self.language_pooling_mode,
         )
         self.video_model = VideoEmbedding(cfgs)
 
@@ -150,19 +215,41 @@ class CRA(nn.Module):
             self.decoder = BaselineDecoder()
             self.forward = self.baseline_forward
         elif self.baseline == "refine":
+            decoder_cfgs = cfgs
+            if self.qbound_v38_m1_enabled:
+                # Keep the legacy decoder on its native wire contract. Do
+                # not mutate the top-level config seen by CRA or the pipeline.
+                decoder_cfgs = {
+                    **cfgs,
+                    "model": {
+                        **model_cfg,
+                        "qbound": {
+                            **{k: v for k, v in qbound_cfg.items() if k != "m2_mbr"},
+                            "version": self.qbound_core_wire_version,
+                        },
+                    },
+                }
             self.decoder = RefineDecoder(
                 num_layer=model_cfg["num_layers"],
-                cfgs=cfgs,
+                cfgs=decoder_cfgs,
             )
             if self.qbound_enabled:
                 decoder_version = str(
                     getattr(self.decoder, "qbound_version", "")
                 )
-                if decoder_version != self.qbound_version:
+                # RefineDecoder retains the ORIGINAL core wire version
+                # even when its V3.8-Minimal event adapter is enabled.
+                if decoder_version != self.qbound_core_wire_version:
                     raise RuntimeError(
-                        "CRA/RefineDecoder Q-Bound version mismatch: "
-                        f"CRA={self.qbound_version!r}, "
+                        "CRA/RefineDecoder core wire version mismatch: "
+                        f"CRA={self.qbound_core_wire_version!r}, "
                         f"decoder={decoder_version!r}."
+                    )
+                if self.qbound_v38_minimal_enabled and not bool(
+                    getattr(self.decoder, "qbound_v38_minimal_enabled", False)
+                ):
+                    raise RuntimeError(
+                        "CRA M0 requires a V3.8-Minimal enabled RefineDecoder."
                     )
             self.forward = self.refine_forward
         else:
@@ -170,6 +257,35 @@ class CRA(nn.Module):
                 "Unknown model.baseline value: "
                 f"{self.baseline!r}. Expected 'baseline' or 'refine'."
             )
+
+        # Register the new modules ONLY for the explicit M0 configuration.
+        # Do this AFTER the entire legacy model is built so its parameter
+        # initialization and checkpoint keys remain unchanged for V3.5.
+        if self.qbound_v38_minimal_enabled:
+            from modules.qbound.event_bank import FixedTemporalEventBank
+            from modules.qbound.event_evidence import JointAnswerEventEvidence
+
+            core_dim = int(self.decoder.qbound.hidden_dim)
+            widths = self.qbound_v38_config.get("widths", [2, 4, 8, 16])
+            self.qbound_v38_bank = FixedTemporalEventBank(
+                hidden_dim=core_dim,
+                widths=widths,
+                context_radius=int(self.qbound_v38_config.get("context_radius", 1)),
+                prior_mode=str(self.qbound_v38_config.get("prior_mode", "scale_balanced")),
+                include_tail=self.qbound_v38_config.get("include_tail", True),
+            )
+            self.qbound_v38_evidence = JointAnswerEventEvidence(
+                event_dim=core_dim,
+                answer_dim=d_model,
+                centering=str(self.qbound_v38_config.get("centering", "double")),
+                prior_temperature=float(self.qbound_v38_config.get("prior_temperature", 1.0)),
+                interaction_temperature=float(
+                    self.qbound_v38_config.get("interaction_temperature", 1.0)
+                ),
+                dropout=float(self.qbound_v38_config.get("dropout", 0.1)),
+            )
+        elif self.qbound_v38_m1_enabled:
+            self._build_v38_m1(d_model)
 
     # ------------------------------------------------------------------
     # Language / input helpers
@@ -318,7 +434,13 @@ class CRA(nn.Module):
                 f"{tuple(question.shape)}."
             )
 
-        question_mask = self._question_mask_from_padded_ids(question)
+        # The V3.8 language encoder exposes the very same PAD definition used
+        # in its pooling. Preserve historical behavior in V3.5 configurations.
+        question_mask = (
+            self.lang_model.get_token_mask(question)
+            if self.qbound_v38_minimal_enabled else
+            self._question_mask_from_padded_ids(question)
+        )
         if hasattr(self.lang_model, "encode_question"):
             question_global, question_tokens = (
                 self.lang_model.encode_question(question)
@@ -405,6 +527,67 @@ class CRA(nn.Module):
         ).abs().amax()
         if float(invalid_mass.detach().item()) > atol:
             raise RuntimeError(f"{name} assigns mass to padded frames.")
+
+    # ------------------------------------------------------------------
+    # V3.5 / QDTG optional same-video question-pair interface
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _validate_paired_input(
+        paired_question,
+        pair_valid_mask,
+        primary_question,
+        batch_size,
+        device,
+    ):
+        """Validate the interface, not the semantic validity of a pair.
+
+        The sampler (NOT this wrapper) must verify that Q1 and Q2 belong to
+        the same video and do not require the same temporal evidence.
+        """
+        if paired_question is None:
+            if pair_valid_mask is not None:
+                raise ValueError(
+                    "pair_valid_mask requires paired_question token ids."
+                )
+            return None
+
+        if not torch.is_tensor(paired_question):
+            raise TypeError("paired_question must be a token id tensor.")
+        if paired_question.ndim == 3 and paired_question.size(1) == 1:
+            paired_question = paired_question.squeeze(1)
+        if paired_question.ndim != 2 or paired_question.size(0) != batch_size:
+            raise ValueError(
+                "paired_question must have shape [B,L2] or [B,1,L2], "
+                "using the same batch/video order as Q1."
+            )
+        if paired_question.size(1) < 1:
+            raise ValueError("paired_question must contain tokens.")
+        if paired_question.dtype not in (
+            torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64
+        ):
+            raise TypeError("paired_question must contain integer token ids.")
+        if not torch.is_tensor(pair_valid_mask):
+            raise TypeError(
+                "V3.5 requires pair_valid_mask: bool [B] alongside Q2 "
+                "so unmatched rows cannot silently enter the loss."
+            )
+        if pair_valid_mask.dtype != torch.bool or pair_valid_mask.shape != (batch_size,):
+            raise ValueError("pair_valid_mask must have dtype bool and shape [B].")
+        pair_valid_mask = pair_valid_mask.to(device=device, non_blocking=True)
+
+        # One cheap fail-fast check. It does NOT certify GT disjointness.
+        q1 = primary_question
+        if q1 is not None:
+            if q1.ndim == 3 and q1.size(1) == 1:
+                q1 = q1.squeeze(1)
+            if q1.ndim == 2 and q1.shape == paired_question.shape:
+                matches = q1.to(device=device).eq(paired_question.to(device=device)).all(dim=-1)
+                if (matches & pair_valid_mask).any():
+                    raise ValueError(
+                        "A V3.5 valid pair cannot use identical Q1/Q2 token ids. "
+                        "Mark placeholder rows invalid with pair_valid_mask=False."
+                    )
+        return pair_valid_mask
 
     # ------------------------------------------------------------------
     # Q-Bound V2.8 wrapper/integration validation
@@ -621,13 +804,14 @@ class CRA(nn.Module):
                 + ", ".join(missing_time)
             )
 
-        if str(qbound_aux["qbound_version"]) != self.qbound_version:
+        if str(qbound_aux["qbound_version"]) != self.qbound_core_wire_version:
             raise RuntimeError(
-                "CRA/RefineDecoder/Q-Bound V2.8 version mismatch: "
-                f"CRA={self.qbound_version!r}, "
+                "CRA/RefineDecoder/QBoundCore wire version mismatch: "
+                f"expected={self.qbound_core_wire_version!r}, "
                 f"decoder_aux={qbound_aux['qbound_version']!r}."
             )
 
+        predictor_enabled = bool(getattr(self.decoder, "qbound_support_predictor_enabled", True))
         expected_on = {
             "structured_visual_evidence_enabled",
             "visual_distinctiveness_enabled",
@@ -691,6 +875,11 @@ class CRA(nn.Module):
             "qbound_question_routes_visual_context",
             "qbound_question_used_as_visual_value",
         }
+        if not predictor_enabled:
+            expected_on -= {"video_only_support_branch_enabled", "predictive_support_graph_enabled",
+                            "qbound_predictive_loss_exposed"}
+            expected_off |= {"video_only_support_branch_enabled", "predictive_support_graph_enabled",
+                             "qbound_predictive_loss_exposed"}
         for name in expected_on:
             actual = self._scalar_flag(qbound_aux, name)
             if actual != 1.0:
@@ -814,6 +1003,11 @@ class CRA(nn.Module):
                 "Grounding support_graph_laplacian must be detached."
             )
 
+        if not predictor_enabled and (
+            qbound_aux["support_predictive_loss"].requires_grad
+            or float(qbound_aux["support_predictive_loss"].detach().item()) != 0.0
+        ):
+            raise RuntimeError("R2-C must not compute a predictive objective.")
         for name in (
             "support_predictive_loss",
             "qbound_support_predictive_loss",
@@ -959,6 +1153,402 @@ class CRA(nn.Module):
             )
 
     # ------------------------------------------------------------------
+    # V3.8-Minimal: joint answer-event evidence, no label or GT input
+    # ------------------------------------------------------------------
+    def _forward_v38_minimal(self, qbound_aux, answer_embeddings):
+        """Independent M0 event branch. Does not modify the CRA QA output.
+
+        Calls the SAME R1 adapter on old-support/Q-only/marginal/conditional
+        posteriors for a controlled event-ranking vs decoder comparison.
+        Answer conditioning uses the EVIDENCE HEAD's predicted answer here;
+        CRA-predicted-answer conditioning can be evaluated later using the
+        returned all-answer conditional posteriors, never answer_id/GT.
+        """
+        if not self.qbound_v38_minimal_enabled:
+            raise RuntimeError("M0 event branch called in legacy Q-Bound mode.")
+        if not isinstance(qbound_aux, dict):
+            raise TypeError("M0 requires QBoundCore outputs from RefineDecoder.")
+        required = (
+            "qbound_v38_event_frame_states", "qbound_v38_question_embedding",
+            "qbound_v38_event_video_mask", "support_temporal_prob",
+        )
+        missing = [key for key in required if key not in qbound_aux]
+        if missing:
+            raise KeyError("M0 encoder adapter missing: " + ", ".join(missing))
+        H = qbound_aux["qbound_v38_event_frame_states"]
+        q = qbound_aux["qbound_v38_question_embedding"]
+        mask = qbound_aux["qbound_v38_event_video_mask"]
+        bank = self.qbound_v38_bank(H, mask)
+        # P2/P3 default: preserve pretrained language/CRA answer embeddings.
+        # This prevents L_evQA from silently changing the legacy QA head.
+        # An explicit ablation may unfreeze this path after a gradient audit.
+        evidence_answers = (
+            answer_embeddings.detach()
+            if bool(self.qbound_v38_config.get("detach_answer_embeddings", True))
+            else answer_embeddings
+        )
+        evidence = self.qbound_v38_evidence(bank, q, evidence_answers)
+        # The old Support Field is included as a diagnostic, NOT fused.
+        # Its graph and QA firewall are left exactly as in V3.5.
+        grounding_views = self.decoder.decode_v38_grounding_views(
+            {
+                "old_support": qbound_aux["support_temporal_prob"].detach(),
+                "question_only": evidence["event_temporal_question"],
+                "joint_marginal": evidence["event_temporal_marginal"],
+                "predicted_answer_conditional": evidence[
+                    "event_temporal_conditional_pred"
+                ],
+            },
+            video_mask=mask,
+        )
+        joint = evidence["event_joint_posterior"]
+        if not torch.allclose(
+            joint.sum(dim=(1, 2)), torch.ones(joint.size(0), device=joint.device),
+            atol=1e-4, rtol=1e-4,
+        ):
+            raise RuntimeError("M0 P(event,answer) is not normalized.")
+        if bool((evidence["event_posterior_consistency_max_abs"] > 1e-4).any()):
+            raise RuntimeError("M0 marginal/conditional posterior inconsistency.")
+        outputs = {
+            "qbound_v38_active": True,
+            "qbound_v38_experiment_version": "3.8-minimal",
+            "qbound_v38_language_pooling_mode": self.language_pooling_mode,
+            "qbound_v38_answer_embedding_source": "CRA [Question SEP Answer_i]",
+            "qbound_v38_bank": bank,
+            "qbound_v38_evidence": evidence,
+            "qbound_v38_grounding_views": grounding_views,
+            "qbound_v38_ev_qa_logits": evidence["event_qa_logits"],
+            "qbound_v38_ev_qa_loss_mask": evidence["event_train_eligible"],
+            "qbound_v38_qa_prediction_source": "evidence-only",
+            # Explicit selected-evidence and baseline keys for cra_pipeline.
+            "qbound_v38_event_grounding_marginal": grounding_views["joint_marginal"],
+            "qbound_v38_event_grounding_conditional": grounding_views[
+                "predicted_answer_conditional"
+            ],
+            "qbound_v38_event_grounding_question": grounding_views["question_only"],
+            "qbound_v38_event_grounding_old": grounding_views["old_support"],
+        }
+        # Independent R1 interval outputs, ready for val/test ground-truth
+        # comparisons outside the model. Do not compute temporal GT metrics here.
+        for view_name, decoded in grounding_views.items():
+            interval = decoded["event_r1_interval"]
+            for field in (
+                "selected_span_start_frame", "selected_span_end_frame",
+                "selected_span_length", "selected_span_fraction",
+                "soft_expected_span_length", "soft_expected_span_fraction",
+                "segment_prob",
+            ):
+                outputs[f"qbound_v38_r1_{view_name}_{field}"] = interval[field]
+        # Flat aliases are convenient for WandB logging and validation dumps.
+        # Never overwrite preexisting old-core keys with these aliases.
+        for source in (bank, evidence):
+            for name, value in source.items():
+                key = "qbound_v38_" + name
+                if key in outputs:
+                    raise RuntimeError("Duplicate M0 output alias: " + key)
+                outputs[key] = value
+        return outputs
+
+    # ------------------------------------------------------------------
+    # V3.8-M1: isolated factorized MIL on pre-Core visual features.
+    # ------------------------------------------------------------------
+    def _build_v38_m1(self, text_dim):
+        core = self.decoder.qbound
+        if not callable(getattr(core, "export_v38_m1_inputs", None)):
+            raise RuntimeError("M1 requires core.py with export_v38_m1_inputs().")
+        if not callable(getattr(self.decoder, "decode_v38_grounding_views", None)):
+            raise RuntimeError("M1 requires the existing Refine grounding-view adapter.")
+        if int(self.cfgs["model"].get("prop_num", 1)) != 1:
+            raise ValueError("M1 uses exactly five CRA candidates and prop_num=1.")
+
+        cfg = self.qbound_v38_config
+        widths = tuple(cfg.get("widths", (2, 4, 8, 16)))
+        prior_mode = cfg.get("prior_mode", "scale_balanced")
+        include_tail = cfg.get("include_tail", True)
+        if widths != (2, 4, 8, 16) or prior_mode != "scale_balanced" or include_tail is not True:
+            raise ValueError("M1 keeps the M0 bank: widths 2/4/8/16, scale-balanced prior and tail coverage.")
+        if cfg.get("detach_answer_embeddings", True) is not True:
+            raise ValueError("M1 requires detached text encoder outputs.")
+
+        from modules.qbound.event_bank import FixedTemporalEventBank
+        from modules.qbound.event_evidence import FactorizedAnswerEventMIL
+
+        self.qbound_v38_m1_bank = FixedTemporalEventBank(
+            hidden_dim=int(core.hidden_dim), widths=widths, context_radius=0,
+            prior_mode=prior_mode, include_tail=include_tail,
+        )
+        # Use geometry() only. Never execute the learnable M0 context reader.
+        self.qbound_v38_m1_bank.requires_grad_(False)
+        self.qbound_v38_m1_evidence = FactorizedAnswerEventMIL(
+            visual_dim=int(core.input_dim),
+            text_dim=int(text_dim),
+            projection_dim=int(cfg.get("projection_dim", core.hidden_dim)),
+            gamma=float(cfg.get("gamma", 0.25)),
+            window_temperature=float(cfg.get("window_temperature", 0.1)),
+            candidate_temperature=float(cfg.get("candidate_temperature", 0.1)),
+        )
+
+    def _pool_v38_m1_text(self, token_features, token_ids):
+        """Masked mean over detached token features, for [B,L] or [B,5,L] IDs."""
+        if not torch.is_tensor(token_features) or token_features.ndim not in (3, 4):
+            raise ValueError("M1 expects token features [B,L,D] or [B,5,L,D].")
+        if not torch.is_tensor(token_ids) or token_ids.shape != token_features.shape[:-1]:
+            raise ValueError("M1 token IDs must match the text feature axes except D.")
+        token_ids = token_ids.to(device=token_features.device, non_blocking=True)
+        flat_ids = token_ids.reshape(-1, token_ids.size(-1))
+        get_token_mask = getattr(self.lang_model, "get_token_mask", None)
+        if callable(get_token_mask):
+            flat_mask = get_token_mask(flat_ids)
+        else:
+            flat_mask = self._question_mask_from_padded_ids(flat_ids)
+        if flat_mask.shape != flat_ids.shape or flat_mask.dtype != torch.bool:
+            raise ValueError("M1 language mask must be boolean and match token IDs.")
+        mask = flat_mask.reshape_as(token_ids)
+        if not bool(mask.any(dim=-1).all()):
+            raise ValueError("Every M1 text candidate must have a valid token.")
+        tokens = token_features.detach().float().masked_fill(~mask.unsqueeze(-1), 0.0)
+        return tokens.sum(dim=-2) / mask.sum(dim=-1, keepdim=True)
+
+    def attach_m2_eval_span_scorer(self, scorer, *, answer_mode="selected"):
+        """Attach an already initialized scorer for learned WHERE evaluation.
+
+        The scorer accepts the keyword tensors in _score_v38_m2_spans and
+        returns one floating-point logit per supplied span. Attach after the
+        CRA checkpoint is loaded and both modules are on the evaluation device.
+        This temporary evaluator is deliberately excluded from CRA checkpoints
+        and optimizers. It is not a training or scorer-initialization API.
+        """
+        if not self.qbound_v38_m2_learned_eval:
+            raise RuntimeError(
+                "Attach an M2 scorer only with m2_mbr.enabled=true and learned=true."
+            )
+        if not isinstance(scorer, nn.Module) or scorer is self:
+            raise TypeError("The M2 eval scorer must be a separate torch.nn.Module.")
+        if answer_mode not in ("selected", "all"):
+            raise ValueError("M2 answer_mode must be 'selected' or 'all'.")
+        # Store a runtime evaluator, not a parameter-bearing CRA child module.
+        object.__setattr__(self, "_m2_eval_span_scorer", scorer.eval())
+        self._m2_eval_answer_mode = answer_mode
+
+    @torch.no_grad()
+    def _score_v38_m2_spans(
+        self, *, frame_features, video_mask, question_tokens, question_mask,
+        answer_tokens, answer_sequence_ids, cra_answer,
+    ):
+        """Score all 496 spans for the supported 32-valid-step MBR cohort."""
+        scorer = getattr(self, "_m2_eval_span_scorer", None)
+        if scorer is None:
+            raise RuntimeError(
+                "M2 learned scorer is not attached. For C2/C4 set m2_mbr.learned=false. "
+                "For learned evaluation attach an initialized scorer with "
+                "attach_m2_eval_span_scorer()."
+            )
+        if self.training or scorer.training:
+            raise RuntimeError("M2 scoring requires both CRA and its attached scorer in eval mode.")
+        batch, steps, _ = frame_features.shape
+        device = frame_features.device
+        if steps != 32 or video_mask.shape != (batch, steps) or video_mask.dtype != torch.bool:
+            raise ValueError("M2 needs a 32-step tensor and a boolean [B,32] visual mask.")
+        if (
+            not torch.is_tensor(question_tokens) or question_tokens.ndim != 3
+            or question_tokens.shape[0] != batch or not torch.is_tensor(question_mask)
+            or question_mask.shape != question_tokens.shape[:2] or question_mask.dtype != torch.bool
+        ):
+            raise ValueError("M2 question tokens [B,L,D] and boolean padding mask [B,L] disagree.")
+        if (
+            not torch.is_tensor(answer_tokens) or answer_tokens.ndim != 4
+            or answer_tokens.shape[:2] != (batch, 5)
+            or not torch.is_tensor(answer_sequence_ids)
+            or answer_sequence_ids.shape != answer_tokens.shape[:-1]
+            or cra_answer.shape != (batch,) or cra_answer.dtype != torch.long
+        ):
+            raise ValueError("M2 requires aligned five-answer tokens and the CRA answer [B].")
+
+        # Start-major (s,e), e exclusive. triu columns are the last included
+        # frame, so shift only that coordinate by one. Same order as m2_mbr.py.
+        s, last = torch.triu_indices(steps, steps, offset=1, device=device)
+        bounds = torch.stack((s, last + 1), dim=-1)
+        eligible = video_mask.all(dim=1)
+        rows = eligible.nonzero(as_tuple=True)[0]
+        logits = frame_features.new_zeros((batch, bounds.size(0)), dtype=torch.float32)
+        if rows.numel():
+            # Partial/padded rows are excluded upstream from MBR evaluation.
+            # No padded row is scored by the attached module.
+            feats = frame_features.index_select(0, rows)
+            vmask = video_mask.index_select(0, rows)
+            qt = question_tokens.detach().index_select(0, rows)
+            qm = question_mask.index_select(0, rows)
+            chosen = cra_answer.index_select(0, rows)
+            ids = answer_sequence_ids.to(device=answer_tokens.device, non_blocking=True)
+            if self._m2_eval_answer_mode == "selected":
+                at = answer_tokens.detach()[rows, chosen].unsqueeze(1)
+                aid = ids[rows, chosen].unsqueeze(1)
+                target = torch.zeros_like(chosen)
+            else:
+                at = answer_tokens.detach().index_select(0, rows)
+                aid = ids.index_select(0, rows)
+                target = chosen
+            flat_ids = aid.reshape(-1, aid.size(-1))
+            get_token_mask = getattr(self.lang_model, "get_token_mask", None)
+            if callable(get_token_mask):
+                am = get_token_mask(flat_ids)
+            else:
+                am = self._question_mask_from_padded_ids(flat_ids)
+            if am.shape != flat_ids.shape or am.dtype != torch.bool:
+                raise ValueError("M2 answer mask must be boolean and match the token IDs.")
+            am = am.reshape_as(aid)
+            if not bool(am.any(dim=-1).all()):
+                raise ValueError("Every M2 answer sequence needs a valid token.")
+            scored = scorer(
+                frame_features=feats, video_mask=vmask,
+                question_tokens=qt.masked_fill(~qm.unsqueeze(-1), 0.0),
+                question_mask=qm,
+                answer_tokens=at.masked_fill(~am.unsqueeze(-1), 0.0), answer_mask=am,
+                target_answer_index=target, span_bounds=bounds.clone(),
+            )
+            if (
+                not torch.is_tensor(scored) or not torch.is_floating_point(scored)
+                or scored.shape != (rows.numel(), bounds.size(0)) or scored.device != device
+            ):
+                raise ValueError("M2 scorer must return floating [B_eligible,496] logits on CRA's device.")
+            scored = scored.to(dtype=logits.dtype)
+            if not bool(torch.isfinite(scored).all()):
+                raise ValueError("M2 scorer returned non-finite logits.")
+            logits.index_copy_(0, rows, scored)
+
+        return {
+            "qbound_v38_m2_span_bounds": bounds,
+            "qbound_v38_m2_span_logits": logits,
+            "qbound_v38_m2_span_eligible": eligible,
+        }
+
+    def _forward_v38_m1(
+        self, *, video, qbound_aux, question_ids, question_tokens,
+        answer_sequence_ids, answer_tokens, answer_proj, video_proj,
+        question_candidate_mask, question_mask=None,
+    ):
+        """Score the bank and export WHERE without replacing legacy CRA QA.
+
+        Scorer contract: event_posterior_question [B,M],
+        event_posterior_by_answer [B,M,5], event_mil_answer_scores [B,5],
+        and event_mil_question_scores [B] when a question pool is supplied.
+        Question scores are MIL values for the diagonal question of each
+        row. The pipeline supplies the common mask for each video's rows
+        and owns deduplication and both losses. A masked diagonal excludes
+        that row from question CE (e.g. descriptive or a duplicate).
+        Neither the answer label nor any timestamp is an argument here.
+        """
+        if not isinstance(qbound_aux, dict):
+            raise TypeError("M1 requires the legacy video mask and Old Support.")
+        raw = self.decoder.qbound.export_v38_m1_inputs(video, qbound_aux["video_mask"])
+        frame_features = raw["qbound_v38_m1_frame_features"]
+        mask = raw["qbound_v38_m1_video_mask"]
+        batch_size = frame_features.size(0)
+        question_positive = None
+        if question_candidate_mask is None:
+            if self.training:
+                raise ValueError("M1 VQA training requires the grouped question-candidate mask.")
+        else:
+            if not self.training:
+                raise ValueError("The M1 question-candidate pool is training-only.")
+            if (not torch.is_tensor(question_candidate_mask)
+                    or question_candidate_mask.dtype != torch.bool
+                    or question_candidate_mask.shape != (batch_size, batch_size)):
+                raise ValueError("M1 question_candidate_mask must be boolean [B,B] on the local batch.")
+            question_candidate_mask = question_candidate_mask.to(device=mask.device)
+            question_positive = question_candidate_mask.diagonal()
+            # Empty pools cannot contribute to question CE. Give their rows
+            # a dummy diagonal only for a finite candidate softmax; never
+            # use it to mark a disallowed training positive as eligible.
+            question_candidate_mask = question_candidate_mask | (
+                ~question_candidate_mask.any(dim=-1, keepdim=True)
+                & torch.eye(batch_size, dtype=torch.bool, device=mask.device)
+            )
+
+        if question_ids.ndim == 3 and question_ids.size(1) == 1:
+            question_ids = question_ids.squeeze(1)
+        question_embeddings = self._pool_v38_m1_text(question_tokens, question_ids)
+        answer_embeddings = self._pool_v38_m1_text(answer_tokens, answer_sequence_ids)
+        if question_embeddings.ndim != 2 or answer_embeddings.shape[:2] != (batch_size, 5):
+            raise ValueError("M1 requires one question and five [Q SEP A] candidates per row.")
+
+        bank = self.qbound_v38_m1_bank.geometry(mask, dtype=torch.float32)
+        evidence = self.qbound_v38_m1_evidence(
+            bank=bank, frame_features=frame_features,
+            question_embeddings=question_embeddings,
+            answer_embeddings=answer_embeddings,
+            question_candidate_mask=question_candidate_mask,
+        )
+        window_mask = bank["event_valid_mask"]
+        q_posterior = evidence["event_posterior_question"]
+        a_posterior = evidence["event_posterior_by_answer"]
+        mil_scores = evidence["event_mil_answer_scores"]
+        self._assert_shape("M1 question posterior", q_posterior, window_mask.shape)
+        self._assert_shape("M1 answer posteriors", a_posterior, (*window_mask.shape, 5))
+        self._assert_shape("M1 answer MIL scores", mil_scores, (batch_size, 5))
+        self._assert_finite("M1 answer MIL scores", mil_scores)
+        if question_candidate_mask is not None:
+            self._assert_shape("M1 question MIL scores", evidence["event_mil_question_scores"], (batch_size,))
+
+        # Pure diagnostics/inference. All training gradients come from the
+        # scorer outputs above, not from hard answer selection or decoding.
+        with torch.no_grad():
+            # Exactly the CRA pipeline VQA logits for prop_num=1, without
+            # cosine normalization or argmax of the MIL answer scores.
+            cra_logits = torch.einsum("bcd,bmd->bmc", answer_proj, video_proj.unsqueeze(1)).squeeze(1)
+            cra_answer = cra_logits.argmax(dim=-1)
+            mil_answer = mil_scores.argmax(dim=-1)
+            rows = torch.arange(batch_size, device=mask.device)
+            event_posteriors = {
+                "question_only": q_posterior.detach(),
+                "cra_answer_conditional": a_posterior[rows, :, cra_answer],
+                "mil_answer_conditional": a_posterior[rows, :, mil_answer],
+            }
+            old_support = qbound_aux["support_temporal_prob"].detach()
+            fallback = bank["bank_fallback"]
+            temporal = {"old_support": old_support}
+            # Normalized footprint push-forward, not membership. Force fp32
+            # under AMP so the existing decoder's normalization check holds.
+            with torch.autocast(device_type=frame_features.device.type, enabled=False):
+                footprint = bank["event_footprint"].float()
+                for view, posterior in event_posteriors.items():
+                    self._assert_distribution(f"M1 {view} windows", posterior.float(), window_mask)
+                    support = torch.bmm(posterior.float().unsqueeze(1), footprint).squeeze(1)
+                    temporal[view] = torch.where(fallback.unsqueeze(1), old_support, support)
+            grounding_views = (
+                self.decoder.decode_v38_grounding_views(temporal, video_mask=mask)
+                if not self.training else {}
+            )
+
+        outputs = {
+            "qbound_v38_m1_active": True,
+            "qbound_v38_m1_bank": bank,
+            "qbound_v38_m1_evidence": evidence,
+            "qbound_v38_m1_train_eligible": bank["bank_train_eligible"],
+            "qbound_v38_m1_question_train_eligible": (
+                question_positive & bank["bank_train_eligible"]
+                if question_positive is not None else None
+            ),
+            "qbound_v38_m1_bank_fallback": fallback,
+            "qbound_v38_m1_cra_answer": cra_answer,
+            "qbound_v38_m1_mil_answer": mil_answer,
+            "qbound_v38_m1_event_posteriors": event_posteriors,
+            "qbound_v38_m1_temporal_by_view": temporal,
+            "qbound_v38_m1_grounding_views": grounding_views,
+            "qbound_v38_m1_primary_grounding_view": "cra_answer_conditional",
+            "qbound_v38_m1_qa_prediction_source": "cra",
+        }
+        if self.qbound_v38_m2_learned_eval and not self.training:
+            # CRA and M1 have already produced their unchanged QA/WHERE outputs.
+            outputs.update(self._score_v38_m2_spans(
+                frame_features=frame_features, video_mask=mask,
+                question_tokens=question_tokens, question_mask=question_mask,
+                answer_tokens=answer_tokens, answer_sequence_ids=answer_sequence_ids,
+                cra_answer=cra_answer,
+            ))
+        return outputs
+
+    # ------------------------------------------------------------------
     # Q-Bound V2.8 refine forward
     # ------------------------------------------------------------------
     def refine_forward(
@@ -972,14 +1562,18 @@ class CRA(nn.Module):
         question=None,
         qbound_mix=1.0,
         answer_only=None,
+        paired_question=None,
+        pair_valid_mask=None,
+        m1_question_candidate_mask=None,
     ):
         """
-        CRA/Q-Bound V2.8 forward.
+        CRA/Q-Bound R2-C forward with optional TRAIN-ONLY V3.5 question pair.
 
         answer
             Existing CRA [Question SEP Answer_i] candidates. They are used only
             by the downstream multiple-choice answer branch and detached CRA
-            reference grounding.
+            reference grounding on the legacy path. M1 also reads a separate,
+            detached token view of all five candidates.
 
         question
             Question-only token ids. These are the only language features sent
@@ -990,7 +1584,23 @@ class CRA(nn.Module):
             by V2.8.
 
         qbound_mix
-            Accepted for compatibility. V2.8 never mixes CRA and Q-Bound keys.
+            Accepted for compatibility. R2-C never mixes CRA and Q-Bound keys.
+
+        paired_question
+            Optional Q2 QUESTION-ONLY token ids [B,L2] for V3.5 training.
+            Q2 must refer to the same video as the corresponding Q1 row.
+            Never provide Q2 during evaluation/inference.
+
+        pair_valid_mask
+            Required if Q2 is provided; boolean [B]. Rows marked False
+            are excluded by the future pair loss in cra_pipeline.py.
+            False rows must still have a nonempty placeholder token sequence.
+
+        m1_question_candidate_mask
+            Training-only [B,B] mask for the M1 question pass, in batch-row
+            order. Distinct positives from one video must share a candidate
+            set from the sampler/pipeline, not independently filtered masks.
+            A false diagonal excludes a row from question supervision.
         """
         del qbound_mix, answer_only
 
@@ -999,12 +1609,37 @@ class CRA(nn.Module):
             raise ValueError(
                 f"Unsupported CRA mode {mode!r}; expected 'VQ' or 'VQA'."
             )
+        if m1_question_candidate_mask is not None and not (
+            self.qbound_v38_m1_enabled and self.training and mode == "VQA"
+        ):
+            raise ValueError("m1_question_candidate_mask is only for M1 VQA training.")
 
         device = video.device
         video_mask = self._move_video_mask(video_mask, device)
 
+        paired_requested = paired_question is not None
+        if paired_requested:
+            if not self.training:
+                raise RuntimeError(
+                    "V3.5 paired_question is TRAIN-ONLY; do not provide Q2 "
+                    "during validation or inference."
+                )
+            if mode != "VQA" or not self.qbound_enabled:
+                raise RuntimeError(
+                    "V3.5 Q2 is only supported with active Q-Bound and mode='VQA'."
+                )
+            if question is None:
+                raise ValueError("V3.5 Q2 requires primary question=Q1.")
+        pair_valid_mask = self._validate_paired_input(
+            paired_question,
+            pair_valid_mask,
+            question,
+            batch_size=video.size(0),
+            device=device,
+        )
+
         # Ordinary CRA candidate-answer representation.
-        answer_g, _ = self._encode_answers(answer, device)
+        answer_g, answer_token_features = self._encode_answers(answer, device)
         batch_size = answer_g.size(0)
         answer_indices = self._prepare_answer_indices(
             answer_id,
@@ -1065,7 +1700,39 @@ class CRA(nn.Module):
                     "V2.8 requires token-level question features."
                 )
 
-        # RefineDecoder owns the one and only V2.8 temporal decision.
+        # V3.5: encode Q2 with the SAME question-only LanModel but stop its
+        # gradient at the external encoder firewall. Isolate RNG so the extra
+        # language dropout does not perturb Q1's canonical decoder/core path.
+        pair_question_g = None
+        pair_question_tokens = None
+        pair_question_mask = None
+        if paired_requested:
+            rng_devices = (
+                [device.index if device.index is not None else torch.cuda.current_device()]
+                if device.type == "cuda" else []
+            )
+            with torch.random.fork_rng(devices=rng_devices, enabled=True):
+                with torch.no_grad():
+                    pair_question_g, pair_question_tokens, pair_question_mask = (
+                        self._encode_question(paired_question, device)
+                    )
+            if pair_question_g.size(0) != batch_size:
+                raise ValueError("Paired question and video batch sizes differ.")
+            if pair_question_g.size(-1) != question_g.size(-1):
+                raise ValueError("Q1/Q2 question-global embedding dimensions differ.")
+            if pair_question_tokens.size(-1) != question_tokens.size(-1):
+                raise ValueError("Q1/Q2 question-token embedding dimensions differ.")
+
+        # R2-C Q1 inference path stays unchanged. Optional Q2 path computes only
+        # shared-encoder Seed and Support inside the patched RefineDecoder.
+        pair_decoder_kwargs = (
+            {
+                "paired_question_feature": pair_question_tokens,
+                "paired_question_mask": pair_question_mask,
+                "pair_valid_mask": pair_valid_mask,
+            }
+            if paired_requested else {}
+        )
         (
             video_proj,
             video_attn,
@@ -1091,6 +1758,7 @@ class CRA(nn.Module):
             question_mask=(
                 question_mask if use_qbound else None
             ),
+            **pair_decoder_kwargs,
         )
 
         answer_proj = answer_g
@@ -1128,7 +1796,10 @@ class CRA(nn.Module):
                 "functional_critic_enabled": zero,
                 "vqa_gradient_to_qbound_topology_enabled": zero,
                 "question_grounding_objective_expected": one,
-                "support_predictive_objective_expected": one,
+                "support_predictive_objective_expected": (
+                    one if getattr(self.decoder, "qbound_support_predictor_enabled", True)
+                    else zero
+                ),
                 # Stop-gradient target prevents the alignment objective from
                 # being solved by moving the question encoder.
                 "grounding_question_stop_gradient": one,
@@ -1163,6 +1834,40 @@ class CRA(nn.Module):
             # Historical answer-only temporal branch remains absent.
             "answer_only_proj": None,
         }
+
+        if paired_requested:
+            if not isinstance(qbound_aux, dict):
+                raise RuntimeError("V3.5 decoder did not return Q-Bound outputs.")
+            for name in (
+                "qbound_pair_valid_mask",
+                "qbound_pair_support_temporal_prob",
+                "qbound_pair_semantic_seed_prob",
+                "qbound_pair_semantic_seed_logits",
+            ):
+                if name not in qbound_aux:
+                    raise KeyError(f"V3.5 RefineDecoder missing {name!r}.")
+            returned_valid = qbound_aux["qbound_pair_valid_mask"]
+            if not torch.equal(returned_valid, pair_valid_mask):
+                raise RuntimeError("V3.5 pair_valid_mask changed in decoder.")
+            # Question-global targets are detached like Q1 L_ground target.
+            # Neither Q2's QA labels nor its answer candidates are consumed.
+            outs["qbound_pair_question"] = pair_question_g.detach()
+            outs["qbound_pair_grounding_question"] = pair_question_g.detach()
+            outs["qbound_pair_valid_mask"] = returned_valid
+            outs["qbound_pair_question_mask"] = pair_question_mask
+            outs["qbound_pair_support_temporal_prob"] = qbound_aux[
+                "qbound_pair_support_temporal_prob"
+            ]
+            outs["qbound_pair_semantic_seed_prob"] = qbound_aux[
+                "qbound_pair_semantic_seed_prob"
+            ]
+            outs["qbound_pair_semantic_seed_logits"] = qbound_aux[
+                "qbound_pair_semantic_seed_logits"
+            ]
+            if outs["qbound_pair_grounding_question"].requires_grad:
+                raise RuntimeError("V3.5 Q2 contrastive target must be detached.")
+            if not outs["qbound_pair_support_temporal_prob"].requires_grad:
+                raise RuntimeError("V3.5 Q2 Support must retain Seed gradients.")
 
         if use_qbound:
             # Grounding target is stopped; video evidence remains
@@ -1249,6 +1954,31 @@ class CRA(nn.Module):
             ]
             outs["cra_video_proj"] = qbound_aux["cra_video_proj"]
             outs["cra_key"] = qbound_aux["cra_key"]
+
+        if self.qbound_v38_minimal_enabled and use_qbound:
+            # Refine's time_param uses the legacy 2.8.0 wire version. Expose
+            # the experiment version separately and consistently at CRA level.
+            outs["qbound_version"] = self.qbound_version
+            outs["qbound_core_wire_version"] = self.qbound_core_wire_version
+            # All five candidates are encoded before answer_id supervision.
+            # Neither answer_id nor temporal GT is passed to this branch.
+            if answer_g.size(1) != 5:
+                raise ValueError(
+                    "V3.8-Minimal requires five [Q SEP A] candidates, got "
+                    f"{answer_g.size(1)}."
+                )
+            outs.update(self._forward_v38_minimal(qbound_aux, answer_g))
+        elif self.qbound_v38_m1_enabled and use_qbound:
+            outs["qbound_version"] = self.qbound_version
+            outs["qbound_core_wire_version"] = self.qbound_core_wire_version
+            outs.update(self._forward_v38_m1(
+                video=video, qbound_aux=qbound_aux,
+                question_ids=question, question_tokens=question_tokens,
+                answer_sequence_ids=answer, answer_tokens=answer_token_features,
+                answer_proj=answer_proj, video_proj=video_proj,
+                question_candidate_mask=m1_question_candidate_mask,
+                question_mask=question_mask,
+            ))
 
         return video_proj, answer_proj, outs
 

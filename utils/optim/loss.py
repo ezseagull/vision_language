@@ -9,7 +9,40 @@ def compute_ce_loss(pred, target, mask=None):
     loss = criterion(pred, target)
     return loss
 
-def align_loss(grounding_feature, qsn, neg_sample=None):
+
+def _masked_align_loss(grounding_feature, qsn, negative_mask):
+    """Keep CRA's 32 negative draws with replacement, only from allowed rows."""
+    if grounding_feature.ndim != 2 or qsn.shape != grounding_feature.shape:
+        raise ValueError("Masked CRA alignment expects two matching [B,D] tensors.")
+    batch_size = grounding_feature.size(0)
+    if (not torch.is_tensor(negative_mask) or negative_mask.dtype != torch.bool
+            or negative_mask.shape != (batch_size, batch_size)):
+        raise ValueError("align_negative_mask must be boolean [B,B].")
+    device = grounding_feature.device
+    allowed = negative_mask.to(device) & ~torch.eye(batch_size, device=device, dtype=torch.bool)
+    eligible = allowed.any(dim=1)
+    if not eligible.any():
+        return (grounding_feature.sum() + qsn.sum()) * 0.0
+
+    indices = torch.multinomial(allowed[eligible].float(), 32, replacement=True)
+    # FP16/BF16 normalization and dot products use FP32 in this opt-in path.
+    dtype = torch.promote_types(grounding_feature.dtype, qsn.dtype)
+    if dtype in (torch.float16, torch.bfloat16):
+        dtype = torch.float32
+    visual = F.normalize(grounding_feature.to(dtype), dim=-1)
+    query = F.normalize(qsn[eligible].to(dtype), dim=-1)
+    positive = (query * visual[eligible]).sum(dim=-1, keepdim=True)
+    negative = (query[:, None, :] * visual[indices]).sum(dim=-1)
+    logits = torch.cat((positive, negative), dim=1) / 0.07
+    labels = torch.zeros(query.size(0), device=device, dtype=torch.long)
+    return F.cross_entropy(logits, labels)
+
+
+def align_loss(grounding_feature, qsn, neg_sample=None, *, align_negative_mask=None):
+    if align_negative_mask is not None:
+        if neg_sample is not None:
+            raise ValueError("Provide neg_sample or align_negative_mask, not both.")
+        return _masked_align_loss(grounding_feature, qsn, align_negative_mask)
         
     def _info_nce_loss(x, x_pos, x_neg, temperature=0.07):
         """
@@ -82,8 +115,12 @@ LOSS_FNS = {"ce": compute_ce_loss, "align": align_loss}
 class BuildLossFunc():
     def __init__(self, cfgs):
         self.loss_fns = cfgs["optim"]["loss"]
+        self.grouped_alignment = (
+            cfgs.get("dataset", {}).get("m1_grouped_batch", False)
+            or cfgs.get("model", {}).get("qbound", {}).get("version") == "3.8-m1"
+        )
 
-    def __call__(self, pred, target):
+    def __call__(self, pred, target, *, align_negative_mask=None):
         loss = {}
         total_loss = 0
         for loss_fn in self.loss_fns.keys():
@@ -100,12 +137,27 @@ class BuildLossFunc():
             elif loss_fn == "align":
                 # global
                 if "g" in self.loss_fns[loss_fn].keys():
+                    weight = self.loss_fns[loss_fn]["g"]
+                    if self.grouped_alignment and float(weight) == 0.0:
+                        # A disabled loss shouldn't sample unmasked negatives.
+                        loss["ag_loss"] = pred["vqa_align_pred"].sum() * 0.0
+                        continue
+                    if self.grouped_alignment and align_negative_mask is None:
+                        raise ValueError("Grouped CRA alignment requires align_negative_mask.")
+                    align_kwargs = ({"align_negative_mask": align_negative_mask}
+                                    if align_negative_mask is not None else {})
                     if "vq_align_pred" in pred.keys():
-                        _loss = LOSS_FNS[loss_fn](pred["vq_align_pred"], target["vq_align_gt"])
-                    _loss = _loss + LOSS_FNS[loss_fn](pred["vqa_align_pred"], target["vqa_align_gt"])
-                    total_loss = total_loss + _loss * self.loss_fns[loss_fn]["g"]
+                        base = LOSS_FNS[loss_fn](pred["vq_align_pred"], target["vq_align_gt"], **align_kwargs)
+                    else:
+                        # Preserve the historical CE contribution when the
+                        # standard CE block precedes align and VQ is disabled.
+                        # If it hasn't run, there is no prior term to reuse.
+                        base = loss.get("vqa_loss", 0)
+                    _loss = base + LOSS_FNS[loss_fn](
+                        pred["vqa_align_pred"], target["vqa_align_gt"], **align_kwargs
+                    )
+                    total_loss = total_loss + _loss * weight
                     loss[f"ag_loss"] = _loss
 
         loss["total_loss"] = total_loss
         return loss
-    

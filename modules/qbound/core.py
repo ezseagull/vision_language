@@ -9,6 +9,18 @@ class QBoundCore(nn.Module):
     """
     Q-Bound V2.8.0 -- Decoupled Relevance-to-Extent Grounding.
 
+
+    V3.8 compatibility contract (additive only)
+    ------------------------------------------
+    The V3.5/R2-C encoder, semantic seed, old support graph, and analytic
+    interval decoder are intentionally NOT redesigned here.  New M0 event
+    bank, limited context reader, and joint answer-event scorer are separate
+    modules connected by exported feature tensors. M1 reads a separate,
+    detached view of the original video features via export_v38_m1_inputs.
+    The M1 text/visual projections, bank scoring and losses stay outside
+    this core. This core remains answer-free and temporal-GT-free; no new
+    trainable parameters are added.
+
     Research diagnosis
     ------------------
     Earlier Q-Bound versions repeatedly exposed the same failure mode under
@@ -17,7 +29,9 @@ class QBoundCore(nn.Module):
     temporal support should extend.  When Question semantics directly score
     temporal spans, optimization can prefer a minimum-sufficient snippet.
 
-    V2.8 therefore enforces a no-bypass factorization:
+    V2.8 enforces a no-bypass factorization. R2-C specifically disables the
+    predictive VIDEO-only branch and retains the same normalized fixed chain
+    Laplacian as R2-B, with no predictive objective:
 
         Video + Question  -> Semantic Evidence Seed r_Q(t)        [RELEVANCE]
         Video only        -> Adjacent Support Graph w_t           [EXTENT STRUCTURE]
@@ -25,8 +39,8 @@ class QBoundCore(nn.Module):
 
     The Question NEVER directly scores [s,e].  The support graph NEVER consumes
     Question/answer features and is detached from L_ground.  It is learned by a
-    separate, video-only, leakage-free predictive objective using frozen/raw
-    visual targets.
+    separate, video-only, leakage-free predictive objective in A/B; in R2-C
+    the predictor is absent and adjacent graph weights are fixed.
 
     WHERE path
     ----------
@@ -77,6 +91,8 @@ class QBoundCore(nn.Module):
         dropout: float = 0.1,
         num_question_heads: int = 4,
         question_ff_multiplier: int = 2,
+        support_graph_mode: str = "learned",
+        support_predictor_enabled: bool = True,
     ) -> None:
         super().__init__()
 
@@ -88,7 +104,15 @@ class QBoundCore(nn.Module):
             raise ValueError("hidden_dim must be divisible by num_question_heads.")
         if question_ff_multiplier < 1:
             raise ValueError("question_ff_multiplier must be >= 1.")
+        if support_graph_mode not in ("learned", "fixed"):
+            raise ValueError("support_graph_mode must be 'learned' or 'fixed'.")
 
+        if not isinstance(support_predictor_enabled, bool):
+            raise TypeError("support_predictor_enabled must be a boolean.")
+        if not support_predictor_enabled and support_graph_mode != "fixed":
+            raise ValueError("R2-C requires fixed graph when predictor is disabled.")
+        self.support_graph_mode = support_graph_mode
+        self.support_predictor_enabled = support_predictor_enabled
         self.input_dim = int(input_dim)
         self.hidden_dim = int(hidden_dim)
         self.dropout_p = float(dropout)
@@ -203,6 +227,16 @@ class QBoundCore(nn.Module):
         )
 
         self._initialize_v280()
+        if not self.support_predictor_enabled:
+            # Preserve EXACT initialization/RNG consumption of R2-B, then
+            # remove the predictor completely before optimizer/model.to().
+            # The live R2-C module has no predictor parameters or forward ops.
+            for name in (
+                "support_input_proj", "support_forward_cell",
+                "support_backward_cell", "support_forward_predictor",
+                "support_backward_predictor",
+            ):
+                delattr(self, name)
 
     # ==================================================================
     # Initialization
@@ -758,6 +792,7 @@ class QBoundCore(nn.Module):
                 "support_edge_surprise_mean": zero,
                 "support_edge_surprise_std": zero,
                 "support_edge_affinity_raw": empty,
+                "support_edge_affinity_learned": empty,
                 "support_edge_affinity": empty,
                 "support_edge_affinity_mean": zero,
                 "support_edge_affinity_std": zero,
@@ -812,12 +847,24 @@ class QBoundCore(nn.Module):
         # This is a deterministic structural mapping, not a learned gate.
         edge_affinity_raw = torch.sigmoid(-standardized_surprise) * edge_mask_f
 
-        # Hard gradient firewall: final grounding may USE this graph but may not
-        # modify it through L_ground.
-        edge_affinity = edge_affinity_raw.detach()
+        # R2 controlled experiment: predictor and L_pred are computed for BOTH
+        # modes; only the edge weights consumed by propagation are switched.
+        # Detaching either edge source protects the same grounding firewall.
+        learned_affinity = edge_affinity_raw.detach()
+        edge_affinity = (
+            learned_affinity
+            if self.support_graph_mode == "learned"
+            else edge_mask_f.detach()
+        )
 
-        affinity_mean, affinity_std = self._masked_stats_1d(
+        # Used-edge statistics must reflect the actual graph in R2-B.
+        # Retain separately the learned-affinity diagnostics for auditing.
+        learned_affinity_mean, learned_affinity_std = self._masked_stats_1d(
             edge_affinity_raw,
+            edge_mask,
+        )
+        affinity_mean, affinity_std = self._masked_stats_1d(
+            edge_affinity,
             edge_mask,
         )
 
@@ -842,11 +889,62 @@ class QBoundCore(nn.Module):
             "support_edge_surprise_mean": surprise_mean,
             "support_edge_surprise_std": surprise_std,
             "support_edge_affinity_raw": edge_affinity_raw,
+            "support_edge_affinity_learned": learned_affinity,
             "support_edge_affinity": edge_affinity,
             "support_edge_affinity_mean": affinity_mean,
             "support_edge_affinity_std": affinity_std,
+            "support_edge_affinity_learned_mean": learned_affinity_mean,
+            "support_edge_affinity_learned_std": learned_affinity_std,
             "support_predictive_loss_per_sample": predictive_loss_per_sample,
             "support_predictive_loss": predictive_loss,
+            "support_graph_adjacency": adjacency,
+            "support_graph_laplacian": laplacian,
+        }
+
+    def _fixed_video_support_structure(self, video_tokens, video_mask):
+        """R2-C: fixed chain graph, NO predictor computation or L_pred.
+
+        Zero-valued predictive fields are compatibility-only placeholders for
+        the original CRA/Refine interface. They are NOT trained, logged as
+        learned edges or added to the objective. Their presence does not mean
+        that a predictor was instantiated or executed.
+        """
+        batch_size, time_steps, input_dim = video_tokens.shape
+        dtype, device = video_tokens.dtype, video_tokens.device
+        edge_mask = video_mask[:, :-1] & video_mask[:, 1:]
+        edge_affinity = edge_mask.to(dtype)
+        adjacency, laplacian = self._build_chain_laplacian(
+            edge_affinity=edge_affinity, video_mask=video_mask, dtype=dtype
+        )
+        empty_hidden = video_tokens.new_zeros(batch_size, time_steps, self.hidden_dim)
+        empty_pred = video_tokens.new_zeros(batch_size, time_steps, input_dim)
+        empty_edge = video_tokens.new_zeros(batch_size, max(time_steps-1, 0))
+        zero_batch = video_tokens.new_zeros(batch_size)
+        zero_scalar = video_tokens.new_zeros(())
+        affinity_mean, affinity_std = self._masked_stats_1d(edge_affinity, edge_mask)
+        return {
+            "support_states": empty_hidden,
+            "support_forward_context": empty_hidden,
+            "support_backward_context": empty_hidden,
+            "support_forward_prediction": empty_pred,
+            "support_backward_prediction": empty_pred,
+            "support_edge_mask": edge_mask,
+            "support_forward_prediction_cosine": empty_edge,
+            "support_backward_prediction_cosine": empty_edge,
+            "support_edge_forward_error": empty_edge,
+            "support_edge_backward_error": empty_edge,
+            "support_edge_surprise": empty_edge,
+            "support_edge_surprise_mean": zero_batch,
+            "support_edge_surprise_std": zero_batch,
+            "support_edge_affinity_raw": empty_edge,
+            "support_edge_affinity_learned": empty_edge,
+            "support_edge_affinity": edge_affinity,
+            "support_edge_affinity_mean": affinity_mean,
+            "support_edge_affinity_std": affinity_std,
+            "support_edge_affinity_learned_mean": zero_batch,
+            "support_edge_affinity_learned_std": zero_batch,
+            "support_predictive_loss_per_sample": zero_batch,
+            "support_predictive_loss": zero_scalar,
             "support_graph_adjacency": adjacency,
             "support_graph_laplacian": laplacian,
         }
@@ -935,10 +1033,14 @@ class QBoundCore(nn.Module):
             if dtype in (torch.float16, torch.bfloat16)
             else dtype
         )
+        # Diagnostic CUDA/cuBLAS workaround for small T x T systems.
+        # Intentionally DO NOT detach semantic_seed_prob: autograd must still
+        # backpropagate through CPU solve and device transfers to the seed.
+        # The graph Laplacian was already detached in the support branch.
         solved = torch.linalg.solve(
-            system.to(solve_dtype),
-            semantic_seed_prob.to(solve_dtype).unsqueeze(-1),
-        ).squeeze(-1).to(dtype)
+            system.to(device="cpu", dtype=solve_dtype),
+            semantic_seed_prob.to(device="cpu", dtype=solve_dtype).unsqueeze(-1),
+        ).squeeze(-1).to(device=device, dtype=dtype)
 
         support_prob = solved.clamp_min(0.0)
         support_prob = support_prob * video_mask.to(dtype)
@@ -1150,6 +1252,184 @@ class QBoundCore(nn.Module):
         }
 
     # ==================================================================
+    # V3.8-M1: raw visual interface, called explicitly by the M1 caller.
+    # ==================================================================
+    def export_v38_m1_inputs(
+        self,
+        video_tokens: torch.Tensor,
+        video_mask: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Export pre-Core video features for M1's independent frame scorer.
+
+        Pass the same original visual tensor supplied to the legacy core,
+        not ``where_context_states``, projected visual evidence, or CRA's
+        contextual visual embeddings. This method does no temporal mixing,
+        projection, question/answer encoding, or bank construction. The
+        caller owns the text embeddings and the trainable M1 projectors.
+
+        The detached [B,T,input_dim] feature tensor is zero on padding.
+        The bank receives the matching left-aligned boolean mask and the
+        per-row valid lengths. Calling this adapter never runs the legacy
+        forward, and legacy/M0 callers need not call it.
+        """
+        if not torch.is_tensor(video_tokens):
+            raise TypeError("M1 video_tokens must be a torch.Tensor.")
+        if video_tokens.ndim != 3:
+            raise ValueError("M1 video_tokens must be [B,T,input_dim].")
+        if not torch.is_floating_point(video_tokens):
+            raise TypeError("M1 video_tokens must be floating point.")
+        batch_size, time_steps, feature_dim = video_tokens.shape
+        if batch_size < 1 or time_steps < 1 or feature_dim != self.input_dim:
+            raise ValueError("M1 expects nonempty [B,T,input_dim] video features.")
+        if video_mask is not None:
+            if not torch.is_tensor(video_mask):
+                raise TypeError("M1 video_mask must be a torch.Tensor.")
+            video_mask = video_mask.to(device=video_tokens.device)
+        valid_mask = self._normalize_video_mask(
+            video_mask, batch_size, time_steps, video_tokens.device,
+        )
+        if bool(((~valid_mask[:, :-1]) & valid_mask[:, 1:]).any()):
+            raise ValueError("M1 fixed windows require a left-aligned video mask.")
+
+        frame_features = video_tokens.detach().masked_fill(
+            ~valid_mask.unsqueeze(-1), 0.0,
+        )
+        if not bool(torch.isfinite(frame_features).all()):
+            raise ValueError("M1 valid video features must be finite.")
+        return {
+            "qbound_v38_m1_frame_features": frame_features,
+            "qbound_v38_m1_video_mask": valid_mask,
+            "qbound_v38_m1_valid_lengths": valid_mask.long().sum(dim=-1),
+        }
+
+    # ==================================================================
+    # V3.8-Minimal (M0): additive encoder/decoder adapters
+    # ==================================================================
+    def _v38_minimal_encoder_view(
+        self,
+        where_context_states: torch.Tensor,
+        question_tokens_projected: torch.Tensor,
+        video_mask: torch.Tensor,
+        question_mask: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Expose the unchanged encoder to the external joint-event head.
+
+        Contract:
+          * ``qbound_v38_event_frame_states``: H [B,T,hidden_dim]; visual
+            temporal context BEFORE semantic-seed scoring/graph propagation.
+            Do NOT use seed probability or old support as an M0 event prior.
+          * ``qbound_v38_question_embedding``: q [B,hidden_dim], mean of
+            the EXISTING projected, valid question tokens; answer-free.
+          * The masks identify valid frames/tokens; downstream event windows
+            must be generated per sample length, never on padded positions.
+          * No new learnable projection, learned boundary, gate, or event graph.
+          * Autograd is deliberately preserved. Freeze/detach controls for the
+            P2 frozen-encoder probe belong to the caller, not this adapter.
+        """
+        if where_context_states.ndim != 3 or question_tokens_projected.ndim != 3:
+            raise ValueError("V3.8 encoder view requires [B,T,d] and [B,L,d].")
+        if where_context_states.shape[:2] != video_mask.shape:
+            raise ValueError("V3.8 frame-state shape does not match video_mask.")
+        if question_tokens_projected.shape[:2] != question_mask.shape:
+            raise ValueError("V3.8 question-token shape does not match question_mask.")
+        if where_context_states.size(0) != question_tokens_projected.size(0):
+            raise ValueError("V3.8 video/question batch sizes differ.")
+        if (where_context_states.size(-1) != self.hidden_dim or
+                question_tokens_projected.size(-1) != self.hidden_dim):
+            raise ValueError("V3.8 projected feature dimension mismatch.")
+
+        question_embedding = self._masked_mean(
+            question_tokens_projected,
+            question_mask,
+            dim=1,
+        )
+        return {
+            "qbound_v38_event_frame_states": where_context_states,
+            "qbound_v38_question_embedding": question_embedding,
+            "qbound_v38_question_tokens": question_tokens_projected,
+            "qbound_v38_event_video_mask": video_mask,
+            "qbound_v38_event_question_mask": question_mask,
+            "qbound_v38_event_valid_lengths": video_mask.long().sum(dim=-1),
+        }
+
+    def forward_v38_features(
+        self,
+        video_tokens: torch.Tensor,
+        question_features: torch.Tensor,
+        video_mask: Optional[torch.Tensor] = None,
+        question_mask: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """P2 probe path: encoder inputs only, without legacy Seed/Support/R1.
+
+        Uses exactly the retained visual+temporal encoder weights. Call
+        ``eval()`` for deterministic equivalence checks with full forward;
+        freezing backbone parameters, if desired, is an external train policy.
+        This method does NOT score answers or generate candidate windows.
+        """
+        if video_tokens.ndim != 3:
+            raise ValueError("video_tokens must be [B,T,D].")
+        batch_size, time_steps, feature_dim = video_tokens.shape
+        if time_steps < 1 or feature_dim != self.input_dim:
+            raise ValueError("V3.8 expects nonempty video [B,T,input_dim].")
+        video_mask = self._normalize_video_mask(
+            video_mask, batch_size, time_steps, video_tokens.device,
+        )
+        question_features, question_mask = self._normalize_question_features(
+            question_features, question_mask, batch_size, video_tokens.device,
+        )
+        visual = self._encode_visual_evidence(video_tokens, video_mask)
+        temporal = self._encode_temporal_context(
+            visual["visual_evidence_states"], video_mask,
+        )
+        projected_question_tokens = self.question_token_proj(question_features)
+        projected_question_tokens = (
+            projected_question_tokens
+            * question_mask.to(projected_question_tokens.dtype).unsqueeze(-1)
+        )
+        return self._v38_minimal_encoder_view(
+            where_context_states=temporal["where_context_states"],
+            question_tokens_projected=projected_question_tokens,
+            video_mask=video_mask,
+            question_mask=question_mask,
+        )
+
+    def decode_v38_event_support(
+        self,
+        event_temporal_prob: torch.Tensor,
+        video_mask: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Apply the EXACT existing core analytic interval decoder to M0 support.
+
+        The external joint scorer must first push forward its event posterior
+        using target-window footprints into a normalized distribution [B,T].
+        Context-window positions must NOT be included in this footprint.
+
+        This is an adapter to ``_support_to_interval_posterior`` and does not
+        invent a new R1 decoder. If ``refine.py`` wraps or further refines R1,
+        its existing downstream path must be preserved during integration.
+        """
+        if event_temporal_prob.ndim != 2:
+            raise ValueError("event_temporal_prob must be [B,T].")
+        if video_mask.shape != event_temporal_prob.shape:
+            raise ValueError("video_mask must match event_temporal_prob [B,T].")
+        if video_mask.dtype != torch.bool:
+            raise TypeError("video_mask must be boolean.")
+        if event_temporal_prob.size(1) < 1 or not torch.all(video_mask.any(dim=-1)):
+            raise ValueError("Every sample requires at least one valid frame.")
+        if not bool(torch.isfinite(event_temporal_prob).all()):
+            raise ValueError("Nonfinite V3.8 event temporal probabilities.")
+        if bool((event_temporal_prob < -1e-7).any()):
+            raise ValueError("V3.8 event temporal probabilities must be nonnegative.")
+        if bool(event_temporal_prob.masked_select(~video_mask).abs().gt(1e-6).any()):
+            raise ValueError("V3.8 event support must have zero mass on padding.")
+        masses = (event_temporal_prob * video_mask.to(event_temporal_prob.dtype)).sum(dim=-1)
+        if not bool(torch.allclose(masses, torch.ones_like(masses), atol=1e-4, rtol=1e-4)):
+            raise ValueError("V3.8 event support must sum to 1 on valid frames.")
+        # Existing decoder is called unchanged; no reweighting or learned
+        # boundary manipulation is introduced by this method.
+        return self._support_to_interval_posterior(event_temporal_prob, video_mask)
+
+    # ==================================================================
     # Forward
     # ==================================================================
     def forward(
@@ -1207,12 +1487,25 @@ class QBoundCore(nn.Module):
             video_mask=video_mask,
         )
 
+        # V3.8-M0: export H and q; the future bank/scorer receives neither
+        # legacy Seed/Support probabilities nor ground-truth temporal labels.
+        v38_encoder = self._v38_minimal_encoder_view(
+            where_context_states=temporal["where_context_states"],
+            question_tokens_projected=relevance["question_tokens_projected"],
+            video_mask=video_mask,
+            question_mask=question_mask,
+        )
+
         # --------------------------------------------------------------
         # Extent/support branch: VIDEO ONLY -> structural graph.
         # --------------------------------------------------------------
-        support_structure = self._learn_video_support_structure(
-            video_tokens=video_tokens,
-            video_mask=video_mask,
+        support_structure = (
+            self._learn_video_support_structure(
+                video_tokens=video_tokens, video_mask=video_mask,
+            ) if self.support_predictor_enabled else
+            self._fixed_video_support_structure(
+                video_tokens=video_tokens, video_mask=video_mask,
+            )
         )
 
         # --------------------------------------------------------------
@@ -1252,8 +1545,9 @@ class QBoundCore(nn.Module):
             "question_direct_span_scoring_enabled": zero,
             "question_as_visual_value_enabled": zero,
 
-            "video_only_support_branch_enabled": one,
-            "predictive_support_graph_enabled": one,
+            "video_only_support_branch_enabled": one if self.support_predictor_enabled else zero,
+            "predictive_support_graph_enabled": one if self.support_predictor_enabled else zero,
+            "support_predictor_enabled_flag": one if self.support_predictor_enabled else zero,
             "support_predictor_target_leakage_enabled": zero,
             "support_branch_uses_question_enabled": zero,
             "grounding_gradient_to_support_graph_enabled": zero,
@@ -1264,6 +1558,9 @@ class QBoundCore(nn.Module):
             "posterior_barycentric_grounding_enabled": one,
             "same_support_for_training_and_inference_enabled": one,
             "value_where_separation_enabled": one,
+            # Encoder adapter is available; this flag does not claim the new
+            # event bank or evidence head has already been constructed.
+            "v38_minimal_encoder_adapter_available": one,
 
             # Explicitly removed shortcut mechanisms.
             "query_routed_visual_context_enabled": zero,
@@ -1300,6 +1597,7 @@ class QBoundCore(nn.Module):
             **support_structure,
             **support,
             **intervals,
+            **v38_encoder,
 
             # ----------------------------------------------------------
             # Canonical downstream aliases for V2.8 migration
@@ -1370,3 +1668,100 @@ class QBoundCore(nn.Module):
             ],
             "qbound_segment_top1_prob": intervals["segment_top1_prob"],
         }
+
+    # ==================================================================
+    # V3.5 / T2: optional same-video paired-question training interface.
+    # ==================================================================
+    def forward_paired(
+        self,
+        video_tokens: torch.Tensor,
+        question_features: torch.Tensor,
+        paired_question_features: torch.Tensor,
+        video_mask: Optional[torch.Tensor] = None,
+        question_mask: Optional[torch.Tensor] = None,
+        paired_question_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        """Run two questions against ONE shared visual representation/graph.
+
+        V3.5 / QDTG contract:
+          * ``primary`` retains every canonical R2-C ``forward()`` field;
+            V3.8 adds only independent encoder-view aliases.
+          * Only the paired question's relevance and support are recomputed.
+            Temporal encoding, masks, and the fixed chain graph are reused.
+          * Both supports remain differentiable all the way to the SAME Seed
+            scorer; neither support nor its logits are detached here.
+          * No answers, ground-truth intervals, pseudo labels, learned graph,
+            second selector, extra parameters, or modified decoder are used.
+          * This method is opt-in: normal ``forward()``/inference is unchanged.
+
+        The caller (RefineDecoder / pipeline) must form legitimate same-video
+        question pairs, apply any QDTG loss, and implement pair filtering.
+        No QDTG supervision, projection, or losses are computed in QBoundCore.
+
+        Returns:
+            (primary, paired)
+            primary: complete legacy R2-C fields plus M0 encoder-view aliases.
+            paired: paired question Seed/Support + M0 encoder-view aliases;
+                    no redundant interval posterior.
+        """
+        primary = self.forward(
+            video_tokens=video_tokens,
+            question_features=question_features,
+            video_mask=video_mask,
+            question_mask=question_mask,
+        )
+
+        batch_size = primary["video_mask"].size(0)
+        paired_features, paired_mask = self._normalize_question_features(
+            paired_question_features,
+            paired_question_mask,
+            batch_size=batch_size,
+            device=video_tokens.device,
+        )
+        if paired_features.device != video_tokens.device:
+            raise ValueError(
+                "paired_question_features must be on the same device as video_tokens."
+            )
+
+        # Reuse the SAME temporal states as primary; do not run temporal
+        # self-attention twice with different dropout masks for one video.
+        paired_relevance = self._discover_semantic_seed(
+            where_context=primary["where_context_states"],
+            question_features=paired_features,
+            question_mask=paired_mask,
+            video_mask=primary["video_mask"],
+        )
+
+        # R2-C propagation is parameter-free and uses the exact SAME fixed
+        # Laplacian as primary. Autograd still flows to paired Seed logits.
+        paired_support = self._propagate_seed_to_support(
+            semantic_seed_prob=paired_relevance["semantic_seed_prob"],
+            support_laplacian=primary["support_graph_laplacian"],
+            video_mask=primary["video_mask"],
+        )
+
+        paired_v38_encoder = self._v38_minimal_encoder_view(
+            where_context_states=primary["where_context_states"],
+            question_tokens_projected=paired_relevance["question_tokens_projected"],
+            video_mask=primary["video_mask"],
+            question_mask=paired_mask,
+        )
+
+        paired = {
+            **paired_v38_encoder,
+            "video_mask": primary["video_mask"],
+            "question_mask": paired_mask,
+            "semantic_seed_logits": paired_relevance["semantic_seed_logits"],
+            "semantic_seed_prob": paired_relevance["semantic_seed_prob"],
+            "semantic_seed_entropy_ratio": paired_relevance[
+                "semantic_seed_entropy_ratio"
+            ],
+            "support_temporal_prob": paired_support["support_temporal_prob"],
+            "support_entropy_ratio": paired_support["support_entropy_ratio"],
+            "support_effective_frames": paired_support["support_effective_frames"],
+            # Canonical aliases consumed by the future V3.5 adapter.
+            "qbound_semantic_seed_logits": paired_relevance["semantic_seed_logits"],
+            "qbound_semantic_seed_prob": paired_relevance["semantic_seed_prob"],
+            "qbound_support_temporal_prob": paired_support["support_temporal_prob"],
+        }
+        return primary, paired

@@ -1,5 +1,6 @@
 import collections
 import os
+import re
 import time
 from random import shuffle
 
@@ -21,20 +22,28 @@ from utils.misc.misc import (
 
 class CRAPipeline(BasePipeline):
     """
-    CRA training/evaluation pipeline for Q-Bound V2.8.0.
+    CRA R2-C / V3.5 pipeline with controlled Q-Bound V3.8-Minimal M0.
 
-    V2.8 has one continuous Support Field and three deliberately separated
-    optimization routes:
+    M0 adds an independent L_evQA on the joint answer-event evidence branch.
+    It preserves the legacy QA/grounding paths and their verified loss
+    configuration for the joint phase. A separate frozen-feature probe trains
+    ONLY the new event modules (and reports legacy losses as diagnostics).
+    M0 temporal inference never consumes answer labels or temporal ground truth.
 
-        L_total = L_CRA/main + lambda_G * L_ground + lambda_P * L_pred
+    Q-Bound R2-A/B retain three optimization routes; R2-C has two:
+
+        A/B: L_CRA/main + lambda_G * L_ground + lambda_P * L_pred
+        C:   L_CRA/main + lambda_G * L_ground
 
     * L_CRA/main consumes the QA feature pooled with an identical but detached
       Support Field.  It cannot train temporal relevance or extent topology.
     * L_ground aligns differentiable raw-CLIP evidence with a detached,
       question-only target.  The structural graph is detached, so this route
       trains semantic relevance only.
-    * L_pred is the sole training signal for the video-only bidirectional
-      predictor that builds adjacent support affinities.
+    * V3.5 optionally adds SAME-VIDEO Q1/Q2 evidence discrimination on top.
+      It does not modify Q1 QA, R2-C L_ground, fixed propagation, or decoder.
+    * A/B use L_pred to train an independent video-only predictor.
+      C has no predictor and uses fixed adjacent edges directly.
 
     The Question creates a semantic seed; a detached video-only predictive
     graph propagates that seed into support_temporal_prob.  The same numerical
@@ -43,10 +52,81 @@ class CRAPipeline(BasePipeline):
     there is no hard-MAP temporal decision or learned span scorer.
     """
 
+    M1_VIEWS = ("question_only", "cra_answer_conditional", "mil_answer_conditional")
+    M1_MONITOR = "v38_m1_cra_acc_gqa"
+
     def __init__(self, cfgs) -> None:
         super().__init__(cfgs)
 
+        # The historical QBoundCore / RefineDecoder wire contract stays 2.8.0.
         self.qbound_version = "2.8.0"
+        self.qbound_experiment_version = str(
+            self._qbound_config().get("version", self.qbound_version)
+        ) if self._qbound_enabled() else self.qbound_version
+        self.v38_minimal_enabled = bool(
+            self._qbound_enabled() and self.qbound_experiment_version == "3.8-minimal"
+        )
+        self.v38_m1_enabled = self._qbound_enabled() and self.qbound_experiment_version == "3.8-m1"
+        grouped = self.cfgs["dataset"].get("m1_grouped_batch", False)
+        if type(grouped) is not bool:
+            raise TypeError("dataset.m1_grouped_batch must be boolean.")
+        self.m1_grouped_batch = self.v38_m1_enabled or grouped
+        if self._qbound_enabled() and self.qbound_experiment_version not in (
+            self.qbound_version, "3.8-minimal", "3.8-m1"
+        ):
+            raise ValueError("Unsupported Q-Bound experiment version.")
+        self.v38_settings = self._v38_loss_settings()
+        self._v38_grad_step = 0
+        self._v38_eligible_rows_this_epoch = 0
+        self.r2_graph_mode = (
+            self._qbound_config().get("support_graph_mode", "learned")
+            if self._qbound_enabled() else None
+        )
+        self.r2_predictor_enabled = self._qbound_config().get("support_predictor_enabled", True)
+        if not isinstance(self.r2_predictor_enabled, bool):
+            raise TypeError("support_predictor_enabled must be boolean.")
+        if self._qbound_enabled() and not self.r2_predictor_enabled and self.r2_graph_mode != "fixed":
+            raise ValueError("R2-C requires fixed graph.")
+        self.eval_test_each_epoch = self.cfgs["stat"].get(
+            "eval_test_each_epoch", self.v38_minimal_enabled or self.v38_m1_enabled
+        )
+        self.save_val_predictions = self.cfgs["stat"].get(
+            "save_val_predictions", True
+        )
+        for name, value in (
+            ("stat.eval_test_each_epoch", self.eval_test_each_epoch),
+            ("stat.save_val_predictions", self.save_val_predictions),
+        ):
+            if not isinstance(value, bool):
+                raise TypeError(f"{name} must be a boolean.")
+        if self.v38_minimal_enabled and not self.eval_test_each_epoch:
+            raise ValueError(
+                "V3.8-Minimal requires stat.eval_test_each_epoch=true. "
+                "The test split is diagnostic only, never used for selection."
+            )
+        if self.v38_minimal_enabled and not self.save_val_predictions:
+            raise ValueError(
+                "V3.8-Minimal requires stat.save_val_predictions=true so "
+                "posterior and timestamp audits are retained for validation."
+            )
+        if self.v38_minimal_enabled:
+            selection_name = str(self.cfgs["stat"].get("monitor", {}).get("metric", ""))
+            if selection_name.lower().startswith(("test", "test_", "test/")):
+                raise ValueError("M0 model-selection metric must not refer to test split.")
+        # Q-Bound core/decoder still advertise 2.8.0 for checkpoint compatibility.
+        # V3.5 is a training experiment identifier, NOT a changed core version.
+        self.v35_pair_settings = self._v35_pair_loss_settings()
+        self._v35_loss_step = 0
+        if self.v35_pair_settings["enabled"]:
+            if not self._qbound_enabled() or self.r2_graph_mode != "fixed" or self.r2_predictor_enabled:
+                raise ValueError("QDTG V3.5 requires enabled R2-C with fixed graph and no predictor.")
+        if self.m1_grouped_batch:
+            self._configure_v38_m1_pipeline()
+
+        # M2 is an opt-in WHERE overlay on the same M1 checkpoint/version.
+        # This step adds evaluation only. It does not change the train loss,
+        # parameter groups, legacy checkpoint selection, or CRA answer.
+        self._m2_mbr_config, self._m2_mbr = self._configure_m2_mbr_eval()
 
         if self._qbound_enabled():
             model_cfg = self.cfgs.get("model", {})
@@ -60,12 +140,14 @@ class CRAPipeline(BasePipeline):
                     model_cfg.get("qbound_version", ""),
                 )
             )
-            if configured_version != self.qbound_version:
+            if configured_version != self.qbound_experiment_version:
                 raise ValueError(
-                    "CRAPipeline/Q-Bound version mismatch: expected "
-                    f"model.qbound.version={self.qbound_version!r}, got "
+                    "CRAPipeline/Q-Bound experiment version mismatch: "
+                    f"expected {self.qbound_experiment_version!r}, got "
                     f"{configured_version!r}."
                 )
+            if self.v38_minimal_enabled:
+                self._configure_v38_phase_and_optimizer()
 
             stale_keys = (
                 "functional_critic",
@@ -99,6 +181,410 @@ class CRAPipeline(BasePipeline):
                     "Q-Bound V2.8 config contains removed legacy keys: "
                     + ", ".join(stale)
                 )
+
+    # ------------------------------------------------------------------
+    # V3.8-Minimal (M0): independent QA supervision and controlled phases.
+    # ------------------------------------------------------------------
+    def _v38_loss_settings(self):
+        """Pre-register M0 settings; never infer loss weights from test scores."""
+        defaults = dict(enabled=False, weight=0.0, phase="joint",
+                        gradient_audit_every=0, dump_joint_matrices=True)
+        if not self.v38_minimal_enabled:
+            return defaults
+        qcfg = self._qbound_config()
+        vcfg = qcfg.get("v38", {})
+        if not isinstance(vcfg, dict):
+            raise TypeError("model.qbound.v38 must be a mapping/dict.")
+        if "train_phase" not in vcfg:
+            raise ValueError(
+                "M0 requires an explicit model.qbound.v38.train_phase "
+                "('probe' or 'joint'); do not silently skip P2."
+            )
+        lcfg = vcfg.get("evidence_loss", {})
+        if not isinstance(lcfg, dict):
+            raise TypeError("model.qbound.v38.evidence_loss must be a mapping/dict.")
+        if "loss_weight" not in lcfg:
+            raise ValueError(
+                "M0 requires model.qbound.v38.evidence_loss.loss_weight "
+                "explicitly, for reproducible comparison."
+            )
+        enabled = lcfg.get("enabled", True)
+        if not isinstance(enabled, bool) or not enabled:
+            raise ValueError("M0 requires independently enabled evidence-only CE.")
+        weight = float(lcfg.get("loss_weight", 1.0))
+        if not np.isfinite(weight) or weight <= 0:
+            raise ValueError("M0 evidence_loss.loss_weight must be positive and finite.")
+        phase = str(vcfg.get("train_phase", "joint"))
+        if phase not in ("probe", "joint"):
+            raise ValueError("M0 train_phase must be 'probe' or 'joint'.")
+        audit_every = vcfg.get("gradient_audit_every", 0)
+        if type(audit_every) is not int or audit_every < 0:
+            raise TypeError("M0 gradient_audit_every must be int >=0.")
+        dump_joint = vcfg.get("dump_joint_matrices", True)
+        if not isinstance(dump_joint, bool):
+            raise TypeError("M0 dump_joint_matrices must be boolean.")
+        return dict(enabled=True, weight=weight, phase=phase,
+                    gradient_audit_every=audit_every,
+                    dump_joint_matrices=dump_joint)
+
+    def _v38_model(self):
+        return self.model.module if hasattr(self.model, "module") else self.model
+
+    def _configure_v38_phase_and_optimizer(self):
+        """Freeze old paths ONLY in the explicitly selected P2 probe phase."""
+        model = self._v38_model()
+        if not getattr(model, "qbound_v38_minimal_enabled", False):
+            raise RuntimeError("M0 pipeline requires matching V3.8-Minimal CRA wrapper.")
+        bank = getattr(model, "qbound_v38_bank", None)
+        evidence = getattr(model, "qbound_v38_evidence", None)
+        if bank is None or evidence is None:
+            raise RuntimeError("M0 event bank/evidence head is absent from CRA.")
+        fresh = {id(p) for m in (bank, evidence) for p in m.parameters()}
+        opt_ids = {id(p) for group in self.optimizer.param_groups for p in group["params"]}
+        if not fresh.issubset(opt_ids):
+            raise RuntimeError(
+                "The optimizer does not contain ALL new event bank/evidence "
+                "parameters. Rebuild it after constructing the V3.8 CRA model."
+            )
+        if self.v38_settings["phase"] == "probe":
+            if self.v35_pair_settings["enabled"]:
+                raise ValueError(
+                    "M0 frozen-feature probe cannot run V3.5 pair loss; "
+                    "disable pair_loss explicitly in the probe YAML."
+                )
+            for parameter in model.parameters():
+                parameter.requires_grad_(id(parameter) in fresh)
+        if not any(p.requires_grad for p in bank.parameters()) or not any(
+            p.requires_grad for p in evidence.parameters()
+        ):
+            raise RuntimeError("M0 event bank and evidence scorer must be trainable.")
+
+    def _v38_set_training_mode(self):
+        """Make a frozen probe deterministic in the old CRA/encoder modules."""
+        if not self.v38_minimal_enabled or self.v38_settings["phase"] != "probe":
+            return
+        model = self._v38_model()
+        model.eval()
+        model.qbound_v38_bank.train()
+        model.qbound_v38_evidence.train()
+
+    def _v38_outputs(self, model_outputs):
+        if not self.v38_minimal_enabled:
+            return None
+        if not isinstance(model_outputs, dict) or model_outputs.get("qbound_v38_active") is not True:
+            raise RuntimeError("M0 forward did not expose an active event branch.")
+        required = (
+            "qbound_v38_ev_qa_logits", "qbound_v38_ev_qa_loss_mask",
+            "qbound_v38_evidence", "qbound_v38_bank",
+            "qbound_v38_event_temporal_question",
+            "qbound_v38_event_temporal_marginal",
+            "qbound_v38_event_temporal_conditional_pred",
+            "qbound_v38_grounding_views",
+        )
+        missing = [key for key in required if key not in model_outputs]
+        if missing:
+            raise KeyError("M0 forward missing outputs: " + ", ".join(missing))
+        logits = model_outputs["qbound_v38_ev_qa_logits"]
+        eligible = model_outputs["qbound_v38_ev_qa_loss_mask"]
+        if logits.ndim != 2 or logits.size(1) != 5 or eligible.shape != (logits.size(0),):
+            raise ValueError("M0 evidence logits/mask must have [B,5]/[B].")
+        if eligible.dtype != torch.bool or not torch.isfinite(logits).all():
+            raise ValueError("M0 evidence logits must be finite and eligible mask bool.")
+        bank = model_outputs["qbound_v38_bank"]
+        posterior = model_outputs["qbound_v38_evidence"]["event_joint_posterior"]
+        event_mask = bank["event_valid_mask"]
+        if posterior.shape != (*event_mask.shape, 5):
+            raise ValueError("M0 event joint posterior must be [B,M,5].")
+        if not torch.allclose(posterior.sum((1, 2)), torch.ones_like(logits[:, 0]), atol=1e-4):
+            raise RuntimeError("M0 joint posterior is not normalized.")
+        video_mask = model_outputs.get("qbound_video_mask")
+        if video_mask is None:
+            raise KeyError("M0 requires qbound_video_mask from RefineDecoder.")
+        for key in ("question", "marginal", "conditional_pred"):
+            temporal_key = "qbound_v38_event_temporal_" + key
+            self._v38_assert_distribution(temporal_key, model_outputs[temporal_key], video_mask)
+        return model_outputs
+
+    @staticmethod
+    def _v38_assert_distribution(name, values, valid_mask):
+        if values.shape != valid_mask.shape or not torch.isfinite(values).all():
+            raise ValueError(f"{name} must be finite [B,T] matching the video mask.")
+        if (values.detach() < -1e-6).any() or (
+            values.detach() * (~valid_mask.bool()).to(values.dtype)
+        ).abs().max() > 1e-5:
+            raise RuntimeError(f"{name} contains negative/padding probability mass.")
+        if not torch.allclose((values * valid_mask).sum(-1),
+                              torch.ones_like(values[:, 0]), atol=1e-4):
+            raise RuntimeError(f"{name} must sum to one over valid frames.")
+
+    def _v38_evidence_loss(self, model_outputs, labels):
+        out = self._v38_outputs(model_outputs)
+        logits = out["qbound_v38_ev_qa_logits"].float()
+        eligible = out["qbound_v38_ev_qa_loss_mask"]
+        if labels.shape != (logits.size(0),):
+            raise ValueError("M0 answer labels must be [B].")
+        if (labels < 0).any() or (labels >= 5).any():
+            raise ValueError("M0 labels must be valid candidate indices [0,4].")
+        per_sample = F.cross_entropy(logits, labels, reduction="none")
+        # Very short fallback samples contribute no gradient to event QA.
+        if eligible.any():
+            evidence_loss = per_sample[eligible].mean()
+        else:
+            evidence_loss = logits.sum() * 0.0
+        with torch.no_grad():
+            predicted = logits.argmax(dim=-1)
+            evidence = out["qbound_v38_evidence"]
+            marginal = evidence["event_posterior_marginal"]
+            question = evidence["event_posterior_question"]
+            valid = out["qbound_v38_bank"]["event_valid_mask"]
+            diag = {
+                "qbound_v38_evqa_loss": float(evidence_loss.detach().item()),
+                "qbound_v38_evqa_eligible_fraction": float(eligible.float().mean().item()),
+                "qbound_v38_evqa_eligible_count": float(eligible.sum().item()),
+                "qbound_v38_evqa_acc": float((predicted == labels).float().mean().item()),
+                "qbound_v38_evqa_acc_eligible": (
+                    float((predicted[eligible] == labels[eligible]).float().mean().item())
+                    if eligible.any() else 0.0
+                ),
+                "qbound_v38_bank_event_count": float(valid.sum(-1).float().mean().item()),
+                "qbound_v38_bank_fallback_fraction": float(out["qbound_v38_bank"]["bank_fallback"].float().mean().item()),
+                "qbound_v38_event_prior_l1": float((marginal - question).abs().sum(-1).mean().item()),
+                "qbound_v38_event_joint_consistency_max": float(
+                    evidence["event_posterior_consistency_max_abs"].max().item()
+                ),
+                "qbound_v38_event_prior_entropy": float(
+                    -(question.clamp_min(1e-30).log() * question).sum(-1).mean().item()
+                ),
+                "qbound_v38_event_marginal_entropy": float(
+                    -(marginal.clamp_min(1e-30).log() * marginal).sum(-1).mean().item()
+                ),
+                "qbound_v38_interaction_centered_rms": float(
+                    evidence["event_interaction_centered"].masked_select(valid.unsqueeze(-1).expand_as(
+                        evidence["event_interaction_centered"])).square().mean().sqrt().item()
+                ),
+            }
+        return evidence_loss, diag
+
+    def _v38_gradient_audit(self, event_loss, model_outputs, labels):
+        """Exact answer-label gradient check; diagnostic only, never extra loss."""
+        evidence = model_outputs["qbound_v38_evidence"]
+        g = evidence["event_g"]
+        eligible = model_outputs["qbound_v38_ev_qa_loss_mask"]
+        if not g.requires_grad or not eligible.any():
+            return {"qbound_v38_grad_prior_norm": 0.0,
+                    "qbound_v38_grad_prior_identity_max_error": 0.0}
+        grad = torch.autograd.grad(event_loss, g, retain_graph=True)[0]
+        # d CE / dg_i = [P_marg(i) - P(i|y)] / N_eligible.
+        conditional = evidence["event_posterior_conditional_all"]
+        correct_cond = conditional.gather(
+            2, labels[:, None, None].expand(-1, conditional.size(1), 1)
+        ).squeeze(-1)
+        expected = (evidence["event_posterior_marginal"] - correct_cond)
+        expected = expected * eligible.unsqueeze(-1).to(expected.dtype) / eligible.sum().clamp_min(1)
+        valid = model_outputs["qbound_v38_bank"]["event_valid_mask"]
+        error = (grad.detach() - expected.detach()).masked_select(valid)
+        return {
+            "qbound_v38_grad_prior_norm": float(grad.detach().float().norm().item()),
+            "qbound_v38_grad_prior_identity_max_error": float(error.abs().max().item()) if error.numel() else 0.0,
+        }
+
+    def _v38_parameter_grad_norms(self):
+        if not self.v38_minimal_enabled:
+            return {}
+        model = self._v38_model()
+        norms = {}
+        for name in ("qbound_v38_bank", "qbound_v38_evidence"):
+            module = getattr(model, name)
+            norms[f"qbound_v38_{name.removeprefix('qbound_v38_')}_grad_norm"] = float(
+                sum(p.grad.detach().float().square().sum().item()
+                    for p in module.parameters() if p.grad is not None) ** 0.5
+            )
+        return norms
+
+    # V3.8-M1 grouped competition. No answer labels or timestamps build masks.
+    def _configure_v38_m1_pipeline(self):
+        if self.v38_m1_enabled and isinstance(self.model, nn.DataParallel):
+            raise ValueError("M1 [B,B] question pools must stay on one device, not DataParallel.")
+        align_cfg = self.cfgs["optim"]["loss"].get("align", {}) or {}
+        self.m1_mask_cra_alignment = any(float(weight) != 0.0 for weight in align_cfg.values())
+        if self.m1_mask_cra_alignment:
+            import inspect
+            if "align_negative_mask" not in inspect.signature(self.criterion).parameters:
+                raise RuntimeError(
+                    "Grouped batches require BuildLossFunc(..., align_negative_mask=...). "
+                    "Update the criterion before training so CRA cannot sample same-video negatives."
+                )
+        if not self.v38_m1_enabled:
+            return  # legacy-only control with identical sampler and masks
+        stat = self.cfgs["stat"]
+        if not self.eval_test_each_epoch or not self.save_val_predictions:
+            raise ValueError("M1 requires per-epoch test evaluation and saved validation predictions.")
+        if stat.get("monitor", {}).get("metric") != self.M1_MONITOR or stat["monitor"].get("mode") != "max":
+            raise ValueError(f"M1 requires monitor.metric={self.M1_MONITOR} and monitor.mode=max.")
+        if self.v35_pair_settings["enabled"] or self.r2_graph_mode != "fixed" or self.r2_predictor_enabled:
+            raise ValueError("M1 uses R2-C legacy and its own question loss, not V3.5 pair loss.")
+        cfg = self._qbound_config().get("v38", {})
+        settings = {}
+        for key in ("question_loss_weight", "answer_loss_weight"):
+            val = float(cfg.get(key, 1.0))
+            if not np.isfinite(val) or val <= 0:
+                raise ValueError(f"M1 {key} must be positive and finite.")
+            settings[key] = val
+        period = cfg.get("gradient_audit_every", 100)
+        if type(period) is not int or period < 0:
+            raise ValueError("M1 gradient_audit_every must be a nonnegative integer.")
+        settings["gradient_audit_every"] = period
+        self.v38_m1_settings = settings
+        self._m1_step = 0
+        model = self._v38_model()
+        head = getattr(model, "qbound_v38_m1_evidence", None)
+        bank = getattr(model, "qbound_v38_m1_bank", None)
+        if not getattr(model, "qbound_v38_m1_enabled", False) or head is None or bank is None:
+            raise RuntimeError("M1 pipeline requires the matching CRA scorer and bank.")
+        params = list(head.parameters())
+        opt_ids = collections.Counter(id(p) for g in self.optimizer.param_groups for p in g["params"])
+        if not params or any(not p.requires_grad or opt_ids[id(p)] != 1 for p in params):
+            raise RuntimeError("Every M1 scorer parameter must train and appear once in the optimizer.")
+        if any(p.requires_grad for p in bank.parameters()):
+            raise RuntimeError("M1 bank geometry must not train the M0 reader.")
+
+    @staticmethod
+    def _m1_metadata(batch, name, batch_size):
+        value = batch[name]
+        if torch.is_tensor(value) and value.ndim == 1:
+            value = value.tolist()
+        if not isinstance(value, (list, tuple)) or len(value) != batch_size:
+            raise ValueError(f"Grouped CRA batch requires one {name} per row.")
+        return value
+
+    @staticmethod
+    def _m1_question_text_key(question):
+        # Preserve every semantic word and its order, including temporal
+        # cues. Only remove formatting and common non-semantic wrappers.
+        if not isinstance(question, str):
+            raise TypeError("question_txt must contain strings.")
+        words = re.findall(r"\w+", question.casefold())
+        for prefix in (("can", "you", "tell", "me"), ("please", "tell", "me"), ("please",)):
+            if tuple(words[:len(prefix)]) == prefix:
+                words = words[len(prefix):]
+                break
+        return tuple(words)
+
+    def _m1_batch_masks(self, batch, question, batch_size, device):
+        videos = self._m1_metadata(batch, "video_id", batch_size)
+        if any(v is None or not str(v).strip() for v in videos):
+            raise ValueError("Grouped CRA batch has a missing video_id.")
+        groups = collections.defaultdict(list)
+        for i, video in enumerate(videos):
+            groups[str(video).strip()].append(i)
+        group_ids = torch.empty(batch_size, dtype=torch.long)
+        for idx, rows in enumerate(groups.values()):
+            group_ids[rows] = idx
+        different_video = group_ids[:, None].ne(group_ids[None, :])
+        if not self.v38_m1_enabled:
+            return different_video.to(device), None, {}
+
+        type_field = "question_type" if "question_type" in batch else "type"
+        types = self._m1_metadata(batch, type_field, batch_size)
+        texts = self._m1_metadata(batch, "question_txt", batch_size) if "question_txt" in batch else None
+        text_keys = [self._m1_question_text_key(s) for s in texts] if texts is not None else [()] * batch_size
+        tokens = question.squeeze(1) if question.ndim == 3 and question.size(1) == 1 else question
+        if tokens.ndim != 2 or tokens.size(0) != batch_size:
+            raise ValueError("M1 question tokens must be [B,L] or [B,1,L].")
+        token_keys = [tuple(row) for row in tokens.detach().cpu().tolist()]
+        usable = []
+        for code in types:
+            if not isinstance(code, str) or not code.strip() or code.strip().casefold() in {"null", "nan", "none"}:
+                raise ValueError("M1 needs the original NextGQA string question type.")
+            usable.append(not code.strip().upper().startswith("D"))
+
+        representatives = {}
+        for video, rows in groups.items():
+            keep, seen_text, seen_tokens = [], set(), set()
+            for i in rows:
+                if not usable[i] or token_keys[i] in seen_tokens or (text_keys[i] and text_keys[i] in seen_text):
+                    continue
+                keep.append(i)
+                seen_tokens.add(token_keys[i])
+                if text_keys[i]:
+                    seen_text.add(text_keys[i])
+            representatives[video] = keep
+
+        candidate_mask = torch.zeros((batch_size, batch_size), dtype=torch.bool)
+        for video, rows in groups.items():
+            positives = representatives[video]
+            if not positives:
+                continue
+            blocked_text = {text_keys[i] for i in positives if text_keys[i]}
+            blocked_tokens = {token_keys[i] for i in positives}
+            keep = list(positives)
+            for other_video, candidates in representatives.items():
+                if other_video == video:
+                    continue
+                for i in candidates:
+                    if token_keys[i] in blocked_tokens or (text_keys[i] and text_keys[i] in blocked_text):
+                        continue
+                    keep.append(i)
+                    blocked_tokens.add(token_keys[i])
+                    if text_keys[i]:
+                        blocked_text.add(text_keys[i])
+            # One denominator for all rows in a video, not one per positive.
+            # Descriptive/duplicate rows have no diagonal and no question loss.
+            candidate_mask[torch.tensor(rows)[:, None], torch.tensor(keep)[None, :]] = True
+        positives = int(candidate_mask.diagonal().sum())
+        logs = {
+            "v38_m1_batch_videos": float(len(groups)),
+            "v38_m1_question_positive_count": float(positives),
+            "v38_m1_descriptive_count": float(batch_size - sum(usable)),
+            "v38_m1_duplicate_count": float(sum(usable) - positives),
+        }
+        return different_video.to(device), candidate_mask.to(device), logs
+
+    def _m1_outputs(self, model_outputs):
+        if model_outputs.get("qbound_v38_m1_active") is not True:
+            raise RuntimeError("Expected active M1 outputs from cra.py.")
+        if (model_outputs.get("qbound_v38_m1_primary_grounding_view") != "cra_answer_conditional"
+                or model_outputs.get("qbound_v38_m1_qa_prediction_source") != "cra"):
+            raise RuntimeError("M1 expects CRA QA with CRA-predicted-answer WHERE.")
+        return model_outputs["qbound_v38_m1_bank"], model_outputs["qbound_v38_m1_evidence"]
+
+    def _m1_objective(self, model_outputs, labels, candidate_mask, different_video):
+        bank, evidence = self._m1_outputs(model_outputs)
+        batch_size = labels.numel()
+        if labels.ndim != 1 or ((labels < -1) | (labels >= 5)).any():
+            raise ValueError("M1 labels must be [B] with values 0..4 or ignored label -1.")
+        eligible_q = model_outputs["qbound_v38_m1_question_train_eligible"] & candidate_mask.sum(dim=-1).gt(1)
+        eligible_a = bank["bank_train_eligible"] & labels.ge(0)
+        q_log = evidence["event_mil_question_log_scores"].float()
+        a_log = evidence["event_mil_answer_log_scores"].float()
+        not_a_log = evidence["event_mil_answer_log_not_scores"].float()
+        if q_log.shape != (batch_size,) or a_log.shape != (batch_size, 5) or not_a_log.shape != a_log.shape:
+            raise ValueError("M1 MIL log-score shapes must match the grouped batch and five answers.")
+        if not all(bool(torch.isfinite(v).all()) for v in (q_log, a_log, not_a_log)):
+            raise RuntimeError("M1 MIL log-scores must be finite before reduction.")
+        q_loss = -q_log[eligible_q].sum() / eligible_q.sum().clamp_min(1)
+        target = F.one_hot(labels.clamp_min(0), num_classes=5).bool()
+        a_per_row = -torch.where(target, a_log, not_a_log).sum(dim=-1)
+        a_loss = a_per_row[eligible_a].sum() / eligible_a.sum().clamp_min(1)
+        with torch.no_grad():
+            paired = (~different_video) & eligible_q[:, None] & eligible_q[None, :]
+            paired = paired & candidate_mask & candidate_mask.T
+            logs = {
+                "v38_m1_question_eligible_count": float(eligible_q.sum()),
+                "v38_m1_answer_eligible_count": float(eligible_a.sum()),
+                "v38_m1_same_video_pair_count": float(paired.triu(diagonal=1).sum()),
+                "v38_m1_mil_acc": float((a_log.argmax(-1).eq(labels) & eligible_a).sum() / eligible_a.sum().clamp_min(1)),
+                "v38_m1_fallback_fraction": float(bank["bank_fallback"].float().mean()),
+            }
+        self._m1_step += 1
+        every = self.v38_m1_settings["gradient_audit_every"]
+        if every and self._m1_step % every == 0 and torch.is_grad_enabled():
+            params = tuple(self._v38_model().qbound_v38_m1_evidence.parameters())
+            for name, value in (("question", q_loss), ("answer", a_loss)):
+                grads = torch.autograd.grad(value, params, retain_graph=True, allow_unused=True)
+                norm_sq = sum(float(g.detach().float().square().sum()) for g in grads if g is not None)
+                logs[f"v38_m1_{name}_grad_norm"] = norm_sq ** 0.5
+        return q_loss, a_loss, logs
 
     def _model_device(self):
         return next(self.model.parameters()).device
@@ -287,6 +773,7 @@ class CRAPipeline(BasePipeline):
 
         grounding = _read_branch("grounding_loss", default_temperature=0.07)
         predictive = _read_branch("predictive_loss")
+        predictor_enabled = bool(getattr(self, "r2_predictor_enabled", True))
 
         if self._qbound_enabled():
             if not grounding["enabled"] or grounding["weight"] <= 0.0:
@@ -294,11 +781,11 @@ class CRAPipeline(BasePipeline):
                     "Canonical Q-Bound V2.8 requires a positive enabled "
                     "model.qbound.grounding_loss."
                 )
-            if not predictive["enabled"] or predictive["weight"] <= 0.0:
-                raise ValueError(
-                    "Canonical Q-Bound V2.8 requires a positive enabled "
-                    "model.qbound.predictive_loss."
-                )
+            if predictor_enabled:
+                if not predictive["enabled"] or predictive["weight"] <= 0.0:
+                    raise ValueError("R2-A/B require positive L_pred.")
+            elif predictive["enabled"] or predictive["weight"] != 0.0:
+                raise ValueError("R2-C requires predictive_loss.enabled=false, loss_weight=0.")
 
         return {
             "grounding_enabled": grounding["enabled"],
@@ -464,6 +951,8 @@ class CRAPipeline(BasePipeline):
         model_outputs,
         qbound_aux,
         temperature,
+        *,
+        negative_mask=None,
     ):
         """
         One-directional in-batch Video->Question semantic grounding.
@@ -544,6 +1033,29 @@ class CRAPipeline(BasePipeline):
             device=logits.device,
             dtype=torch.long,
         )
+        if negative_mask is not None:
+            if (negative_mask.dtype != torch.bool or negative_mask.shape != logits.shape
+                    or bool(negative_mask.diagonal().any())):
+                raise ValueError("Grouped L_ground expects a boolean different-video negative mask [B,B].")
+            keep = negative_mask | torch.eye(batch_size, dtype=torch.bool, device=logits.device)
+            eligible = negative_mask.any(dim=-1)
+            masked_logits = logits.masked_fill(~keep, -torch.inf)
+            row_loss = F.cross_entropy(masked_logits, labels, reduction="none")
+            grounding_loss = row_loss[eligible].sum() / eligible.sum().clamp_min(1)
+            with torch.no_grad():
+                positive = similarity.diag()[eligible]
+                negative = similarity[negative_mask]
+                hardest = similarity.masked_fill(~negative_mask, -torch.inf).amax(dim=-1)[eligible]
+                denom = eligible.sum().clamp_min(1)
+                return grounding_loss, {
+                    "grounding_batch_size": float(batch_size),
+                    "grounding_retrieval_acc": float((masked_logits.argmax(-1).eq(labels) & eligible).sum() / denom),
+                    "grounding_positive_similarity": float(positive.sum() / denom),
+                    "grounding_negative_similarity": float(negative.sum() / max(negative.numel(), 1)),
+                    "grounding_hardest_negative_similarity": float(hardest.sum() / denom),
+                    "grounding_margin": float((positive - hardest).sum() / denom),
+                    "grounding_different_video_negative_count": float(negative.numel()),
+                }
         grounding_loss = F.cross_entropy(logits, labels)
 
         with torch.no_grad():
@@ -578,6 +1090,228 @@ class CRAPipeline(BasePipeline):
             }
 
         return grounding_loss, diagnostics
+
+    # ------------------------------------------------------------------
+    # V3.5 / QDTG — opt-in SAME-VIDEO question discrimination.
+    # ------------------------------------------------------------------
+    def _v35_pair_loss_settings(self):
+        """Strictly gated so an unchanged R2-C YAML runs IDENTICAL code."""
+        q_cfg = self._qbound_config() if self._qbound_enabled() else {}
+        branch = q_cfg.get("pair_loss", {})
+        if branch is None:
+            branch = {}
+        if not isinstance(branch, dict):
+            raise TypeError("model.qbound.pair_loss must be a mapping/dict.")
+        enabled = branch.get("enabled", False)
+        if not isinstance(enabled, bool):
+            raise TypeError("model.qbound.pair_loss.enabled must be boolean.")
+        weight = float(branch.get("loss_weight", 0.0))
+        temperature = float(branch.get("temperature", 0.07))
+        margin = float(branch.get("margin", 0.0))
+        gradient_audit_every = branch.get("gradient_audit_every", 0)
+        if not isinstance(gradient_audit_every, int) or isinstance(gradient_audit_every, bool):
+            raise TypeError("model.qbound.pair_loss.gradient_audit_every must be an integer.")
+        if weight < 0.0 or not np.isfinite(weight):
+            raise ValueError("V3.5 pair loss_weight must be finite and >= 0.")
+        if not np.isfinite(temperature) or temperature <= 0.0:
+            raise ValueError("V3.5 pair temperature must be positive and finite.")
+        if not np.isfinite(margin) or margin < 0.0:
+            raise ValueError("V3.5 pair margin must be finite and >= 0.")
+        if gradient_audit_every < 0:
+            raise ValueError("V3.5 pair gradient_audit_every must be >= 0.")
+        if enabled != (weight > 0.0):
+            raise ValueError(
+                "V3.5 requires pair_loss.enabled=true with positive loss_weight "
+                "OR enabled=false with loss_weight=0."
+            )
+        if not enabled and gradient_audit_every != 0:
+            raise ValueError("V3.5 gradient audit requires enabled pair loss.")
+        return dict(enabled=enabled, weight=weight, temperature=temperature,
+                    margin=margin, gradient_audit_every=gradient_audit_every)
+
+    @staticmethod
+    def _v35_pair_inputs(batch, batch_size, device):
+        """Fail closed: Q2 must be a separate question from the same actual video.
+
+        Required TRAIN-only fields emitted by the future dataset/collate:
+          paired_question: LongTensor[B,L2] (question-only ids, PAD-aware)
+          pair_valid_mask: BoolTensor[B]
+          paired_video_id: list[str] length B (source video of each Q2)
+          paired_question_id: list[str] length B (source unique Q2 id)
+        Original batch must include video_id and question_id.  Pair validity
+        needs to be independently established by the DATASET, not inferred from
+        answers.  Identical-video metadata alone cannot prove distinct GT spans.
+        """
+        required = ("paired_question", "pair_valid_mask", "paired_video_id",
+                    "paired_question_id", "video_id", "question_id")
+        missing = [key for key in required if key not in batch]
+        if missing:
+            raise KeyError(
+                "V3.5 pair_loss is enabled but training batch is missing "
+                f"{missing}. Update dataset.py/dataloaders.py before training."
+            )
+        q2 = batch["paired_question"]
+        valid = batch["pair_valid_mask"]
+        if not torch.is_tensor(q2) or q2.ndim != 2 or q2.size(0) != batch_size:
+            raise ValueError("V3.5 paired_question must be tensor [B,L2].")
+        if q2.dtype not in (torch.int32, torch.int64) or q2.size(1) < 1:
+            raise TypeError("V3.5 paired_question must be nonempty integer token ids.")
+        if not torch.is_tensor(valid) or valid.dtype != torch.bool or valid.shape != (batch_size,):
+            raise TypeError("V3.5 pair_valid_mask must be BoolTensor[B].")
+
+        def _metadata(name):
+            value = batch[name]
+            if not isinstance(value, (list, tuple)) or len(value) != batch_size:
+                raise TypeError(f"V3.5 {name} must be a list/tuple of B identifiers.")
+            return [str(x) for x in value]
+
+        vid1 = _metadata("video_id")
+        vid2 = _metadata("paired_video_id")
+        qid1 = _metadata("question_id")
+        qid2 = _metadata("paired_question_id")
+        valid_cpu = valid.detach().cpu().tolist()
+        for i, is_valid in enumerate(valid_cpu):
+            if is_valid and vid1[i] != vid2[i]:
+                raise ValueError(f"V3.5 row {i}: Q1/Q2 belong to DIFFERENT videos.")
+            if is_valid and qid1[i] == qid2[i]:
+                raise ValueError(f"V3.5 row {i}: Q1/Q2 refer to the SAME question id.")
+        return q2.to(device=device, non_blocking=True), valid.to(device=device, non_blocking=True)
+
+    def _v35_pair_objective(self, model_outputs, settings):
+        """Question-discriminative evidence loss (TRAIN ONLY), no new weights.
+
+        Per-frame u_t = normalize(W_host @ raw_CLIP_t + b_host), with detached
+        host projection weights and detached video features. Center per-video
+        on VALID frames: r_t = u_t - mean_valid(u).  Then e_i=sum_t S_i(t) r_t.
+        NOTE: because sum(S1)=sum(S2)=1, centering cancels in (e1-e2).
+        Thus centering is numerically redundant for D, NOT independent
+        protection against semantic shortcuts or wrong-event localization.
+
+        D = ((e_1-e_2) dot (q_1-q_2))/temperature, with stopgrad normalized
+        question-only embeddings. L_pair = mean_valid softplus(margin-D).
+
+        The loss DOES NOT identify GT event; its gradient must be validated
+        before a full training run. A wrong Q-specific event is still possible.
+        """
+        if not self.model.training or not torch.is_grad_enabled():
+            raise RuntimeError("V3.5 QDTG pair objective is strictly train-only.")
+        required = (
+            "qbound_support_temporal_prob", "qbound_pair_support_temporal_prob",
+            "qbound_grounding_question", "qbound_pair_grounding_question",
+            "qbound_pair_valid_mask", "qbound_value_sequence", "qbound_semantic_seed_logits",
+            "qbound_pair_semantic_seed_logits", "qbound_video_mask",
+        )
+        missing = [key for key in required if key not in model_outputs]
+        if missing:
+            raise KeyError(f"V3.5 CRA outputs missing pair fields: {missing}")
+
+        s1 = model_outputs["qbound_support_temporal_prob"]
+        s2 = model_outputs["qbound_pair_support_temporal_prob"]
+        q1 = model_outputs["qbound_grounding_question"]
+        q2 = model_outputs["qbound_pair_grounding_question"]
+        valid_pairs = model_outputs["qbound_pair_valid_mask"]
+        raw = model_outputs["qbound_value_sequence"]
+        frame_mask = model_outputs["qbound_video_mask"].bool()
+
+        if s1.ndim != 2 or s1.shape != s2.shape or not s1.requires_grad or not s2.requires_grad:
+            raise RuntimeError("V3.5 S1/S2 must be differentiable matching [B,T] Support Fields.")
+        b, t = s1.shape
+        if raw.ndim != 3 or raw.shape[:2] != (b, t):
+            raise ValueError("V3.5 raw VALUE must be [B,T,D].")
+        if q1.ndim != 2 or q1.shape != q2.shape or q1.size(0) != b:
+            raise ValueError("V3.5 question-global representations must match [B,D].")
+        if valid_pairs.shape != (b,) or valid_pairs.dtype != torch.bool:
+            raise TypeError("V3.5 pair_valid_mask must be BoolTensor[B].")
+        if frame_mask.shape != (b, t):
+            raise ValueError("V3.5 qbound_video_mask must be [B,T].")
+        if q1.requires_grad or q2.requires_grad:
+            raise RuntimeError("V3.5 question targets must be detached.")
+        if not (torch.isfinite(s1).all() and torch.isfinite(s2).all()
+                and torch.isfinite(q1).all() and torch.isfinite(q2).all()):
+            raise RuntimeError("V3.5 input contains non-finite values.")
+
+        # Calculate in float32 for AMP safety.  The sum over valid frames is 1.
+        # F.linear on raw features keeps video/projector out of THIS loss graph.
+        source = raw.detach().float()
+        host = self._v35_host_projection_linear()
+        projected = F.linear(source, host.weight.detach().float(),
+                             host.bias.detach().float() if host.bias is not None else None)
+        u = F.normalize(projected, p=2, dim=-1, eps=1e-6)
+        valid_float = frame_mask.unsqueeze(-1).to(dtype=u.dtype)
+        mean = (u * valid_float).sum(dim=1, keepdim=True) / valid_float.sum(
+            dim=1, keepdim=True).clamp_min(1.0)
+        residual = (u - mean) * valid_float
+        if residual.size(-1) != q1.size(-1):
+            raise ValueError("V3.5 host-projected visual and question dimensions differ.")
+
+        e1 = torch.einsum("bt,btd->bd", s1.float(), residual)
+        e2 = torch.einsum("bt,btd->bd", s2.float(), residual)
+        question_diff = F.normalize(q1.detach().float(), p=2, dim=-1, eps=1e-6) - F.normalize(
+            q2.detach().float(), p=2, dim=-1, eps=1e-6)
+        discrimination = ((e1 - e2) * question_diff).sum(dim=-1) / settings["temperature"]
+        per_pair = F.softplus(settings["margin"] - discrimination)
+
+        if valid_pairs.any():
+            pair_loss = per_pair[valid_pairs].mean()
+        else:
+            # Zero gradient, no made-up pair. The dataset controls coverage.
+            pair_loss = s1.sum() * 0.0
+
+        with torch.no_grad():
+            v = valid_pairs
+            n_valid = int(v.sum().item())
+            info = {
+                "qbound_pair_weight": float(settings["weight"]),
+                "qbound_pair_temperature": float(settings["temperature"]),
+                "qbound_pair_margin": float(settings["margin"]),
+                "qbound_pair_valid_fraction": float(v.float().mean().item()),
+                "qbound_pair_valid_count": float(n_valid),
+                "qbound_pair_discrimination": float(discrimination[v].mean().item()) if n_valid else 0.0,
+                "qbound_pair_margin_positive_fraction": float((discrimination[v] > 0).float().mean().item()) if n_valid else 0.0,
+                "qbound_pair_support_l1": float((s1[v] - s2[v]).abs().sum(dim=-1).mean().item()) if n_valid else 0.0,
+                "qbound_pair_question_cosine": float(F.cosine_similarity(q1[v].float(), q2[v].float(), dim=-1).mean().item()) if n_valid else 0.0,
+                "qbound_pair_visual_residual_norm": float(residual[frame_mask].norm(dim=-1).mean().item()) if frame_mask.any() else 0.0,
+            }
+        if not torch.isfinite(pair_loss).all():
+            raise RuntimeError("V3.5 L_pair non-finite.")
+        return pair_loss, info
+
+    def _v35_host_projection_linear(self):
+        model = self.model.module if hasattr(self.model, "module") else self.model
+        decoder = getattr(model, "decoder", None)
+        if decoder is None or not hasattr(decoder, "video_proj"):
+            raise AttributeError("V3.5 requires CRA RefineDecoder.video_proj.")
+        layers = [x for x in decoder.video_proj.modules() if isinstance(x, nn.Linear)]
+        if len(layers) != 1:
+            raise RuntimeError("V3.5 expects exactly one nn.Linear in video_proj.")
+        return layers[0]
+
+    @staticmethod
+    def _v35_pair_gradient_diagnostics(pair_loss, grounding_loss, model_outputs,
+                                       pair_weight, grounding_weight):
+        """Measure loss-gradient agreement at Q1 Seed logits; NOT GT direction."""
+        seed1 = model_outputs["qbound_semantic_seed_logits"]
+        seed2 = model_outputs["qbound_pair_semantic_seed_logits"]
+        if not seed1.requires_grad or not seed2.requires_grad:
+            raise RuntimeError("V3.5 Seed logits must retain gradients.")
+        gp1, gp2 = torch.autograd.grad(pair_loss, (seed1, seed2),
+                                      retain_graph=True, allow_unused=False)
+        (gg1,) = torch.autograd.grad(grounding_loss, (seed1,),
+                                    retain_graph=True, allow_unused=False)
+        p = gp1.detach().float().reshape(gp1.size(0), -1)
+        g = gg1.detach().float().reshape(gg1.size(0), -1)
+        p_norm, g_norm = p.norm(dim=-1), g.norm(dim=-1)
+        cosine = (p*g).sum(dim=-1) / (p_norm*g_norm).clamp_min(1e-12)
+        weighted_ratio = (float(pair_weight) * p.norm()) / (
+            float(grounding_weight) * g.norm() + 1e-12)
+        return {
+            "qbound_pair_grad_weighted_ratio": float(weighted_ratio.item()),
+            "qbound_pair_grad_seed1_norm": float(p.norm().item()),
+            "qbound_pair_grad_seed2_norm": float(gp2.detach().float().norm().item()),
+            "qbound_pair_grad_grounding_norm": float(g.norm().item()),
+            "qbound_pair_grad_cosine_grounding": float(cosine.mean().item()),
+            "qbound_pair_grad_conflict_fraction": float((cosine < 0).float().mean().item()),
+        }
 
     def _validate_v280_contract(self, gqa_output):
         """Validate the pipeline-facing V2.8 causal and gradient contract."""
@@ -732,6 +1466,12 @@ class CRAPipeline(BasePipeline):
             "qbound_vqa_gradient_to_topology_enabled",
             "qbound_grounding_gradient_to_support_graph_enabled",
         }
+        if not self.r2_predictor_enabled:
+            predictive_flags = {"video_only_support_branch_enabled",
+                                "predictive_support_graph_enabled", "qbound_predictive_loss_exposed",
+                                "support_predictive_objective_expected"}
+            expected_on -= predictive_flags
+            expected_off |= predictive_flags
         for name in expected_on:
             actual = _flag(name)
             if actual != 1.0:
@@ -811,7 +1551,8 @@ class CRAPipeline(BasePipeline):
                     f"{name} must detach support before the CRA/QA route."
                 )
 
-        training_with_grad = self.model.training and torch.is_grad_enabled()
+        training_with_grad = (self.model.training and torch.is_grad_enabled() and
+                              not (self.v38_minimal_enabled and self.v38_settings["phase"] == "probe"))
         if training_with_grad:
             for name in ("semantic_seed_prob", "qbound_grounding_key"):
                 if not qbound_aux[name].requires_grad:
@@ -831,6 +1572,25 @@ class CRAPipeline(BasePipeline):
             raise RuntimeError(
                 "L_ground must see a detached support_edge_affinity."
             )
+        # Mode contract at pipeline level, in addition to Refine/Base checks.
+        # It must remain true in both training and validation inference.
+        actual_mode = qbound_aux.get("support_graph_mode", "learned")
+        if actual_mode != self.r2_graph_mode:
+            raise RuntimeError(
+                "R2 graph mode mismatch in VQA outputs: "
+                f"config={self.r2_graph_mode!r}, aux={actual_mode!r}."
+            )
+        expected_used = (
+            edge_mask.to(edge_affinity.dtype)
+            if actual_mode == "fixed"
+            else qbound_aux["support_edge_affinity_raw"].detach()
+        )
+        if not torch.allclose(
+            edge_affinity.detach(), expected_used.detach(), atol=1e-6, rtol=1e-6
+        ):
+            raise RuntimeError(
+                f"R2 {actual_mode} propagation received unexpected edges."
+            )
 
         laplacian = qbound_aux["support_graph_laplacian"]
         if laplacian.shape != (batch_size, time_steps, time_steps):
@@ -845,10 +1605,14 @@ class CRAPipeline(BasePipeline):
         if not torch.is_tensor(predictive_loss) or predictive_loss.numel() != 1:
             raise TypeError("support_predictive_loss must be a scalar tensor.")
         _finite("support_predictive_loss", predictive_loss)
-        if training_with_grad and bool(edge_mask.any()) and not predictive_loss.requires_grad:
+        if self.r2_predictor_enabled and training_with_grad and bool(edge_mask.any()) and not predictive_loss.requires_grad:
             raise RuntimeError(
                 "L_pred is detached; the support predictor would not learn."
             )
+        if not self.r2_predictor_enabled and (
+            predictive_loss.requires_grad or float(predictive_loss.detach().item()) != 0.0
+        ):
+            raise RuntimeError("R2-C must not compute L_pred.")
         for alias in (
             qbound_aux["qbound_support_predictive_loss"],
             model_outputs["qbound_support_predictive_loss"],
@@ -966,17 +1730,23 @@ class CRAPipeline(BasePipeline):
             "qbound_soft_training_key_max_abs_diff",
         )
         for key in scalar_keys:
+            if not getattr(self, "r2_predictor_enabled", True) and (
+                key.startswith("support_predictive")
+                or key.startswith("support_edge_surprise")
+            ):
+                continue
             scalar = self._scalar_mean(qbound_aux.get(key))
             if scalar is not None:
                 log_key = key if key.startswith("qbound_") else f"qbound_{key}"
                 stats[log_key] = scalar
 
         edge_mask = qbound_aux.get("support_edge_mask")
-        for name in (
-            "support_edge_surprise",
-            "support_edge_affinity_raw",
-            "support_edge_affinity",
-        ):
+        edge_names = (
+            ("support_edge_surprise", "support_edge_affinity_raw", "support_edge_affinity")
+            if getattr(self, "r2_predictor_enabled", True)
+            else ("support_edge_affinity",)
+        )
+        for name in edge_names:
             value = qbound_aux.get(name)
             if not torch.is_tensor(value) or value.numel() == 0:
                 continue
@@ -1079,13 +1849,9 @@ class CRAPipeline(BasePipeline):
 
     def _qbound_component_grad_norms(self):
         names = (
-            "where_input",
-            "visual_distinctiveness",
-            "visual_transition",
-            "temporal_context",
-            "semantic_relevance",
-            "support_predictor",
-        )
+            "where_input", "visual_distinctiveness", "visual_transition",
+            "temporal_context", "semantic_relevance",
+        ) + (("support_predictor",) if getattr(self, "r2_predictor_enabled", True) else ())
         totals = {name: 0.0 for name in names}
         if not self._qbound_enabled():
             return {
@@ -1181,6 +1947,25 @@ class CRAPipeline(BasePipeline):
             "qbound_grounding_negative_similarity",
             "qbound_grounding_hardest_negative_similarity",
             "qbound_grounding_margin",
+            # V3.5 / QDTG (populated only when pair_loss enabled)
+            "qbound_pair_weight",
+            "qbound_pair_temperature",
+            "qbound_pair_margin",
+            "qbound_pair_loss",
+            "qbound_pair_weighted_loss",
+            "qbound_pair_valid_fraction",
+            "qbound_pair_valid_count",
+            "qbound_pair_discrimination",
+            "qbound_pair_margin_positive_fraction",
+            "qbound_pair_support_l1",
+            "qbound_pair_question_cosine",
+            "qbound_pair_visual_residual_norm",
+            "qbound_pair_grad_weighted_ratio",
+            "qbound_pair_grad_seed1_norm",
+            "qbound_pair_grad_seed2_norm",
+            "qbound_pair_grad_grounding_norm",
+            "qbound_pair_grad_cosine_grounding",
+            "qbound_pair_grad_conflict_fraction",
             "qbound_visual_distinctiveness_input_ratio",
             "qbound_visual_distinctiveness_delta_ratio",
             "qbound_visual_transition_delta_ratio",
@@ -1235,6 +2020,21 @@ class CRAPipeline(BasePipeline):
             "qbound_soft_training_key_max_abs_diff",
         ]
 
+    @staticmethod
+    def _v38_monitor_keys():
+        return (
+            "qbound_v38_evqa_loss", "qbound_v38_evqa_weighted_loss",
+            "qbound_v38_evqa_weight", "qbound_v38_evqa_eligible_fraction",
+            "qbound_v38_evqa_eligible_count", "qbound_v38_evqa_acc",
+            "qbound_v38_evqa_acc_eligible", "qbound_v38_probe_phase",
+            "qbound_v38_bank_event_count", "qbound_v38_bank_fallback_fraction",
+            "qbound_v38_event_prior_l1", "qbound_v38_event_joint_consistency_max",
+            "qbound_v38_event_prior_entropy", "qbound_v38_event_marginal_entropy",
+            "qbound_v38_interaction_centered_rms",
+            "qbound_v38_grad_prior_norm", "qbound_v38_grad_prior_identity_max_error",
+            "qbound_v38_bank_grad_norm", "qbound_v38_evidence_grad_norm",
+        )
+
     def get_loss(self, batch, qbound_mix=1.0):
         del qbound_mix
         device = self._model_device()
@@ -1253,7 +2053,7 @@ class CRAPipeline(BasePipeline):
 
         settings = self._qbound_v280_loss_settings()
         video_mask = (
-            get_mask(video_len, self.cfgs["dataset"]["max_feats"]).to(
+            get_mask(video_len, video_frames.size(1)).to(
                 device, non_blocking=True
             )
             if self.cfgs["dataset"]["max_feats"] > 0
@@ -1264,6 +2064,25 @@ class CRAPipeline(BasePipeline):
         answer_id_device = self._prepare_labels(answer_id, device)
         prediction_dict = {}
         target_dict = {}
+        negative_mask, candidate_mask, m1_logs = None, None, {}
+        v38_m1_kwargs = {}
+        if self.m1_grouped_batch:
+            negative_mask, candidate_mask, m1_logs = self._m1_batch_masks(
+                batch, batch["question"], batch_size, device,
+            )
+            if self.v38_m1_enabled:
+                v38_m1_kwargs["m1_question_candidate_mask"] = candidate_mask
+
+        # V3.5 is train-only. Missing Q2 metadata must be a HARD ERROR, never
+        # silently turned into zero pair loss over an unchanged R2-C run.
+        v35_pair_kwargs = {}
+        if self.v35_pair_settings["enabled"]:
+            paired_question, pair_valid_mask = self._v35_pair_inputs(
+                batch=batch, batch_size=batch_size, device=device)
+            v35_pair_kwargs = {
+                "paired_question": paired_question,
+                "pair_valid_mask": pair_valid_mask,
+            }
 
         # Historical CRA VQ objective remains outside Q-Bound.
         if self.cfgs["model"]["vg_loss"]:
@@ -1303,6 +2122,8 @@ class CRAPipeline(BasePipeline):
             question=question,
             qbound_mix=(1.0 if self._qbound_enabled() else 0.0),
             answer_only=None,
+            **v35_pair_kwargs,
+            **v38_m1_kwargs,
         )
         main_video_proj = gqa_output[0]
         answer_proj = gqa_output[1]
@@ -1322,58 +2143,122 @@ class CRAPipeline(BasePipeline):
         prediction_dict["vqa_align_pred"] = main_video_proj
         target_dict["vqa_align_gt"] = model_outputs["align_gt"]
 
-        loss = self.criterion(prediction_dict, target_dict)
+        criterion_kwargs = (
+            {"align_negative_mask": negative_mask}
+            if self.m1_grouped_batch and self.m1_mask_cra_alignment else {}
+        )
+        loss = self.criterion(prediction_dict, target_dict, **criterion_kwargs)
         if "total_loss" not in loss:
             raise KeyError("The criterion must return loss['total_loss'].")
         if not torch.isfinite(loss["total_loss"]).all():
             raise RuntimeError("L_CRA/main contains non-finite values.")
 
         qbound_logs = {}
+        if self.v38_m1_enabled:
+            question_loss, answer_loss, stats = self._m1_objective(
+                model_outputs, answer_id_device, candidate_mask, negative_mask,
+            )
+            q_weight = self.v38_m1_settings["question_loss_weight"]
+            a_weight = self.v38_m1_settings["answer_loss_weight"]
+            loss["v38_m1_question_loss"] = question_loss
+            loss["v38_m1_answer_loss"] = answer_loss
+            loss["total_loss"] = loss["total_loss"] + q_weight * question_loss + a_weight * answer_loss
+            qbound_logs.update(m1_logs)
+            qbound_logs.update(stats)
+        if self.v38_minimal_enabled:
+            ev_loss, ev_logs = self._v38_evidence_loss(model_outputs, answer_id_device)
+            weighted_ev = self.v38_settings["weight"] * ev_loss
+            legacy_total = loss["total_loss"]
+            if self.v38_settings["phase"] == "probe":
+                # P2: freeze old encoders/CRA; do NOT train on the old losses.
+                loss["qbound_v38_legacy_loss_diagnostic"] = legacy_total.detach()
+                loss["total_loss"] = weighted_ev
+            else:
+                loss["total_loss"] = legacy_total + weighted_ev
+            loss["qbound_v38_evqa_loss"] = ev_loss
+            loss["qbound_v38_evqa_weighted_loss"] = weighted_ev
+            qbound_logs.update(ev_logs)
+            qbound_logs["qbound_v38_evqa_weight"] = self.v38_settings["weight"]
+            qbound_logs["qbound_v38_probe_phase"] = float(self.v38_settings["phase"] == "probe")
+            self._v38_eligible_rows_this_epoch += int(ev_logs["qbound_v38_evqa_eligible_count"])
+            self._v38_grad_step += 1
+            period = self.v38_settings["gradient_audit_every"]
+            if period and self._v38_grad_step % period == 0:
+                qbound_logs.update(self._v38_gradient_audit(
+                    ev_loss, model_outputs, answer_id_device
+                ))
         if self._qbound_enabled():
             qbound_aux = self._validate_v280_contract(gqa_output)
 
-            grounding_loss, grounding_diag = (
-                self._qbound_video_question_objective(
-                    model_outputs=model_outputs,
-                    qbound_aux=qbound_aux,
-                    temperature=settings["grounding_temperature"],
+            if self.v38_minimal_enabled and self.v38_settings["phase"] == "probe":
+                # P2 intentionally has NO old grounding or pair objectives.
+                # The untouched legacy outputs remain available for diagnostics.
+                qbound_logs["qbound_grounding_weight"] = settings["grounding_weight"]
+            else:
+                grounding_loss, grounding_diag = (
+                    self._qbound_video_question_objective(
+                        model_outputs=model_outputs,
+                        qbound_aux=qbound_aux,
+                        temperature=settings["grounding_temperature"],
+                        **({"negative_mask": negative_mask} if self.m1_grouped_batch else {}),
+                    )
                 )
-            )
-            predictive_loss = qbound_aux["support_predictive_loss"]
-            if not torch.isfinite(predictive_loss).all():
-                raise RuntimeError("L_pred contains non-finite values.")
+                predictive_loss = qbound_aux["support_predictive_loss"]
+                if not torch.isfinite(predictive_loss).all():
+                    raise RuntimeError("L_pred contains non-finite values.")
 
-            weighted_grounding = (
-                settings["grounding_weight"] * grounding_loss
-            )
-            weighted_predictive = (
-                settings["predictive_weight"] * predictive_loss
-            )
-            loss["qbound_grounding_loss"] = grounding_loss
-            loss["qbound_grounding_weighted_loss"] = weighted_grounding
-            loss["qbound_predictive_loss"] = predictive_loss
-            loss["qbound_predictive_weighted_loss"] = weighted_predictive
-            loss["total_loss"] = (
-                loss["total_loss"]
-                + weighted_grounding
-                + weighted_predictive
-            )
+                weighted_grounding = (
+                    settings["grounding_weight"] * grounding_loss
+                )
+                loss["qbound_grounding_loss"] = grounding_loss
+                loss["qbound_grounding_weighted_loss"] = weighted_grounding
+                if self.r2_predictor_enabled:
+                    weighted_predictive = settings["predictive_weight"] * predictive_loss
+                    loss["qbound_predictive_loss"] = predictive_loss
+                    loss["qbound_predictive_weighted_loss"] = weighted_predictive
+                    loss["total_loss"] = loss["total_loss"] + weighted_grounding + weighted_predictive
+                else:
+                    # No predictive loss calculation/gradient in R2-C.
+                    loss["total_loss"] = loss["total_loss"] + weighted_grounding
 
-            qbound_logs.update(
-                {
-                    f"qbound_{name}": value
-                    for name, value in grounding_diag.items()
-                }
-            )
-            qbound_logs["qbound_grounding_weight"] = settings[
-                "grounding_weight"
-            ]
-            qbound_logs["qbound_grounding_temperature"] = settings[
-                "grounding_temperature"
-            ]
-            qbound_logs["qbound_predictive_weight"] = settings[
-                "predictive_weight"
-            ]
+                # V3.5: only the opt-in pair objective can update the SAME shared
+                # Q-Bound Seed scorer through Q1 and Q2 Support Fields.  Do not
+                # change CRA QA, detached host/video/question sources or L_ground.
+                if self.v35_pair_settings["enabled"]:
+                    pair_loss, pair_diag = self._v35_pair_objective(
+                        model_outputs=model_outputs,
+                        settings=self.v35_pair_settings,
+                    )
+                    weighted_pair = self.v35_pair_settings["weight"] * pair_loss
+                    loss["qbound_pair_loss"] = pair_loss
+                    loss["qbound_pair_weighted_loss"] = weighted_pair
+                    loss["total_loss"] = loss["total_loss"] + weighted_pair
+                    qbound_logs.update(pair_diag)
+                    self._v35_loss_step += 1
+                    period = self.v35_pair_settings["gradient_audit_every"]
+                    if period and self._v35_loss_step % period == 0 and pair_diag["qbound_pair_valid_count"] > 0:
+                        qbound_logs.update(self._v35_pair_gradient_diagnostics(
+                            pair_loss=pair_loss,
+                            grounding_loss=grounding_loss,
+                            model_outputs=model_outputs,
+                            pair_weight=self.v35_pair_settings["weight"],
+                            grounding_weight=settings["grounding_weight"],
+                        ))
+
+                qbound_logs.update(
+                    {
+                        f"qbound_{name}": value
+                        for name, value in grounding_diag.items()
+                    }
+                )
+                qbound_logs["qbound_grounding_weight"] = settings[
+                    "grounding_weight"
+                ]
+                qbound_logs["qbound_grounding_temperature"] = settings[
+                    "grounding_temperature"
+                ]
+                if self.r2_predictor_enabled:
+                    qbound_logs["qbound_predictive_weight"] = settings["predictive_weight"]
 
         predicted = main_logits.argmax(dim=-1).detach().cpu()
         running_accuracy = (
@@ -1385,6 +2270,179 @@ class CRAPipeline(BasePipeline):
         )
         return loss, running_accuracy, qbound_stats
 
+    @staticmethod
+    def _r1_posthoc_frame0_fixed(vatt, cur, thd_weight=0.3, dis=10):
+        """R1 diagnostic: original find_seg_ada with only left bound >0 -> >=0.
+
+        This is NOT used for primary R2 model selection or the canonical metrics.
+        Its threshold, time discount, gap-skipping and right search are unchanged.
+        """
+        values = np.asarray(vatt, dtype=np.float64).reshape(-1)
+        timestamps = np.asarray(cur, dtype=np.float64).reshape(-1)
+        if values.size == 0 or timestamps.size != values.size:
+            raise ValueError("R1 post-hoc requires matching nonempty key/timestamps.")
+        values = (values - values.min()) / (values.max() - values.min() + 1e-12)
+        peak = int(np.argmax(values))
+        path = [peak]
+        mean_s = np.mean(values)
+        threshold = mean_s + thd_weight * mean_s
+        stamp_s = timestamps[peak]
+
+        i = 1
+        while peak - i >= 0:  # ONLY change versus Metric.find_seg_ada
+            stamp = timestamps[peak - i]
+            elapse = abs(stamp_s - stamp)
+            score = values[peak - i] / (1 + elapse / dis)
+            if score >= threshold:
+                path.append(peak - i)
+            elif elapse > dis:
+                break
+            i += 1
+
+        i = 1
+        while peak + i < values.size:
+            stamp = timestamps[peak + i]
+            elapse = abs(stamp_s - stamp)
+            score = values[peak + i] / (1 + elapse / dis)
+            if score >= threshold:
+                path.append(peak + i)
+            elif elapse > dis:
+                break
+            i += 1
+        return [float(timestamps[min(path)]), float(timestamps[max(path)])]
+
+    @staticmethod
+    def _r1_key_video_id(question_id):
+        """NExT-GQA key: video_id_question_id, video_id may not contain '_'."""
+        key = str(question_id)
+        if "_" not in key:
+            raise ValueError(f"Unexpected NExT-GQA question key: {key!r}")
+        return key.split("_", 1)[0]
+
+    @staticmethod
+    def _r1_span_diagnostics(predictions, prefix):
+        if not predictions:
+            return {}
+        spans = np.asarray(list(predictions.values()), dtype=np.float64)
+        if spans.ndim != 2 or spans.shape[1] != 2:
+            raise ValueError("R1 span diagnostics expects predictions of shape [N,2].")
+        length = spans[:, 1] - spans[:, 0]
+        if np.any(length < -1e-6):
+            raise RuntimeError("Temporal decoder emitted reversed interval endpoints.")
+        return {
+            f"{prefix}ZeroDurationPct": float(np.mean(np.abs(length) <= 1e-9) * 100.0),
+            f"{prefix}MeanLengthSeconds": float(np.mean(length)),
+        }
+
+    @classmethod
+    def _v38_oracle_bank_audit(cls, event_metadata, ground_truth, segments):
+        """VALIDATION AUDIT ONLY: best candidate IoU using sampled timestamps.
+
+        This is an approximate diagnostic ceiling, not train supervision or
+        an oracle-prediction path. Uses [start, end_exclusive) fixed windows,
+        converted to [sampled time(start), sampled time(end-1)].
+        """
+        ious = []
+        best_ranks = []
+        duplicate_rate = []
+        gt_positive_mass = []
+        missing = 0
+        for qid, meta in event_metadata.items():
+            try:
+                vid = cls._r1_key_video_id(qid)
+                question_id = str(qid).split("_", 1)[1]
+                target = ground_truth[vid]["location"][question_id]
+                timeline = np.asarray(segments[vid], dtype=np.float64).reshape(-1)
+            except (KeyError, IndexError, TypeError):
+                missing += 1
+                continue
+            gt = np.asarray(target, dtype=np.float64).reshape(-1)
+            if gt.size != 2 or timeline.size < int(meta["valid_length"]):
+                missing += 1
+                continue
+            starts = np.asarray(meta["start"], dtype=np.int64)
+            ends = np.asarray(meta["end_exclusive"], dtype=np.int64)
+            marginal = np.asarray(meta["posterior_marginal"], dtype=np.float64)
+            if not (len(starts) == len(ends) == len(marginal)):
+                raise ValueError("M0 bank oracle metadata has mismatched window lengths.")
+            if not len(starts):
+                missing += 1
+                continue
+            if (starts < 0).any() or (ends <= starts).any() or (ends > timeline.size).any():
+                raise RuntimeError(f"M0 bank contains invalid temporal indices: {qid}")
+            s_time, e_time = timeline[starts], timeline[ends - 1]
+            intersection = np.maximum(0, np.minimum(e_time, gt[1]) - np.maximum(s_time, gt[0]))
+            union = np.maximum(e_time, gt[1]) - np.minimum(s_time, gt[0])
+            candidate_iou = intersection / np.maximum(union, 1e-12)
+            ious.append(float(candidate_iou.max()))
+            # Rank only when at least one candidate overlaps GT. A zero-IoU
+            # bank has no meaningful "GT candidate" whose rank can be quoted.
+            if float(candidate_iou.max()) > 0.0:
+                best_index = int(np.argmax(candidate_iou))
+                order = np.argsort(-marginal, kind="stable")
+                best_ranks.append(int(np.flatnonzero(order == best_index)[0]) + 1)
+            duplicate_rate.append(float(np.mean(candidate_iou >= 0.5)))
+            gt_positive_mass.append(float(marginal[candidate_iou >= 0.3].sum()))
+        if not ious:
+            return {"V38BankOracleCount": 0.0,
+                    "V38BankOracleUnresolvedCount": float(missing)}
+        ious = np.asarray(ious)
+        return {
+            "V38BankOracleCount": float(len(ious)),
+            "V38BankOracleUnresolvedCount": float(missing),
+            "V38BankOracleSampledIoUMean": float(ious.mean()),
+            "V38BankOracleSampledRecall03": float(np.mean(ious >= 0.3)),
+            "V38BankOracleSampledRecall05": float(np.mean(ious >= 0.5)),
+            "V38BankGTBestCandidateRankMean": float(np.mean(best_ranks)) if best_ranks else -1.0,
+            "V38BankGTBestCandidateRankResolvedCount": float(len(best_ranks)),
+            "V38BankMarginalGTCandidateMass03": float(np.mean(gt_positive_mass)),
+            "V38BankFractionWindowsIoU05": float(np.mean(duplicate_rate)),
+        }
+
+    @classmethod
+    def _v38_span_failure_audit(cls, predictions, ground_truth, answer_results, prefix):
+        """Evaluate WHERE, span length and QA-correct/IoU-zero without training GT.
+
+        All numbers here are measured strictly after evaluation predictions.
+        Missing GT metadata is counted, not treated as a zero-IoU failure.
+        """
+        valid_ious = []
+        lengths = []
+        qa_correct_zero = 0
+        qa_correct = 0
+        missing = 0
+        for qid, span in predictions.items():
+            try:
+                vid = cls._r1_key_video_id(qid)
+                question_id = str(qid).split("_", 1)[1]
+                gt = np.asarray(ground_truth[vid]["location"][question_id], dtype=np.float64).reshape(-1)
+            except (KeyError, TypeError, IndexError):
+                missing += 1
+                continue
+            pred = np.asarray(span, dtype=np.float64).reshape(-1)
+            if pred.size != 2 or gt.size != 2:
+                missing += 1
+                continue
+            intersection = max(0.0, min(pred[1], gt[1]) - max(pred[0], gt[0]))
+            union = max(pred[1], gt[1]) - min(pred[0], gt[0])
+            iou = intersection / max(union, 1e-12)
+            valid_ious.append(iou)
+            lengths.append(max(0.0, pred[1] - pred[0]))
+            correct = int(answer_results[qid]["prediction"] == answer_results[qid]["answer"])
+            qa_correct += correct
+            if correct and iou <= 1e-9:
+                qa_correct_zero += 1
+        if not valid_ious:
+            return {f"{prefix}Resolved": 0.0, f"{prefix}Missing": float(missing)}
+        return {
+            f"{prefix}Resolved": float(len(valid_ious)),
+            f"{prefix}Missing": float(missing),
+            f"{prefix}IoUZeroFraction": float(np.mean(np.asarray(valid_ious) <= 1e-9)),
+            f"{prefix}QACorrectIoUZeroFraction": float(qa_correct_zero / len(valid_ious)),
+            f"{prefix}QACorrectIoUZeroAmongCorrect": float(qa_correct_zero / max(qa_correct, 1)),
+            f"{prefix}MeanLengthSeconds": float(np.mean(lengths)),
+        }
+
     def _train_epoch(self, epoch):
         self.monitor.log_info(
             f"\n{'#' * 20} Epoch "
@@ -1393,6 +2451,12 @@ class CRAPipeline(BasePipeline):
         )
         print("Training Stage")
         self.model.train()
+        self._v38_set_training_mode()
+        self._v38_eligible_rows_this_epoch = 0
+        if self.m1_grouped_batch:
+            sampler = self.train_dataloader.batch_sampler
+            if callable(getattr(sampler, "set_epoch", None)):
+                sampler.set_epoch(epoch)
 
         self.monitor.reset_kv(
             f"{self.cfgs['stat']['monitor']['metric']}"
@@ -1415,8 +2479,20 @@ class CRAPipeline(BasePipeline):
 
         if self._qbound_enabled():
             for key in self._qbound_monitor_keys():
+                if not self.v35_pair_settings["enabled"] and key.startswith("qbound_pair_"):
+                    continue
+                if not self.r2_predictor_enabled and (
+                    "predictive" in key or "edge_surprise" in key
+                    or "edge_affinity_raw" in key or "support_predictor_grad" in key
+                ):
+                    continue
                 self.monitor.reset_kv(key)
+            if self.v38_minimal_enabled:
+                for key in self._v38_monitor_keys():
+                    self.monitor.reset_kv(key)
 
+        v35_valid_pairs_this_epoch = 0
+        m1_q_rows, m1_a_rows, m1_pairs = 0, 0, 0
         for index, batch in enumerate(
             self.train_dataloader
         ):
@@ -1439,6 +2515,12 @@ class CRAPipeline(BasePipeline):
                 "acc",
                 monitor_metric,
             )
+            if self.v35_pair_settings["enabled"]:
+                v35_valid_pairs_this_epoch += int(qbound_stats.get("qbound_pair_valid_count", 0))
+            if self.v38_m1_enabled:
+                m1_q_rows += int(qbound_stats["v38_m1_question_eligible_count"])
+                m1_a_rows += int(qbound_stats["v38_m1_answer_eligible_count"])
+                m1_pairs += int(qbound_stats["v38_m1_same_video_pair_count"])
             for name, value in (
                 qbound_stats.items()
             ):
@@ -1452,6 +2534,9 @@ class CRAPipeline(BasePipeline):
                 "total_loss"
             ].backward()
 
+            if self.v38_minimal_enabled:
+                for name, value in self._v38_parameter_grad_norms().items():
+                    self.monitor.logkv_mean(name, value)
             if self._qbound_enabled():
                 self.monitor.logkv_mean(
                     "qbound_grad_norm",
@@ -1510,7 +2595,7 @@ class CRAPipeline(BasePipeline):
                 f"{remaining_batch_time}-"
                 f"{remaining_epoch_time}) | "
                 f"Train "
-                f"{self.cfgs['stat']['monitor']['metric']}: "
+                f"{'CRA QA acc' if self.v38_m1_enabled else self.cfgs['stat']['monitor']['metric']}: "
                 f"{monitor_metric:3.2%}"
             )
 
@@ -1540,6 +2625,19 @@ class CRAPipeline(BasePipeline):
                 flush=True,
             )
 
+        if self.v38_minimal_enabled and self._v38_eligible_rows_this_epoch <= 0:
+            raise RuntimeError("M0 trained on zero eligible event-bank examples this epoch.")
+        if self.v38_m1_enabled and (min(m1_q_rows, m1_a_rows, m1_pairs) <= 0):
+            raise RuntimeError(
+                "M1 had no effective question rows, answer rows, or same-video pairs this epoch. "
+                "Check the grouped sampler and candidate metadata before interpreting the run."
+            )
+        if self.v35_pair_settings["enabled"] and v35_valid_pairs_this_epoch <= 0:
+            raise RuntimeError(
+                "V3.5 enabled but no valid same-video question pairs were used "
+                "during this epoch. Inspect dataset pairing/filter before training."
+            )
+
         table = [[], []]
         for (
             name,
@@ -1561,45 +2659,56 @@ class CRAPipeline(BasePipeline):
             end="\n",
         )
 
-        print("Eval Stage")
-        val_score, val_result = (
-            self.eval(
-                self.val_dataloader
-            )
+        if self.v38_m1_enabled:
+            print("Eval Stage: validation (CRA answer + M1 WHERE selection)")
+        else:
+            print("Eval Stage: validation (canonical R2-C/V3.5 model selection)")
+        val_score, val_result = self.eval(
+            self.val_dataloader, save=self.save_val_predictions
         )
+        val_result["r2_graph_mode"] = self.r2_graph_mode
+        val_result["r2_predictor_enabled"] = self.r2_predictor_enabled
+        val_result["r2_variant"] = ("A" if self.r2_graph_mode == "learned"
+                                    else "B" if self.r2_predictor_enabled else "C")
+        val_result["experiment_variant"] = (
+            "V3.8-M1" if self.v38_m1_enabled else
+            ("V3.8-Minimal-" + self.v38_settings["phase"])
+            if self.v38_minimal_enabled else
+            ("V3.5-QDTG" if self.v35_pair_settings["enabled"] else "R2-C")
+        )
+        val_result["epoch"] = int(epoch)
+        val_result["split"] = "val"
 
-        
-        # R1/R2 diagnostic: save validation predictions per epoch.
-        # Does not affect forward, loss, gradients, or model weights.
-        if self._qbound_enabled():
-            dump_dir = os.path.join(self.save_dir, "val_dumps")
+        if self.save_val_predictions:
+            dump_dir = os.path.join(self.save_dir, "validation_dumps")
             os.makedirs(dump_dir, exist_ok=True)
-
+            dump_path = os.path.join(dump_dir, f"val_epoch_{epoch:02d}.pth")
+            # Compatible with previously saved val_epoch_15.pth format:
+            # {epoch, score, result}. Each per-question prediction is in result.
             torch.save(
                 {
                     "epoch": int(epoch),
                     "score": val_score,
                     "result": val_result,
+                    "r2_graph_mode": self.r2_graph_mode,
+                    "r2_predictor_enabled": self.r2_predictor_enabled,
+                    "r2_variant": val_result["r2_variant"],
+                    "experiment_variant": val_result["experiment_variant"],
                 },
-                os.path.join(
-                    dump_dir,
-                    f"val_epoch_{epoch:02d}.pth",
-                ),
+                dump_path,
             )
+            print(f"[R2 {self.r2_graph_mode}] Validation dump: {dump_path}")
 
-        if (
-            self.cfgs["dataset"]["name"]
-            == "star"
-        ):
-            test_score = val_score
-            test_result = val_result
-        else:
-            (
-                test_score,
-                test_result,
-            ) = self.eval(
-                self.test_dataloader
-            )
+        # Always evaluate test each epoch in M0 for OBSERVATION ONLY.
+        # The returned validation result and BasePipeline selection contract must
+        # NEVER use test numbers to select/update a checkpoint.
+        test_score = {}
+        if self.eval_test_each_epoch:
+            print("Eval Stage: test (diagnostic only; NEVER for selection)")
+            if self.cfgs["dataset"]["name"] == "star":
+                test_score = val_score
+            else:
+                test_score, _ = self.eval(self.test_dataloader)
 
         score = {
             **{
@@ -1616,8 +2725,28 @@ class CRAPipeline(BasePipeline):
         self.print_score(score)
 
         wandb_data = {
-            "epoch": epoch
+            "epoch": epoch,
+            "experiment/v38_minimal": int(self.v38_minimal_enabled),
+            "experiment/v38_probe_phase": int(
+                self.v38_minimal_enabled and self.v38_settings["phase"] == "probe"
+            ),
+            "experiment/v38_evqa_weight": float(self.v38_settings["weight"]),
+            "experiment/r2_is_fixed_graph": int(self.r2_graph_mode == "fixed")
+            if self._qbound_enabled() else 0,
+            "experiment/r2_predictor_enabled": int(self.r2_predictor_enabled)
+            if self._qbound_enabled() else 0,
+            "experiment/v35_pair_loss_enabled": int(self.v35_pair_settings["enabled"]),
+            "experiment/v35_pair_loss_weight": float(self.v35_pair_settings["weight"]),
         }
+        if self.v38_m1_enabled:
+            wandb_data.update({
+                "experiment/v38_m1": 1,
+                "experiment/v38_m1_question_weight": self.v38_m1_settings["question_loss_weight"],
+                "experiment/v38_m1_answer_weight": self.v38_m1_settings["answer_loss_weight"],
+                "train/v38_m1_question_eligible_total": m1_q_rows,
+                "train/v38_m1_answer_eligible_total": m1_a_rows,
+                "train/v38_m1_same_video_pair_total": m1_pairs,
+            })
         for (
             name,
             value,
@@ -1657,10 +2786,8 @@ class CRAPipeline(BasePipeline):
         wandb.log(
             wandb_data
         )
-        return (
-            score,
-            test_result,
-        )
+        # BasePipeline._record_best stores this as result.pth; it MUST be val.
+        return score, val_result
 
     def print_score(self, score):
         def _print_score(score_dict):
@@ -1676,7 +2803,7 @@ class CRAPipeline(BasePipeline):
             if acc_key in score:
                 self.monitor.log_info(
                     f"\n{split.title()} Set\t "
-                    f"Q-Bound V2.8 acc: {score[acc_key]:.2%}"
+                    f"Q-Bound R2-C/V3.5 acc: {score[acc_key]:.2%}"
                 )
 
             prehoc_key = f"{split}_pre-hoc"
@@ -1693,6 +2820,16 @@ class CRAPipeline(BasePipeline):
                 )
                 _print_score(score[posthoc_key])
 
+            for diagnostic_name in (
+                "pre-hoc-timestamp", "post-hoc-leftfix", "seed-post-hoc"
+            ):
+                diagnostic_key = f"{split}_{diagnostic_name}"
+                if diagnostic_key in score:
+                    self.monitor.log_info(
+                        f"\n========== {split} {diagnostic_name} [diagnostic] =========="
+                    )
+                    _print_score(score[diagnostic_key])
+
             merge_key = f"{split}_merge"
             if merge_key in score:
                 self.monitor.log_info(
@@ -1700,6 +2837,26 @@ class CRAPipeline(BasePipeline):
                 )
                 _print_score(score[merge_key])
 
+        if self.v38_minimal_enabled:
+            self.monitor.log_info("\n=============== Q-Bound V3.8-M0 ===============")
+            for split in ("val", "test"):
+                for name in ("v38_evqa_acc", "v38_qa_agreement",
+                             "v38_bank_fallback_fraction",
+                             "v38_joint_marginal_post-hoc",
+                             "v38_predicted_answer_conditional_post-hoc",
+                             "v38_question_only_post-hoc"):
+                    value = score.get(f"{split}_{name}")
+                    if isinstance(value, dict):
+                        self.monitor.log_info(f"\n{split}_{name}: {value}")
+                    elif isinstance(value, (float, int)):
+                        self.monitor.log_info(f"\n{split}_{name}: {value:.6f}")
+        if self.v38_m1_enabled:
+            self.monitor.log_info("\n=============== Q-Bound V3.8-M1 ===============")
+            for split in ("val", "test"):
+                for view in self.M1_VIEWS:
+                    name = f"{split}_v38_m1_{view}_post-hoc"
+                    if name in score:
+                        self.monitor.log_info(f"\n{name} (CRA answers): {score[name]}")
         qbound_keys = [
             key for key in score
             if key.startswith(("val_qbound_", "test_qbound_"))
@@ -1846,13 +3003,393 @@ class CRAPipeline(BasePipeline):
             )
             plt.close(figure)
 
+    def _m1_collect_eval_batch(self, state, model_outputs, qids, predicted, labels, dump):
+        bank, evidence = self._m1_outputs(model_outputs)
+        cra_answer = model_outputs["qbound_v38_m1_cra_answer"].cpu()
+        mil_answer = model_outputs["qbound_v38_m1_mil_answer"].cpu()
+        if not torch.equal(cra_answer, predicted):
+            raise RuntimeError("M1 WHERE was not conditioned on the actual CRA QA prediction.")
+        temporal = model_outputs["qbound_v38_m1_temporal_by_view"]
+        posteriors = model_outputs["qbound_v38_m1_event_posteriors"]
+        fallback = bank["bank_fallback"]
+        tail_windows = bank["event_valid_mask"] & bank["event_end_exclusive"].eq(
+            bank["bank_video_lengths"][:, None]
+        )
+        state["mil_correct"] += int(mil_answer.eq(labels).sum())
+        state["mil_agreement"] += int(mil_answer.eq(predicted).sum())
+        state["fallback"] += int(fallback.sum())
+        state["tail_count"] += int((~fallback).sum())
+        arrays = {}
+        for view in self.M1_VIEWS:
+            arrays[view] = temporal[view].detach().cpu().tolist()
+            tail_mass = (posteriors[view] * tail_windows).sum(dim=-1)
+            state["tail_sum"][view] += float(tail_mass[~fallback].sum())
+        if dump:
+            steps = {
+                "start": bank["event_start"], "end_exclusive": bank["event_end_exclusive"],
+                "width": bank["event_width"], "bank_prior": bank["bank_prior_weights"],
+                "ring_valid_steps": bank["event_ring_valid_steps"],
+                "prior_question": posteriors["question_only"],
+                "posterior_cra_answer": posteriors["cra_answer_conditional"],
+                "posterior_mil_answer": posteriors["mil_answer_conditional"],
+                "posterior_by_answer": evidence["event_posterior_by_answer"],
+                "question_in_scores": evidence["event_question_in_scores"],
+                "question_contrast_scores": evidence["event_question_contrast_scores"],
+                "answer_in_scores": evidence["event_answer_in_scores"],
+                "answer_contrast_scores": evidence["event_answer_contrast_scores"],
+            }
+            steps = {k: v.detach().cpu().tolist() for k, v in steps.items()}
+            mask_rows = bank["event_valid_mask"].cpu().tolist()
+            lengths = bank["bank_video_lengths"].cpu().tolist()
+            fallbacks = fallback.cpu().tolist()
+            mil_scores = evidence["event_mil_answer_scores"].detach().cpu().tolist()
+        for i, qid in enumerate(qids):
+            for view in self.M1_VIEWS:
+                by_qid = state["temporal"][view]
+                if qid in by_qid:
+                    raise ValueError(f"Duplicate M1 eval question_id: {qid}")
+                by_qid[qid] = arrays[view][i]
+            if dump:
+                valid_idx = [j for j, keep in enumerate(mask_rows[i]) if keep]
+                state["metadata"][qid] = {
+                    **{k: [value[i][j] for j in valid_idx] for k, value in steps.items()},
+                    "valid_mask": [True] * len(valid_idx),
+                    "valid_length": int(lengths[i]),
+                    "fallback": bool(fallbacks[i]),
+                    "cra_predicted_answer": int(cra_answer[i]),
+                    "mil_predicted_answer": int(mil_answer[i]),
+                    "mil_answer_scores": mil_scores[i],
+                }
+
+    @classmethod
+    def _m1_bank_rank_audit(cls, metadata, gt, segments):
+        """Match M0's midpoint audit, not the legacy sample-endpoint oracle."""
+        totals = collections.Counter()
+        for qid, meta in metadata.items():
+            if meta["fallback"]:
+                totals["Fallback"] += 1
+                continue
+            try:
+                vid = cls._r1_key_video_id(qid)
+                info = gt[vid]
+                target = np.asarray(info["location"][str(qid).split("_", 1)[1]], dtype=np.float64).reshape(-1, 2)
+                times = np.asarray(segments[vid], dtype=np.float64).reshape(-1)
+                duration = float(info.get("duration", info.get("duration_s")))
+            except (KeyError, IndexError, ValueError, TypeError):
+                totals["Unresolved"] += 1
+                continue
+            length = meta["valid_length"]
+            if (times.size < length or target.size == 0 or not np.isfinite(target).all()
+                    or not np.isfinite(duration) or np.any(target[:, 1] <= target[:, 0])):
+                totals["Unresolved"] += 1
+                continue
+            times = times[:length]
+            if (not np.isfinite(times).all() or times[0] < 0 or times[-1] > duration
+                    or np.any(np.diff(times) <= 0)):
+                totals["Unresolved"] += 1
+                continue
+            edges = np.r_[0.0, (times[:-1] + times[1:]) / 2.0, duration]
+            starts, ends = edges[np.asarray(meta["start"])], edges[np.asarray(meta["end_exclusive"])]
+            inter = np.maximum(0.0, np.minimum(ends[:, None], target[:, 1]) - np.maximum(starts[:, None], target[:, 0]))
+            union = ends[:, None] - starts[:, None] + target[:, 1] - target[:, 0] - inter
+            iou = (inter / np.maximum(union, 1e-12)).max(axis=1)
+            good = iou >= 0.3
+            totals["Resolved"] += 1
+            totals["OracleIoU03"] += int(good.any())
+            totals["OracleIoU05"] += int((iou >= 0.5).any())
+            for name, key in (("Question", "prior_question"), ("CRA", "posterior_cra_answer"), ("MIL", "posterior_mil_answer")):
+                p = np.asarray(meta[key])
+                top_idx = int(np.argmax(p))
+                top_ties = np.isclose(p, p[top_idx], rtol=1e-7, atol=1e-12)
+                if not (good[top_ties].any() and (~good[top_ties]).any()):
+                    totals[f"{name}Top1Resolved"] += 1
+                    totals[f"{name}Top1IoU03"] += int(good[top_idx])
+                totals[f"{name}GTMass03"] += float(p[good].sum())
+                if not good.any():
+                    continue
+                best_good = p[good].max()
+                totals[f"{name}Rank"] += 1 + int(((p > best_good) & ~np.isclose(p, best_good, rtol=1e-7, atol=1e-12)).sum())
+        n = totals["Resolved"]
+        oracle_n = totals["OracleIoU03"]
+        out = {
+            "V38M1BankResolvedCount": float(n),
+            "V38M1BankUnresolvedCount": float(totals["Unresolved"]),
+            "V38M1BankFallbackCount": float(totals["Fallback"]),
+        }
+        if n:
+            out["V38M1BankOracleIoU03"] = oracle_n / n
+            out["V38M1BankOracleIoU05"] = totals["OracleIoU05"] / n
+        if n:
+            for name in ("Question", "CRA", "MIL"):
+                top_n = totals[f"{name}Top1Resolved"]
+                if top_n:
+                    out[f"V38M1Bank{name}Top1IoU03"] = totals[f"{name}Top1IoU03"] / top_n
+                out[f"V38M1Bank{name}Top1ResolvedCount"] = float(top_n)
+                if oracle_n:
+                    out[f"V38M1Bank{name}GTRankMean"] = totals[f"{name}Rank"] / oracle_n
+                out[f"V38M1Bank{name}GTMass03"] = totals[f"{name}GTMass03"] / n
+        return out
+
+    def _m1_finish_eval(self, state, score, count, results, old_spans, gt, segments, questions):
+        spans_by_view = {"old_support": old_spans}
+        for view, temporal in state["temporal"].items():
+            if set(temporal) != set(results):
+                raise RuntimeError(f"M1 {view} does not cover the same questions as CRA.")
+            spans = self.metric.generate_ground(temporal, segments, questions)
+            if set(spans) != set(results):
+                raise RuntimeError(f"M1 {view} decoder did not return all evaluation spans.")
+            spans_by_view[view] = spans
+            # Use CRA's answers for every WHERE view. MIL's own QA accuracy
+            # is logged separately, never used for checkpoint selection.
+            score[f"v38_m1_{view}_post-hoc"] = self.metric(spans, gt, results, gs=False)
+            prefix = "V38M1" + view.title().replace("_", "")
+            score.update(self._r1_span_diagnostics(spans, prefix))
+            if callable(getattr(self.metric, "temporal_key_metrics", None)):
+                score.update(self.metric.temporal_key_metrics(temporal, gt, segments, prefix=prefix))
+            if state["tail_count"]:
+                score[f"v38_m1_{view}_tail_mass_nonfallback"] = state["tail_sum"][view] / state["tail_count"]
+        score[self.M1_MONITOR] = float(score["v38_m1_cra_answer_conditional_post-hoc"]["Acc&GQA"])
+        score["v38_m1_mil_acc"] = state["mil_correct"] / count
+        score["v38_m1_qa_agreement"] = state["mil_agreement"] / count
+        score["v38_m1_bank_fallback_fraction"] = state["fallback"] / count
+        if state["metadata"]:
+            score.update(self._m1_bank_rank_audit(state["metadata"], gt, segments))
+        return spans_by_view
+
+    def _configure_m2_mbr_eval(self):
+        options = self._qbound_config().get("m2_mbr", {}) if self._qbound_enabled() else {}
+        if not isinstance(options, dict):
+            raise TypeError("model.qbound.m2_mbr must be a mapping.")
+        defaults = {"enabled": False, "references": True, "compare_steps": True, "learned": False}
+        unknown = set(options) - set(defaults)
+        if unknown:
+            raise ValueError(f"Unknown model.qbound.m2_mbr options: {sorted(unknown)}")
+        cfg = {**defaults, **options}
+        for key, value in cfg.items():
+            if type(value) is not bool:
+                raise TypeError(f"model.qbound.m2_mbr.{key} must be a boolean.")
+        if not cfg["enabled"]:
+            return cfg, None
+        if not self.v38_m1_enabled or str(self.cfgs["dataset"]["name"]).lower() != "nextgqa":
+            raise ValueError("M2 MBR evaluation requires NExT-GQA and the 3.8-m1 backbone.")
+        if not (cfg["references"] or cfg["learned"]):
+            raise ValueError("M2 MBR requires at least one evaluation arm.")
+        # Deferred import: old configurations do not need the new companion.
+        from . import m2_mbr
+        return cfg, m2_mbr
+
+    def _m2_mbr_collect_batch(self, state, model_outputs, qids, prediction):
+        """Collect only inference inputs. QA labels and timestamps do not enter here."""
+        mbr = self._m2_mbr
+        cfg = self._m2_mbr_config
+        bank, evidence = self._m1_outputs(model_outputs)
+        batch_size = len(qids)
+        mask = bank["bank_video_mask"].detach().cpu().numpy()
+        cra_answer = model_outputs["qbound_v38_m1_cra_answer"].detach().cpu()
+        if cra_answer.shape != (batch_size,) or not torch.equal(cra_answer, prediction):
+            raise RuntimeError("M2 MBR requires the unchanged CRA QA predictions.")
+        answers = cra_answer.numpy()
+        if mask.shape != (batch_size, mbr.T) or mask.dtype.kind != "b":
+            raise ValueError("M2 MBR expects a boolean [B,32] M1 video mask.")
+
+        standard = mask.all(axis=1)
+        if cfg["references"]:
+            start = bank["event_start"].detach().cpu().numpy()
+            end = bank["event_end_exclusive"].detach().cpu().numpy()
+            valid = bank["event_valid_mask"].detach().cpu().numpy()
+            q = evidence["event_question_in_scores"].detach().cpu().numpy()
+            a = evidence["event_answer_in_scores"].detach().cpu().numpy()
+            if (
+                start.shape != end.shape or start.shape != valid.shape
+                or start.ndim != 2 or start.shape[0] != batch_size
+                or valid.dtype.kind != "b" or start.dtype.kind not in "iu" or end.dtype.kind not in "iu"
+                or q.shape != start.shape or a.shape != (*start.shape, 5)
+            ):
+                raise ValueError("M2 reference inputs do not match the M1 [B,W,6] inside-score contract.")
+        if cfg["learned"]:
+            logits_t = model_outputs.get("qbound_v38_m2_span_logits")
+            bounds_t = model_outputs.get("qbound_v38_m2_span_bounds")
+            if not torch.is_tensor(logits_t) or not torch.is_tensor(bounds_t):
+                raise RuntimeError(
+                    "M2 learned evaluation is not wired yet: CRA must emit "
+                    "qbound_v38_m2_span_logits and qbound_v38_m2_span_bounds. "
+                    "Use m2_mbr.learned=false for the C2/C4 reference run."
+                )
+            logits = logits_t.detach().cpu()
+            if logits.dtype in (torch.float16, torch.bfloat16):
+                logits = logits.float()
+            logits = logits.numpy()
+            bounds = bounds_t.detach().cpu().numpy()
+            # Shared geometry for all batch rows. No candidate filtering by the scorer.
+            if (
+                logits.shape != (batch_size, mbr.N_SPANS)
+                or bounds.dtype.kind not in "iu"
+                or not np.array_equal(bounds, mbr.SPAN_BOUNDS)
+            ):
+                raise ValueError("M2 scorer must emit [B,496] logits and the canonical [496,2] bounds.")
+
+        for i, raw_kid in enumerate(qids):
+            kid = str(raw_kid)
+            if kid in state["rows"] or kid in state["excluded"]:
+                raise ValueError(f"Duplicate M2 MBR question key: {kid}")
+            if not standard[i]:
+                # Never silently fill missing M2 results with legacy predictions.
+                state["excluded"][kid] = "nonstandard_video_length"
+                continue
+            row = {"cra_answer": int(answers[i])}
+            if cfg["references"]:
+                active = valid[i]
+                bb = np.column_stack((start[i, active], end[i, active]))
+                if not np.array_equal(bb, mbr.BANK_BOUNDS):
+                    state["excluded"][kid] = "noncanonical_m1_bank"
+                    continue
+                inside = np.column_stack((q[i, active], a[i, active]))
+                if not np.isfinite(inside).all():
+                    raise ValueError(f"Non-finite M1 reference scores at {kid}.")
+                row["inside"] = inside
+            if cfg["learned"]:
+                if not np.isfinite(logits[i]).all():
+                    raise ValueError(f"Non-finite M2 span logits at {kid}.")
+                row["logits"] = logits[i].copy()
+            state["rows"][kid] = row
+
+    def _m2_mbr_decode(self, state, segments, questions):
+        """Decode without reading GT or QA labels. Group seconds utilities by video."""
+        mbr = self._m2_mbr
+        cfg = self._m2_mbr_config
+        skipped = dict(state["excluded"])
+        names = (["c2", "c4"] if cfg["references"] else []) + (["learned"] if cfg["learned"] else [])
+        modes = ("seconds", "steps") if cfg["compare_steps"] else ("seconds",)
+        views = {f"{name}_{mode}": {} for name in names for mode in modes}
+        detail = {view: {} for view in views}
+        question_text = {}
+        if cfg["references"]:
+            required = {"video_id", "qid", "question"}
+            if not required.issubset(questions.columns):
+                raise ValueError(f"M2 C2/C4 require CSV columns: {sorted(required)}.")
+            for vid, qid, question in questions[["video_id", "qid", "question"]].itertuples(
+                index=False, name=None,
+            ):
+                kid = f"{vid}_{qid}"
+                if kid in question_text:
+                    raise ValueError(f"Duplicate M2 CSV question key: {kid}")
+                question_text[kid] = question
+
+        accepted = []
+        video_times = {}
+        for kid in sorted(state["rows"]):
+            vid = self._r1_key_video_id(kid)
+            if vid not in video_times:
+                try:
+                    video_times[vid] = mbr.validate_timestamps(segments[vid])
+                except (KeyError, TypeError, ValueError):
+                    video_times[vid] = None
+            if video_times[vid] is None:
+                skipped[kid] = "missing_or_invalid_sample_centers"
+                continue
+            q = question_text.get(kid)
+            if cfg["references"] and (not isinstance(q, str) or not q.strip()):
+                skipped[kid] = "missing_question_text"
+                continue
+            accepted.append((kid, vid))
+        if not accepted:
+            return views, detail, skipped
+
+        rows = [state["rows"][kid] for kid, _ in accepted]
+        p = {}
+        if cfg["references"]:
+            p.update(mbr.locked_reference_probabilities(
+                np.stack([row["inside"] for row in rows]),
+                np.asarray([row["cra_answer"] for row in rows], dtype=np.int64),
+                [question_text[kid] for kid, _ in accepted],
+            ))
+        if cfg["learned"]:
+            p["learned"] = mbr.interval_probabilities(np.stack([row["logits"] for row in rows]))
+
+        def record(view, indices, bounds, utilities):
+            for k, span, utility in zip(indices, bounds, utilities):
+                kid, vid = accepted[k]
+                s, e = map(int, span)
+                ts = video_times[vid]
+                seconds = [float(ts[s]), float(ts[e - 1])]
+                views[view][kid] = seconds
+                detail[view][kid] = {
+                    "s_step": s, "e_step_exclusive": e, "span_seconds": seconds,
+                    "expected_utility": float(utility), "cra_answer": rows[k]["cra_answer"],
+                }
+
+        video_rows = collections.defaultdict(list)
+        for i, (_, vid) in enumerate(accepted):
+            video_rows[vid].append(i)
+        if cfg["compare_steps"]:
+            # Keep the batch arithmetic/layout of the locked replay on the step arm.
+            for name, probabilities in p.items():
+                record(f"{name}_steps", range(len(accepted)), *mbr.select(probabilities))
+        for vid, indices in video_rows.items():
+            times = video_times[vid]
+            together = np.concatenate([p[name][indices] for name in names], axis=0)
+            bounds, utilities = mbr.select(together, timestamps=times)
+            for i, name in enumerate(names):
+                part = slice(i * len(indices), (i + 1) * len(indices))
+                record(f"{name}_seconds", indices, bounds[part], utilities[part])
+        return views, detail, skipped
+
+    def _m2_mbr_finish_eval(self, state, score, results, gt, segments, questions):
+        """Keep the evaluator intact; add audit-only GQA-cov and exact denominators."""
+        spans, detail, skipped = self._m2_mbr_decode(state, segments, questions)
+        received = len(state["rows"]) + len(state["excluded"])
+        base = {"n_received": received, "n_decoded": 0, "n_scored": 0}
+        for view, predictions in spans.items():
+            n_scored, cov_hits = 0, 0
+            for vid, annotation in gt.items():
+                for qid, alternatives in annotation["location"].items():
+                    kid = f"{vid}_{qid}"
+                    if kid not in predictions:
+                        continue
+                    if kid not in results:
+                        raise RuntimeError(f"M2 interval has no CRA answer at {kid}.")
+                    row = detail[view][kid]
+                    qa = results[kid]
+                    if qa["prediction"] != row["cra_answer"]:
+                        raise RuntimeError(f"M2 interval used a different CRA answer at {kid}.")
+                    n_scored += 1
+                    matched = False
+                    for loc in alternatives:
+                        iou, iop = self.metric.get_tIoU(loc, predictions[kid])
+                        if iou >= 0.30 and iop >= 0.50:
+                            matched = True
+                            break
+                    hit = int(matched and qa["prediction"] == qa["answer"])
+                    cov_hits += hit
+                    row["gqa_cov_hit"] = hit
+            # Do not report a zero percentage when the branch has no scored rows.
+            if n_scored:
+                official = dict(self.metric(predictions, gt, results, gs=False))
+                official["GQA-cov"] = 100.0 * cov_hits / n_scored
+                official["n_scored"] = n_scored
+                official["n_decoded"] = len(predictions)
+                score[f"v38_m2_mbr_{view}"] = official
+            base["n_decoded"] = len(predictions)
+            base["n_scored"] = n_scored
+        base["n_excluded_before_scoring"] = len(skipped)
+        base["n_decoded_without_gt_row"] = base["n_decoded"] - base["n_scored"]
+        for reason, n in sorted(collections.Counter(skipped.values()).items()):
+            base[f"excluded_{reason}"] = n
+        score["v38_m2_mbr_coverage"] = base
+        return {
+            "v38_m2_mbr_spans": spans,
+            "v38_m2_mbr_diagnostics": detail,
+            "v38_m2_mbr_excluded": skipped,
+            "v38_m2_mbr_qa_prediction_source": "cra",
+        }
+
     def eval(
         self,
         data_loader,
         epoch=None,
         save=False,
     ):
-        del epoch, save
+        del epoch
 
         self.model.eval()
         device = self._model_device()
@@ -1867,7 +3404,31 @@ class CRAPipeline(BasePipeline):
         qbound_seed_keyframe = {}
         qbound_support_keyframe = {}
         cra_keyframe = {}
+        selected_frame_bounds = {}
+        learned_edge_by_qid = {}
+        used_edge_by_qid = {}
+        edge_surprise_by_qid = {}
 
+        # M0: independent answer and grounding views, NEVER replacing old CRA.
+        v38_view_names = (
+            "question_only", "joint_marginal", "predicted_answer_conditional"
+        )
+        v38_temporal_by_view = {name: {} for name in v38_view_names}
+        v38_evidence_results = {}
+        v38_event_metadata = {}  # Included in validation dumps when save=True.
+        v38_correct = 0
+        v38_agreement = 0
+        v38_fallback = 0
+        v38_eligible = 0
+        m1_state = None
+        if self.v38_m1_enabled:
+            m1_state = {
+                "temporal": {view: {} for view in self.M1_VIEWS}, "metadata": {},
+                "mil_correct": 0, "mil_agreement": 0, "fallback": 0,
+                "tail_count": 0, "tail_sum": collections.Counter(),
+            }
+
+        m2_state = {"rows": {}, "excluded": {}} if self._m2_mbr is not None else None
         qbound_stat_sums = collections.defaultdict(float)
         qbound_stat_count = 0
         saw_time_param = False
@@ -1925,6 +3486,76 @@ class CRAPipeline(BasePipeline):
                 score["acc"] += (
                     predicted == labels_cpu
                 ).sum().item()
+                if m1_state is not None:
+                    self._m1_collect_eval_batch(
+                        m1_state, model_outputs, question_id, predicted, labels_cpu,
+                        dump=bool(save and data_loader.dataset.split == "val"),
+                    )
+
+                if m2_state is not None:
+                    self._m2_mbr_collect_batch(m2_state, model_outputs, question_id, predicted)
+
+                if self.v38_minimal_enabled:
+                    self._v38_outputs(model_outputs)
+                    v38_logits = model_outputs["qbound_v38_ev_qa_logits"]
+                    v38_predicted = v38_logits.argmax(dim=-1).detach().cpu()
+                    v38_correct += int((v38_predicted == labels_cpu).sum().item())
+                    v38_agreement += int((v38_predicted == predicted).sum().item())
+                    v38_bank = model_outputs["qbound_v38_bank"]
+                    v38_evidence = model_outputs["qbound_v38_evidence"]
+                    v38_fallback += int(v38_bank["bank_fallback"].sum().item())
+                    v38_eligible += int(v38_bank["bank_train_eligible"].sum().item())
+                    v38_arrays = {
+                        "question_only": model_outputs["qbound_v38_event_temporal_question"].detach().cpu().numpy(),
+                        "joint_marginal": model_outputs["qbound_v38_event_temporal_marginal"].detach().cpu().numpy(),
+                        "predicted_answer_conditional": model_outputs[
+                            "qbound_v38_event_temporal_conditional_pred"
+                        ].detach().cpu().numpy(),
+                    }
+                    # Store compact posterior/window metadata only for validation
+                    # dumps (not for test or gradient computation).
+                    if save:
+                        v38_meta_arrays = {
+                            "valid_mask": v38_bank["event_valid_mask"].detach().cpu().numpy(),
+                            "start": v38_bank["event_start"].detach().cpu().numpy(),
+                            "end_exclusive": v38_bank["event_end_exclusive"].detach().cpu().numpy(),
+                            "width": v38_bank["event_width"].detach().cpu().numpy(),
+                            "bank_prior": v38_bank["bank_prior_weights"].detach().cpu().numpy(),
+                            "prior_question": v38_evidence["event_posterior_question"].detach().cpu().numpy(),
+                            "posterior_marginal": v38_evidence["event_posterior_marginal"].detach().cpu().numpy(),
+                            "posterior_conditional": v38_evidence[
+                                "event_posterior_conditional_pred"
+                            ].detach().cpu().numpy(),
+                            "answer_posterior": v38_evidence["event_qa_posterior"].detach().cpu().numpy(),
+                            "coverage_bias": v38_bank["bank_prior_temporal_bias"].detach().cpu().numpy(),
+                            "fallback": v38_bank["bank_fallback"].detach().cpu().numpy(),
+                            "valid_length": v38_bank["bank_video_lengths"].detach().cpu().numpy(),
+                        }
+                        if self.v38_settings["dump_joint_matrices"]:
+                            v38_meta_arrays["joint_posterior"] = (
+                                v38_evidence["event_joint_posterior"].detach().cpu().numpy()
+                            )
+                            v38_meta_arrays["interaction_centered"] = (
+                                v38_evidence["event_interaction_centered"].detach().cpu().numpy()
+                            )
+                    for sample_index, qid in enumerate(question_id):
+                        v38_evidence_results[qid] = {
+                            "prediction": int(v38_predicted[sample_index].item()),
+                            "answer": int(labels_cpu[sample_index].item()),
+                        }
+                        for view_name, array in v38_arrays.items():
+                            v38_temporal_by_view[view_name][qid] = array[sample_index].tolist()
+                        if save:
+                            valid_count = int(v38_meta_arrays["valid_mask"][sample_index].sum())
+                            v38_event_metadata[qid] = {
+                                name: (value[sample_index, :valid_count].tolist()
+                                       if name in ("valid_mask", "start", "end_exclusive",
+                                                   "width", "bank_prior", "prior_question",
+                                                   "posterior_marginal", "posterior_conditional",
+                                                   "joint_posterior", "interaction_centered")
+                                       else value[sample_index].tolist())
+                                for name, value in v38_meta_arrays.items()
+                            }
 
                 time_param = model_outputs.get("time_param")
                 qbound_aux = self._get_qbound_aux(gqa_output)
@@ -1950,6 +3581,10 @@ class CRAPipeline(BasePipeline):
                 batch_seed_key = None
                 batch_support_key = None
                 batch_cra_key = None
+                batch_frame_bounds = None
+                batch_learned_edge = None
+                batch_used_edge = None
+                batch_edge_surprise = None
 
                 if isinstance(time_param, dict):
                     start_time = time_param["start"].detach().cpu().numpy()
@@ -1965,6 +3600,24 @@ class CRAPipeline(BasePipeline):
                     support_key = qbound_aux.get("support_temporal_prob")
                     cra_key = qbound_aux.get("cra_key")
                     mask = qbound_aux.get("video_mask")
+                    # Preserve both learned edges and edges actually passed to
+                    # propagation. This distinguishes graph learning from smoothing.
+                    learned_edge = qbound_aux.get("support_edge_affinity_raw")
+                    used_edge = qbound_aux.get("support_edge_affinity")
+                    surprise = qbound_aux.get("support_edge_surprise")
+                    if self.r2_predictor_enabled and torch.is_tensor(learned_edge):
+                        batch_learned_edge = learned_edge.detach().cpu().numpy()
+                    if torch.is_tensor(used_edge):
+                        batch_used_edge = used_edge.detach().cpu().numpy()
+                    if self.r2_predictor_enabled and torch.is_tensor(surprise):
+                        batch_edge_surprise = surprise.detach().cpu().numpy()
+                    start_idx = qbound_aux.get("selected_span_start_frame")
+                    end_idx = qbound_aux.get("selected_span_end_frame")
+                    if torch.is_tensor(start_idx) and torch.is_tensor(end_idx):
+                        batch_frame_bounds = np.column_stack((
+                            start_idx.detach().cpu().numpy(),
+                            end_idx.detach().cpu().numpy(),
+                        ))
                     if torch.is_tensor(seed_key):
                         batch_seed_key = self._normalize_distribution(
                             seed_key.detach(), mask=mask
@@ -1978,6 +3631,16 @@ class CRAPipeline(BasePipeline):
                             cra_key.detach(), mask=mask
                         ).cpu().numpy()
 
+                # The original CRA post-hoc decoder must see the same Support
+                # Field used for ground/QA. Any future divergence invalidates R1/R2.
+                if self._qbound_enabled() and batch_support_key is not None:
+                    if not np.allclose(
+                        video_attention, batch_support_key, atol=1e-5, rtol=1e-5
+                    ):
+                        raise RuntimeError(
+                            "R2 protocol broken: model_outputs['fatt'] differs "
+                            "from the Q-Bound Support Field used by QA."
+                        )
                 predicted_np = predicted.numpy()
                 labels_np = labels_cpu.numpy()
                 for batch_index, qid in enumerate(question_id):
@@ -2002,6 +3665,17 @@ class CRAPipeline(BasePipeline):
                         )
                     if batch_cra_key is not None:
                         cra_keyframe[qid] = batch_cra_key[batch_index].tolist()
+                    if batch_frame_bounds is not None:
+                        selected_frame_bounds[qid] = [
+                            int(batch_frame_bounds[batch_index][0]),
+                            int(batch_frame_bounds[batch_index][1]),
+                        ]
+                    if batch_learned_edge is not None:
+                        learned_edge_by_qid[qid] = batch_learned_edge[batch_index].tolist()
+                    if batch_used_edge is not None:
+                        used_edge_by_qid[qid] = batch_used_edge[batch_index].tolist()
+                    if batch_edge_surprise is not None:
+                        edge_surprise_by_qid[qid] = batch_edge_surprise[batch_index].tolist()
 
                 progress = float(index + 1) / len(data_loader)
                 print(f"\rProgress: {progress:.2%}", end="", flush=True)
@@ -2009,6 +3683,11 @@ class CRAPipeline(BasePipeline):
         if count == 0:
             raise RuntimeError("Evaluation data loader is empty.")
         score["acc"] /= count
+        if self.v38_minimal_enabled:
+            score["v38_evqa_acc"] = v38_correct / count
+            score["v38_qa_agreement"] = v38_agreement / count
+            score["v38_bank_fallback_fraction"] = v38_fallback / count
+            score["v38_event_train_eligible_fraction"] = v38_eligible / count
         if qbound_stat_count > 0:
             for name, total in qbound_stat_sums.items():
                 score[name] = total / qbound_stat_count
@@ -2029,6 +3708,34 @@ class CRAPipeline(BasePipeline):
         score["post-hoc"] = self.metric(
             post_hoc_ground, ground_truth, results, gs=False
         )
+        if self._qbound_enabled():
+            # R1 diagnostics ONLY. The canonical post-hoc decoder above is
+            # unchanged and remains the sole checkpoint-selection reference.
+            post_hoc_leftfix = {}
+            for qid in post_hoc_ground:
+                vid = self._r1_key_video_id(qid)
+                post_hoc_leftfix[qid] = self._r1_posthoc_frame0_fixed(
+                    ground_res[qid], segments[vid]
+                )
+            score["post-hoc-leftfix"] = self.metric(
+                post_hoc_leftfix, ground_truth, results, gs=False
+            )
+            score.update(self._r1_span_diagnostics(
+                post_hoc_ground, "QBoundPosthoc"
+            ))
+
+            seed_post_hoc = self.metric.generate_ground(
+                qbound_seed_keyframe, segments, questions
+            )
+            score["seed-post-hoc"] = self.metric(
+                seed_post_hoc, ground_truth, results, gs=False
+            )
+            score.update(self._r1_span_diagnostics(
+                seed_post_hoc, "QBoundSeedPosthoc"
+            ))
+        else:
+            post_hoc_leftfix = {}
+            seed_post_hoc = {}
 
         if qbound_support_keyframe:
             if not hasattr(self.metric, "temporal_key_metrics"):
@@ -2073,6 +3780,46 @@ class CRAPipeline(BasePipeline):
                 )
             )
 
+        v38_posthoc_spans = {}
+        if self.v38_minimal_enabled:
+            for view_name, temporal_by_qid in v38_temporal_by_view.items():
+                if set(temporal_by_qid) != set(results):
+                    raise RuntimeError(f"M0 {view_name} is missing validation/test examples.")
+                # EXACT same external R1 generate_ground implementation, same
+                # timestamps/queries as old-support post_hoc_ground.
+                event_spans = self.metric.generate_ground(
+                    temporal_by_qid, segments, questions
+                )
+                v38_posthoc_spans[view_name] = event_spans
+                score[f"v38_{view_name}_post-hoc"] = self.metric(
+                    event_spans, ground_truth, v38_evidence_results, gs=False
+                )
+                prefix = {
+                    "question_only": "QBoundV38Question",
+                    "joint_marginal": "QBoundV38Marginal",
+                    "predicted_answer_conditional": "QBoundV38Conditional",
+                }[view_name]
+                if hasattr(self.metric, "temporal_key_metrics"):
+                    score.update(self.metric.temporal_key_metrics(
+                        temporal_by_qid, ground_truth, segments, prefix=prefix
+                    ))
+                score.update(self._r1_span_diagnostics(
+                    event_spans, f"V38{view_name.title().replace('_', '')}R1"
+                ))
+                score.update(self._v38_span_failure_audit(
+                    event_spans, ground_truth, v38_evidence_results,
+                    f"V38{view_name.title().replace('_', '')}"
+                ))
+            # Isolate WHERE improvements from the effect of a different QA head.
+            score["v38_marginal_craqa_post-hoc"] = self.metric(
+                v38_posthoc_spans["joint_marginal"], ground_truth,
+                results, gs=False
+            )
+            if save:
+                score.update(self._v38_oracle_bank_audit(
+                    v38_event_metadata, ground_truth, segments
+                ))
+
         result = {
             "ph": post_hoc_ground,
             "result": results,
@@ -2083,7 +3830,44 @@ class CRAPipeline(BasePipeline):
             # Compatibility: qbound_key now means the continuous support.
             "qbound_key": qbound_support_keyframe,
             "cra_key": cra_keyframe,
+            "ph_r1_leftfix": post_hoc_leftfix,
+            "ph_seed": seed_post_hoc,
+            "qbound_edge_affinity_learned": learned_edge_by_qid,
+            "qbound_edge_affinity_used": used_edge_by_qid,
+            "qbound_edge_surprise": edge_surprise_by_qid,
+            "qbound_graph_mode": self.r2_graph_mode,
         }
+
+        if m1_state is not None:
+            spans = self._m1_finish_eval(
+                m1_state, score, count, results, post_hoc_ground,
+                ground_truth, segments, questions,
+            )
+            result.update({
+                "v38_m1_temporal_by_view": {"old_support": ground_res, **m1_state["temporal"]},
+                "v38_m1_posthoc_spans": spans,
+                "v38_m1_event_metadata": m1_state["metadata"],
+                "v38_m1_selected_grounding_view": "cra_answer_conditional",
+                "v38_m1_qa_prediction_source": "cra",
+            })
+
+        if m2_state is not None:
+            result.update(self._m2_mbr_finish_eval(
+                m2_state, score, results, ground_truth, segments, questions,
+            ))
+
+        if self.v38_minimal_enabled:
+            result.update({
+                "v38_evidence_answer_results": v38_evidence_results,
+                "v38_temporal_by_view": v38_temporal_by_view,
+                "v38_posthoc_spans": v38_posthoc_spans,
+                "v38_event_metadata": v38_event_metadata if save else {},
+                "v38_experiment_version": "3.8-minimal",
+                "v38_training_phase": self.v38_settings["phase"],
+                "v38_selected_grounding_posterior": "joint_marginal",
+                "v38_qa_prediction_source": "evidence-only",
+                "v38_legacy_cra_results_preserved": True,
+            })
 
         if saw_time_param and ground_pre:
             score["pre-hoc"] = self.metric(
@@ -2105,6 +3889,35 @@ class CRAPipeline(BasePipeline):
                 merge_ground, ground_truth, results, gs=False
             )
             result["merge"] = merge_ground
+
+            # R1 timestamp control: use SAME rounded barycenter frame indices
+            # that generated tg, mapped to actual sampled-frame timestamps.
+            # Do not change the canonical normalized-time pre-hoc metric.
+            if self._qbound_enabled():
+                ground_pre_timestamp = {}
+                for qid, bounds in selected_frame_bounds.items():
+                    vid = self._r1_key_video_id(qid)
+                    times = np.asarray(segments[vid], dtype=np.float64).reshape(-1)
+                    support_size = len(qbound_support_keyframe[qid])
+                    if times.size != support_size:
+                        raise ValueError(
+                            f"R1 timestamps vs Support Field mismatch at {qid}: "
+                            f"{times.size} timestamps, {support_size} frames."
+                        )
+                    start_idx, end_idx = bounds
+                    if not (0 <= start_idx <= end_idx < times.size):
+                        raise RuntimeError(f"Invalid barycenter indices for {qid}.")
+                    ground_pre_timestamp[qid] = [
+                        float(times[start_idx]), float(times[end_idx])
+                    ]
+                if len(ground_pre_timestamp) != len(ground_pre):
+                    raise RuntimeError(
+                        "R1 timestamp diagnostic lacks some pre-hoc predictions."
+                    )
+                score["pre-hoc-timestamp"] = self.metric(
+                    ground_pre_timestamp, ground_truth, results, gs=False
+                )
+                result["tg_timestamp"] = ground_pre_timestamp
 
         return score, result
 
