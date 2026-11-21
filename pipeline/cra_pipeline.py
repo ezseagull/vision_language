@@ -1,4 +1,5 @@
 import collections
+import json
 import os
 import re
 import time
@@ -127,6 +128,8 @@ class CRAPipeline(BasePipeline):
         # This step adds evaluation only. It does not change the train loss,
         # parameter groups, legacy checkpoint selection, or CRA answer.
         self._m2_mbr_config, self._m2_mbr = self._configure_m2_mbr_eval()
+        if self._m2_mbr is not None:
+            self._m2_preflight_full_splits()
 
         if self._qbound_enabled():
             model_cfg = self.cfgs.get("model", {})
@@ -2443,6 +2446,54 @@ class CRAPipeline(BasePipeline):
             f"{prefix}MeanLengthSeconds": float(np.mean(lengths)),
         }
 
+    def _m2_write_full_scores(self, val_score, test_score, epoch=None):
+        """Export exactly the same validated C4 scores printed and logged to W&B."""
+        if self._m2_mbr is None or not self._m2_mbr_config["references"]:
+            return None
+        both = {"val": val_score, "test": test_score}
+        report = {
+            "experiment": "Q-Bound V3.8-M2 C4+MBR seconds",
+            "epoch": None if epoch is None else int(epoch),
+            "seed": int(self.cfgs["misc"]["seed"]),
+            "run": str(self.cfgs["misc"]["running_name"]),
+            "selection_rule": "validation only; test observed every epoch",
+            "checkpoint_for_inference": (str(self._m2_eval_checkpoint_path)
+                                         if self._m2_eval_checkpoint_path else None),
+            "scores": {},
+        }
+        for split, scores in both.items():
+            key = "v38_m2_mbr_c4_seconds"
+            value = scores.get(key)
+            if not isinstance(value, dict):
+                raise RuntimeError(f"Missing M2 C4+MBR seconds scores for {split}.")
+            needed = 3358 if split == "val" else 5553
+            if int(value.get("n_scored", -1)) != needed or int(value.get("n_expected", -1)) != needed:
+                raise RuntimeError(f"Refusing a non-full {split} M2 score export.")
+            report["scores"][split] = {k: float(v) for k, v in value.items()}
+        folder = os.path.join(self.save_dir, "benchmark_scores")
+        os.makedirs(folder, exist_ok=True)
+        name = (f"m2_c4_full_epoch_{int(epoch):02d}.json" if epoch is not None
+                else "m2_c4_full_inference.json")
+        path = os.path.join(folder, name)
+        with open(path, "w", encoding="utf-8") as stream:
+            json.dump(report, stream, ensure_ascii=False, indent=2)
+        print(f"[M2 full Val/Test metric export] {path}", flush=True)
+        return path
+
+    @staticmethod
+    def _m2_flatten_eval_metrics(split_scores):
+        """Canonical single-source names for W&B (shared train / infer)."""
+        scalars = {}
+        for split, metrics in split_scores.items():
+            for key, value in metrics.items():
+                if isinstance(value, dict):
+                    for sub_key, sub_value in value.items():
+                        if isinstance(sub_value, (int, float, np.integer, np.floating, bool)):
+                            scalars[f"{split}/{key}_{sub_key}"] = float(sub_value)
+                elif isinstance(value, (int, float, np.integer, np.floating, bool)):
+                    scalars[f"{split}/{key}"] = float(value)
+        return scalars
+
     def _train_epoch(self, epoch):
         self.monitor.log_info(
             f"\n{'#' * 20} Epoch "
@@ -2663,6 +2714,7 @@ class CRAPipeline(BasePipeline):
             print("Eval Stage: validation (CRA answer + M1 WHERE selection)")
         else:
             print("Eval Stage: validation (canonical R2-C/V3.5 model selection)")
+        self._m2_active_eval_epoch = epoch
         val_score, val_result = self.eval(
             self.val_dataloader, save=self.save_val_predictions
         )
@@ -2722,6 +2774,7 @@ class CRAPipeline(BasePipeline):
                 in test_score.items()
             },
         }
+        self._m2_write_full_scores(val_score, test_score, epoch=epoch)
         self.print_score(score)
 
         wandb_data = {
@@ -2755,33 +2808,11 @@ class CRAPipeline(BasePipeline):
                 f"train/{name}"
             ] = value
 
-        for (
-            split_name,
-            split_dict,
-        ) in (
-            ("val", val_score),
-            ("test", test_score),
-        ):
-            for (
-                key,
-                value,
-            ) in split_dict.items():
-                if isinstance(
-                    value,
-                    dict,
-                ):
-                    for (
-                        sub_key,
-                        sub_value,
-                    ) in value.items():
-                        wandb_data[
-                            f"{split_name}/"
-                            f"{key}_{sub_key}"
-                        ] = sub_value
-                else:
-                    wandb_data[
-                        f"{split_name}/{key}"
-                    ] = value
+        # The same flattening convention is used by train and infer.
+        # No partial C4 scores reach this point (coverage guard runs in eval).
+        wandb_data.update(self._m2_flatten_eval_metrics({
+            "val": val_score, "test": test_score,
+        }))
 
         wandb.log(
             wandb_data
@@ -2857,6 +2888,26 @@ class CRAPipeline(BasePipeline):
                     name = f"{split}_v38_m1_{view}_post-hoc"
                     if name in score:
                         self.monitor.log_info(f"\n{name} (CRA answers): {score[name]}")
+        if self._m2_mbr is not None:
+            self.monitor.log_info("\n=============== Q-Bound V3.8-M2: C4 + MBR (SECONDS) ===============")
+            primary = ("Acc&GQA", "Acc&VQA", "mIoP", "TIoP@0.3", "TIoP@0.5",
+                       "mIoU", "TIoU@0.3", "TIoU@0.5")
+            for split in ("val", "test"):
+                key = f"{split}_v38_m2_mbr_c4_seconds"
+                if key not in score:
+                    continue
+                values = score[key]
+                n = values["n_scored"]
+                expected = values["n_expected"]
+                if n != expected:
+                    raise RuntimeError(f"M2 {split} partial score reached print_score.")
+                self.monitor.log_info(
+                    f"\n{split.upper()} FULL: {n}/{expected} QA+spans+GT | "
+                    "QA=CRA; WHERE=C4 + MBR seconds | metric values are percentages")
+                self.monitor.log_info("\n" + " | ".join(
+                    f"{metric}: {values[metric]:.4f}" for metric in primary))
+                self.monitor.log_info(
+                    f"\nW&B prefix: {split}/v38_m2_mbr_c4_seconds_")
         qbound_keys = [
             key for key in score
             if key.startswith(("val_qbound_", "test_qbound_"))
@@ -3178,6 +3229,58 @@ class CRAPipeline(BasePipeline):
         from . import m2_mbr
         return cfg, m2_mbr
 
+    def _m2_preflight_full_splits(self):
+        """Cheap fail-before-training audit of native Val/Test timestamp metadata.
+
+        This checks the REAL sample centers from frame2time. It never builds
+        replacement timestamps or changes the 32-feature ordering. A decoder
+        may still reject noncanonical feature masks at inference; those cases
+        are diagnosed by the per-question full-coverage guard.
+        """
+        if not self._m2_mbr_config["references"]:
+            return
+        root = self.cfgs["dataset"]["csv_path"]
+        output_dir = os.path.join(self.save_dir, "coverage_audits")
+        os.makedirs(output_dir, exist_ok=True)
+        problems = {}
+        for split in ("val", "test"):
+            questions = load_file(os.path.join(root, f"{split}.csv"))
+            gt = load_file(os.path.join(root, f"gsub_{split}.json"))
+            times = load_file(os.path.join(root, f"frame2time_{split}.json"))
+            expected = self._m2_split_ids(questions, gt, split)
+            if not isinstance(times, dict):
+                raise TypeError(f"frame2time_{split}.json must be a JSON dictionary.")
+            rows = []
+            for vid, frame in questions.groupby("video_id", sort=False):
+                key = str(vid)
+                status, t = self._m2_mbr.timestamp_status(times.get(key))
+                if t is None:
+                    rows.append({"video_id": key, "status": status,
+                                 "n_questions": len(frame),
+                                 "question_ids": [f"{key}_{qid}" for qid in frame["qid"]]})
+            report = {
+                "split": split, "n_expected": len(expected),
+                "n_videos": int(questions["video_id"].nunique()),
+                "n_bad_videos": len(rows),
+                "n_questions_blocked_by_timestamps": sum(r["n_questions"] for r in rows),
+                "bad_videos": rows,
+                "policy": "no missing-value interpolation, sorting, or guessed timestamps",
+            }
+            path = os.path.join(output_dir, f"m2_preflight_{split}.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(report, handle, ensure_ascii=False, indent=2)
+            print(f"[M2 timestamp preflight] {split}: {len(expected)} question IDs; "
+                  f"bad_videos={len(rows)}, audit={path}", flush=True)
+            if rows:
+                problems[split] = path
+        if problems:
+            raise RuntimeError(
+                "M2 cannot certify full native Val/Test before training: "
+                f"missing/invalid REAL sampled-frame timestamps; audits={problems}. "
+                "Repair frame2time mappings from the actual feature sampler, "
+                "not by using a synthetic 32-point linspace."
+            )
+
     def _m2_mbr_collect_batch(self, state, model_outputs, qids, prediction):
         """Collect only inference inputs. QA labels and timestamps do not enter here."""
         mbr = self._m2_mbr
@@ -3277,15 +3380,15 @@ class CRAPipeline(BasePipeline):
 
         accepted = []
         video_times = {}
+        time_status = {}
         for kid in sorted(state["rows"]):
             vid = self._r1_key_video_id(kid)
             if vid not in video_times:
-                try:
-                    video_times[vid] = mbr.validate_timestamps(segments[vid])
-                except (KeyError, TypeError, ValueError):
-                    video_times[vid] = None
+                status, t = mbr.timestamp_status(segments.get(vid))
+                time_status[vid] = status
+                video_times[vid] = t
             if video_times[vid] is None:
-                skipped[kid] = "missing_or_invalid_sample_centers"
+                skipped[kid] = "timestamp_" + time_status[vid]
                 continue
             q = question_text.get(kid)
             if cfg["references"] and (not isinstance(q, str) or not q.strip()):
@@ -3334,25 +3437,111 @@ class CRAPipeline(BasePipeline):
                 record(f"{name}_seconds", indices, bounds[part], utilities[part])
         return views, detail, skipped
 
-    def _m2_mbr_finish_eval(self, state, score, results, gt, segments, questions):
-        """Keep the evaluator intact; add audit-only GQA-cov and exact denominators."""
+    @staticmethod
+    def _m2_split_ids(questions, gt, split):
+        """Compare native CSV question IDs with native GT annotations.
+
+        Do not infer the benchmark denominator from the subset decoded by MBR.
+        This guard is M2-only: old CRA/M1 evaluators remain unchanged.
+        """
+        if not {"video_id", "qid", "question"}.issubset(questions.columns):
+            raise ValueError(f"{split} CSV lacks video_id/qid/question columns.")
+        expected = [f"{vid}_{qid}" for vid, qid in
+                    questions[["video_id", "qid"]].itertuples(index=False, name=None)]
+        gt_ids = [f"{vid}_{qid}" for vid, anno in gt.items()
+                  for qid in anno["location"]]
+        if len(expected) != len(set(expected)) or len(gt_ids) != len(set(gt_ids)):
+            raise RuntimeError(f"M2 {split}: duplicate IDs in native split CSV or GT.")
+        reference_n = {"val": 3358, "test": 5553}.get(split)
+        if reference_n is not None and len(expected) != reference_n:
+            raise RuntimeError(
+                f"M2 {split}: split CSV has {len(expected)} questions, expected "
+                f"{reference_n} for the native NExT-GQA split. No score exported."
+            )
+        if set(expected) != set(gt_ids):
+            raise RuntimeError(
+                f"M2 {split}: CSV/GT ID mismatch: "
+                f"missing_GT={sorted(set(expected) - set(gt_ids))[:8]}, "
+                f"GT_only={sorted(set(gt_ids) - set(expected))[:8]}."
+            )
+        return set(expected)
+
+    def _m2_coverage_audit(self, *, split, expected, results, views, skipped):
+        """Write the failure reason to disk BEFORE refusing partial benchmark metrics."""
+        qa_ids = set(results)
+        states = {}
+        for view, predictions in views.items():
+            observed = set(predictions)
+            states[view] = {
+                "n_predicted": len(observed),
+                "n_missing": len(expected - observed),
+                "n_extra": len(observed - expected),
+                "missing_examples": sorted(expected - observed)[:50],
+                "extra_examples": sorted(observed - expected)[:50],
+            }
+        report = {
+            "split": split,
+            "experiment": "Q-Bound V3.8-M2 C4+MBR",
+            "expected_n": len(expected),
+            "qa_n": len(results),
+            "qa_missing_n": len(expected - qa_ids),
+            "qa_extra_n": len(qa_ids - expected),
+            "qa_missing_examples": sorted(expected - qa_ids)[:50],
+            "qa_extra_examples": sorted(qa_ids - expected)[:50],
+            "decoded": states,
+            "excluded_by_reason": dict(sorted(collections.Counter(skipped.values()).items())),
+            "excluded_by_qid": dict(sorted(skipped.items())),
+            "checkpoint_selection": "validation only",
+            "complete": (qa_ids == expected and all(
+                set(predictions) == expected for predictions in views.values())),
+        }
+        output_dir = os.path.join(self.save_dir, "coverage_audits")
+        os.makedirs(output_dir, exist_ok=True)
+        epoch = getattr(self, "_m2_active_eval_epoch", None)
+        suffix = f"epoch_{int(epoch):02d}" if epoch is not None else "inference"
+        path = os.path.join(output_dir, f"m2_{split}_{suffix}.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(report, handle, indent=2, ensure_ascii=False)
+        print(f"[M2 full-split coverage] {split}: QA={len(results)}/{len(expected)}, "
+              f"span_views={{{', '.join(f'{name}: {len(pred)}' for name, pred in views.items())}}}; "
+              f"audit={path}", flush=True)
+        if not report["complete"]:
+            raise RuntimeError(
+                f"M2 {split}: incomplete predictions. Full-split benchmark metrics "
+                f"WERE NOT computed or logged to W&B. Audit: {path}. "
+                f"Reasons: {report['excluded_by_reason']}"
+            )
+        return report
+
+    def _m2_mbr_finish_eval(self, state, score, results, gt, segments, questions, split):
+        """Score C4 only when QA AND every WHERE arm cover the FULL native split.
+
+        No partial-denominator Acc&GQA is ever emitted as an M2 benchmark.
+        Timestamp GT is evaluator-only; MBR never sees it during decoding.
+        """
         spans, detail, skipped = self._m2_mbr_decode(state, segments, questions)
+        expected = self._m2_split_ids(questions, gt, split)
+        report = self._m2_coverage_audit(
+            split=split, expected=expected, results=results,
+            views=spans, skipped=skipped,
+        )
         received = len(state["rows"]) + len(state["excluded"])
-        base = {"n_received": received, "n_decoded": 0, "n_scored": 0}
+        if received != len(expected):
+            raise RuntimeError(f"M2 {split}: collected {received} rows vs {len(expected)} IDs.")
+        base = {"n_expected": len(expected), "n_received": received,
+                "n_qa": len(results), "n_decoded": len(expected),
+                "n_scored": len(expected), "full_split": 1,
+                "n_excluded_before_scoring": 0,
+                "n_decoded_without_gt_row": 0}
         for view, predictions in spans.items():
-            n_scored, cov_hits = 0, 0
+            cov_hits = 0
             for vid, annotation in gt.items():
                 for qid, alternatives in annotation["location"].items():
                     kid = f"{vid}_{qid}"
-                    if kid not in predictions:
-                        continue
-                    if kid not in results:
-                        raise RuntimeError(f"M2 interval has no CRA answer at {kid}.")
                     row = detail[view][kid]
                     qa = results[kid]
                     if qa["prediction"] != row["cra_answer"]:
-                        raise RuntimeError(f"M2 interval used a different CRA answer at {kid}.")
-                    n_scored += 1
+                        raise RuntimeError(f"M2 changed CRA answer at {kid}.")
                     matched = False
                     for loc in alternatives:
                         iou, iop = self.metric.get_tIoU(loc, predictions[kid])
@@ -3362,25 +3551,19 @@ class CRAPipeline(BasePipeline):
                     hit = int(matched and qa["prediction"] == qa["answer"])
                     cov_hits += hit
                     row["gqa_cov_hit"] = hit
-            # Do not report a zero percentage when the branch has no scored rows.
-            if n_scored:
-                official = dict(self.metric(predictions, gt, results, gs=False))
-                official["GQA-cov"] = 100.0 * cov_hits / n_scored
-                official["n_scored"] = n_scored
-                official["n_decoded"] = len(predictions)
-                score[f"v38_m2_mbr_{view}"] = official
-            base["n_decoded"] = len(predictions)
-            base["n_scored"] = n_scored
-        base["n_excluded_before_scoring"] = len(skipped)
-        base["n_decoded_without_gt_row"] = base["n_decoded"] - base["n_scored"]
-        for reason, n in sorted(collections.Counter(skipped.values()).items()):
-            base[f"excluded_{reason}"] = n
+            official = dict(self.metric(predictions, gt, results, gs=False))
+            official["GQA-cov"] = 100.0 * cov_hits / len(expected)
+            official["n_expected"] = len(expected)
+            official["n_scored"] = len(expected)
+            official["n_decoded"] = len(expected)
+            score[f"v38_m2_mbr_{view}"] = official
         score["v38_m2_mbr_coverage"] = base
         return {
             "v38_m2_mbr_spans": spans,
             "v38_m2_mbr_diagnostics": detail,
             "v38_m2_mbr_excluded": skipped,
             "v38_m2_mbr_qa_prediction_source": "cra",
+            "v38_m2_mbr_full_split": bool(report["complete"]),
         }
 
     def eval(
@@ -3644,6 +3827,8 @@ class CRAPipeline(BasePipeline):
                 predicted_np = predicted.numpy()
                 labels_np = labels_cpu.numpy()
                 for batch_index, qid in enumerate(question_id):
+                    if qid in results:
+                        raise RuntimeError(f"Duplicate evaluation question ID: {qid}")
                     results[qid] = {
                         "prediction": int(predicted_np[batch_index]),
                         "answer": int(labels_np[batch_index]),
@@ -3853,7 +4038,7 @@ class CRAPipeline(BasePipeline):
 
         if m2_state is not None:
             result.update(self._m2_mbr_finish_eval(
-                m2_state, score, results, ground_truth, segments, questions,
+                m2_state, score, results, ground_truth, segments, questions, split,
             ))
 
         if self.v38_minimal_enabled:
@@ -3965,5 +4150,12 @@ class CRAPipeline(BasePipeline):
             },
         }
 
+        self._m2_write_full_scores(val_score, test_score, epoch=None)
         self.print_score(score)
+        # Frozen checkpoint evaluation must also log the EXACT C4+MBR metrics
+        # as the training path, rather than leaving an empty W&B inference run.
+        wandb.log({"epoch": int(epoch) if epoch is not None else 0,
+                   "experiment/mode_infer": 1,
+                   **self._m2_flatten_eval_metrics({"val": val_score,
+                                                    "test": test_score})})
         return score

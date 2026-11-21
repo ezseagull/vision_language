@@ -31,15 +31,44 @@ _BEGIN = {"beginning", "begin", "start", "started", "first"}
 _END = {"end", "ending", "finally", "last"}
 
 
+def timestamp_status(timestamps):
+    """Classify actual sampled-frame centers WITHOUT fabricating or sorting times.
+
+    Exact adjacent ties are permitted; they can arise when the sampled indices
+    are repeated. The 32-step feature order is never changed. All-equal values
+    cannot define a positive-duration span, so they remain an explicit error.
+    """
+    if timestamps is None:
+        return "missing_key", None
+    try:
+        t = np.asarray(timestamps, dtype=np.float64)
+    except (TypeError, ValueError, OverflowError):
+        return "not_numeric", None
+    if t.shape not in ((T,), (T, 1), (1, T)):
+        return "wrong_shape", None
+    t = t.reshape(T)
+    if not np.isfinite(t).all():
+        return "nonfinite", None
+    if np.any(t < 0):
+        return "negative", None
+    dt = np.diff(t)
+    if np.any(dt < 0):
+        return "decreasing", None
+    if not np.any(dt > 0):
+        return "all_equal", None
+    return ("repeated_centers" if np.any(dt == 0) else "strict"), t
+
+
 def validate_timestamps(timestamps):
-    """Validate sampled-frame centers, not annotations or duration-normalized indices."""
-    t = np.asarray(timestamps, dtype=np.float64)
-    if t.shape in ((T, 1), (1, T)):
-        t = t.reshape(T)
-    if t.shape != (T,) or not np.isfinite(t).all():
-        raise ValueError("M2 MBR expects 32 finite sampled-frame center timestamps.")
-    if t[0] < 0 or np.any(np.diff(t) <= 0):
-        raise ValueError("M2 MBR timestamps must be nonnegative and strictly increasing.")
+    """Validate exactly 32 real, ordered sampled-frame centers.
+
+    Non-decreasing ties are accepted and handled by select() with an explicit
+    positive-duration span mask; missing/invalid centers never receive guessed
+    timestamps. Strictly increasing inputs follow the ORIGINAL MBR code path.
+    """
+    status, t = timestamp_status(timestamps)
+    if t is None:
+        raise ValueError(f"M2 MBR timestamp error: {status}")
     return t
 
 
@@ -116,7 +145,40 @@ def select(probabilities, timestamps=None):
         or np.any(p < 0) or not np.allclose(p.sum(1), 1.0, rtol=0, atol=1e-8)
     ):
         raise ValueError("M2 MBR expects normalized probabilities [N,496].")
-    utility = _STEP_UTILITY if timestamps is None else _utility(validate_timestamps(timestamps))
-    scores = p @ utility.T
+    if timestamps is None:
+        # Locked replay: do not change the step-domain utility.
+        utility = _STEP_UTILITY
+        scores = p @ utility.T
+        choice = scores.argmax(axis=1)
+        return SPAN_BOUNDS[choice], scores[np.arange(len(choice)), choice]
+
+    t = validate_timestamps(timestamps)
+    if np.all(np.diff(t) > 0):
+        # Exactly the original 496-span seconds utility/MBR for strict times.
+        scores = p @ _utility(t).T
+        choice = scores.argmax(axis=1)
+        return SPAN_BOUNDS[choice], scores[np.arange(len(choice)), choice]
+
+    # The ONLY changed geometry: duplicated sample centers create some
+    # zero-second intervals. Keep original indices/order and exclude *only*
+    # those impossible positive-duration decisions and hypotheses. No fallback.
+    valid = t[_E - 1] > t[_S]
+    if not np.any(valid):
+        raise ValueError("No positive-duration span among the 496 intervals.")
+    bounds = SPAN_BOUNDS[valid]
+    lo, hi = t[bounds[:, 0]], t[bounds[:, 1] - 1]
+    lengths = hi - lo
+    intersection = np.maximum(
+        0.0, np.minimum(hi[:, None], hi[None, :])
+        - np.maximum(lo[:, None], lo[None, :]),
+    )
+    union = lengths[:, None] + lengths[None, :] - intersection
+    utility = ((intersection / union >= 0.30)
+               & (intersection / lengths[:, None] >= 0.50)).astype(np.float64)
+    pmass = p[:, valid]
+    denom = pmass.sum(axis=1, keepdims=True)
+    if not np.all(denom > 0):
+        raise RuntimeError("All C4 probability mass fell on zero-duration spans.")
+    scores = (pmass / denom) @ utility.T
     choice = scores.argmax(axis=1)
-    return SPAN_BOUNDS[choice], scores[np.arange(len(choice)), choice]
+    return bounds[choice], scores[np.arange(len(choice)), choice]

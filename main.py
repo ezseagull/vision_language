@@ -1,6 +1,7 @@
 """Run a VideoQA experiment from its YAML, using the installed pipeline registry."""
 
 import argparse
+import hashlib
 import inspect
 import os
 from pathlib import Path
@@ -23,6 +24,16 @@ def main(args):
         misc["cuda"] = args.cuda
     if args.R:
         misc["running_name"] = args.R
+
+    # Match Base's contract: a non-null checkpoint is for frozen evaluation.
+    # Base still validates the actual value and loads the checkpoint.
+    stat = cfgs.get("stat")
+    frozen_m2_eval = isinstance(stat, dict) and stat.get("m2_eval_checkpoint") is not None
+    run_infer = args.infer or frozen_m2_eval
+    if frozen_m2_eval:
+        mode = "infer (stat.m2_eval_checkpoint)"
+    else:
+        mode = "infer (--infer)" if args.infer else "train"
 
     # Set device visibility before importing anything that can load PyTorch.
     os.environ["CUDA_VISIBLE_DEVICES"] = str(misc.get("cuda", "0"))
@@ -49,6 +60,17 @@ def main(args):
     print(f"[VideoQA] Pipeline source: {Path(source).resolve() if source else '<unknown>'}", flush=True)
     print(f"[VideoQA] Q-Bound version from YAML: {version!r}", flush=True)
     print(f"[VideoQA] CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']!r}", flush=True)
+    print(f"[VideoQA] Mode: {mode}", flush=True)
+    # Fingerprint the code actually loaded, not only the YAML. This makes it
+    # possible to audit whether two same-seed runs used identical sources.
+    here = Path(__file__).resolve().parent
+    source_hashes = {}
+    for relative in ("main.py", "pipeline/base.py", "pipeline/cra_pipeline.py",
+                     "pipeline/m2_mbr.py"):
+        path = here / relative
+        if path.is_file():
+            source_hashes[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+            print(f"[VideoQA] SHA256 {relative}: {source_hashes[relative]}", flush=True)
     if args.check_entrypoint:
         return  # Report imports only. No model construction or W&B run.
 
@@ -63,15 +85,26 @@ def main(args):
     # Initialize the pipeline first. Invalid version/configuration should
     # fail with the original traceback without creating an empty W&B run.
     pipeline = pipeline_cls(cfgs)
-    wandb.init(
+    run = wandb.init(
         entity="chinhez",
         project="CRA-GQA",
         name=misc["running_name"],
         config=cfgs,
     )
-    if args.infer:
-        return pipeline.infer()
-    return pipeline.train()
+    if run is not None:
+        wandb.config.update({"code_sha256": source_hashes,
+                             "execution_mode": mode}, allow_val_change=True)
+    # Both modes use exactly the same pipeline and M2 full-coverage guard.
+    # The inference path logs the same named C4 metrics as each train epoch.
+    try:
+        if run_infer:
+            return pipeline.infer()
+        return pipeline.train()
+    finally:
+        # Flush W&B even if a timestamp/full-coverage guard raises. Incomplete
+        # C4 benchmark scores are never logged by the pipeline.
+        if run is not None:
+            wandb.finish()
 
 
 def parse_args():
@@ -79,7 +112,10 @@ def parse_args():
     parser.add_argument("--cfg", default="config/CRA/CRA_NextGQA.yml")
     parser.add_argument("--cuda", default=None, help="Override misc.cuda from YAML.")
     parser.add_argument("-R", default="", help="Override misc.running_name from YAML.")
-    parser.add_argument("--infer", action="store_true", help="Run inference instead of training.")
+    parser.add_argument(
+        "--infer", action="store_true",
+        help="Run inference instead of training. Automatic when stat.m2_eval_checkpoint is set.",
+    )
     parser.add_argument("--check-entrypoint", action="store_true",
                         help="Print YAML version and loaded pipeline path without building the model.")
     return parser.parse_args()

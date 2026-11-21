@@ -133,7 +133,7 @@ stat:
   # Same checkpoint path used by the previous M1 audit. Point this at the
   # exact epoch-15 weights if comparing to val_epoch_15.
   # This is weights-only evaluation. Use infer(), not train() or resume.
-  m2_eval_checkpoint: /content/drive/MyDrive/output_4/qbound_3_8_M1/checkpoint/current_checkpoint.pth
+  m2_eval_checkpoint: null
   init_from_checkpoint: null
   resume: null
   resume_strict: true

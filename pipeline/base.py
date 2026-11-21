@@ -159,6 +159,18 @@ class BasePipeline(object):
             "mIoU": {"value": -inf, "epoch": 0},
             "Acc&GQA": {"value": -inf, "epoch": 0},
         }
+        # Keep the ORIGINAL M1 model_best.pth (M1 Val monitor), while adding
+        # a separately named Val-selected C4+MBR checkpoint for paper results.
+        # C4 has no new parameters, so both snapshots contain native M1 weights.
+        m2_cfg = self._qbound_config().get("m2_mbr", {}) if self._qbound_enabled() else {}
+        self._m2_c4_checkpoint_enabled = (self._base_v38_m1_enabled()
+            and isinstance(m2_cfg, dict) and m2_cfg.get("enabled") is True
+            and m2_cfg.get("references", True) is True)
+        if self._m2_c4_checkpoint_enabled:
+            self.grounding_best.update({
+                "v38_m2_mbr_c4_Acc&GQA": {"value": -inf, "epoch": 0},
+                "v38_m2_mbr_c4_mIoU": {"value": -inf, "epoch": 0},
+            })
         if self._v38_enabled():
             # Independent VAL-ONLY selectors; never mixed with old-support.
             self.grounding_best.update({
@@ -2035,6 +2047,20 @@ class BasePipeline(object):
     # ------------------------------------------------------------------
     def _update_grounding_best(self, epoch, score):
         """Select additional checkpoints ONLY by validation grounding scores."""
+        if self._m2_c4_checkpoint_enabled:
+            c4 = score.get("val_v38_m2_mbr_c4_seconds")
+            if not isinstance(c4, dict) or c4.get("n_scored") != c4.get("n_expected"):
+                raise RuntimeError("M2 Val-best requires FULL Val C4+MBR seconds metrics.")
+            improvements = []
+            for metric in ("Acc&GQA", "mIoU"):
+                name = f"v38_m2_mbr_c4_{metric}"
+                value = float(c4[metric])
+                if not math.isfinite(value):
+                    raise RuntimeError(f"Nonfinite M2 validation {metric}.")
+                if value > self.grounding_best[name]["value"]:
+                    self.grounding_best[name] = {"value": value, "epoch": int(epoch)}
+                    improvements.append(name)
+            return tuple(improvements)
         if not self._qbound_enabled() or self._base_v38_m1_enabled():
             return ()
 
@@ -2232,6 +2258,10 @@ class BasePipeline(object):
                 snapshots.append("model_best_v38_marginal_miou.pth")
             elif metric_name == "v38_joint_marginal_Acc&GQA":
                 snapshots.append("model_best_v38_marginal_gqa.pth")
+            elif metric_name == "v38_m2_mbr_c4_Acc&GQA":
+                snapshots.append("model_best_m2_c4_gqa.pth")
+            elif metric_name == "v38_m2_mbr_c4_mIoU":
+                snapshots.append("model_best_m2_c4_miou.pth")
             else:
                 raise ValueError(f"Unknown validation grounding checkpoint selector: {metric_name}")
 
@@ -2309,6 +2339,11 @@ class BasePipeline(object):
             saved_grounding_best = checkpoint.get("grounding_best")
             if isinstance(saved_grounding_best, dict):
                 self.grounding_best = saved_grounding_best
+            if self._m2_c4_checkpoint_enabled:
+                # Full-state resume from an older native M1 checkpoint may not
+                # yet carry M2-specific Val selectors. Do not change M1 weights.
+                for name in ("v38_m2_mbr_c4_Acc&GQA", "v38_m2_mbr_c4_mIoU"):
+                    self.grounding_best.setdefault(name, {"value": -inf, "epoch": 0})
         else:
             # A non-strict legacy/transfer load initializes model weights only.
             # Reusing its epoch, optimizer, scheduler, or best metric would mix
