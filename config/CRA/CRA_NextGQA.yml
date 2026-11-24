@@ -1,9 +1,9 @@
-# Q-Bound V3.8-M2: frozen M1 C2/C4 evaluation (infer only).
-# Keep CRA QA and the M1 checkpoint architecture unchanged.
+# Q-Bound V3.8-M2: train native M1 backbone and select/report by M2 C4+MBR.
+# Keep CRA QA, training losses and the M1 checkpoint architecture unchanged.
 # Seconds utility is the main result; step utility replays the locked reference.
 # GQA temporal annotations are evaluator-only. No scorer is trained here.
 #
-# Keep this as a separate config from the M1 training YAML.
+# Use for a FRESH run; do not change the monitor mid-way through old-run resume.
 
 dataset:
   name: nextgqa
@@ -124,15 +124,13 @@ optim:
 stat:
   monitor:
     mode: max
-    # CRA answer + M1 WHERE conditioned on the answer predicted by CRA.
-    metric: v38_m1_cra_acc_gqa
+    # Primary checkpoint selection: full validation, C4+MBR seconds Acc&GQA.
+    metric: v38_m2_c4_acc_gqa
     early_stop: 15
     vis: false
     display_port: 8099
   record_dir: ./output
-  # Same checkpoint path used by the previous M1 audit. Point this at the
-  # exact epoch-15 weights if comparing to val_epoch_15.
-  # This is weights-only evaluation. Use infer(), not train() or resume.
+  # For fresh training: null; for frozen infer: set the specific M2 best .pth.
   m2_eval_checkpoint: null
   init_from_checkpoint: null
   resume: null
@@ -143,12 +141,11 @@ stat:
   eval_test_each_epoch: true
   save_epoch_weights: false
 misc:
-  running_name: CRA/NextGQA/QBound_V3_8_M2_MBR_C2C4_eval_seed2024
+  running_name: qbound_3_8_M2_C4_primary_seed2024
   info: >-
-    Q-Bound V3.8-M2 frozen M1 evaluation for NextGQA CLIPL_I, 32 steps
-    and 5 choices. CRA predicts the answer on the full video. C2/C4
-    use the same 496 intervals and MBR decoder, with seconds utility
-    primary and step utility for locked replay. No learned scorer,
-    optimizer update, or checkpoint selection in this evaluation.
+    Q-Bound V3.8-M2 primary C4+MBR-second evaluation and validation-only
+    checkpoint selection. Trainable M1 backbone and existing CRA losses
+    remain unchanged; MBR is parameter-free. Full 3358-val and 5553-test
+    evaluation each epoch, with test never used for model selection.
   cuda: '0'
   seed: 2024

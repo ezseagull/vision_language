@@ -422,8 +422,9 @@ class CRAPipeline(BasePipeline):
         stat = self.cfgs["stat"]
         if not self.eval_test_each_epoch or not self.save_val_predictions:
             raise ValueError("M1 requires per-epoch test evaluation and saved validation predictions.")
-        if stat.get("monitor", {}).get("metric") != self.M1_MONITOR or stat["monitor"].get("mode") != "max":
-            raise ValueError(f"M1 requires monitor.metric={self.M1_MONITOR} and monitor.mode=max.")
+        expected = self.M2_MONITOR if self._base_m2_primary_enabled() else self.M1_MONITOR
+        if stat.get("monitor", {}).get("metric") != expected or stat["monitor"].get("mode") != "max":
+            raise ValueError(f"C4+MBR requires Val-only monitor.metric={expected} and monitor.mode=max.")
         if self.v35_pair_settings["enabled"] or self.r2_graph_mode != "fixed" or self.r2_predictor_enabled:
             raise ValueError("M1 uses R2-C legacy and its own question loss, not V3.5 pair loss.")
         cfg = self._qbound_config().get("v38", {})
@@ -2480,6 +2481,20 @@ class CRAPipeline(BasePipeline):
         print(f"[M2 full Val/Test metric export] {path}", flush=True)
         return path
 
+    def _m2_attach_primary_monitor(self, score):
+        """Expose a scalar for BasePipeline's existing Val monitor lifecycle."""
+        if not self._base_m2_primary_enabled():
+            return
+        for split, expected in (("val", 3358), ("test", 5553)):
+            c4 = score.get(f"{split}_v38_m2_mbr_c4_seconds")
+            if (not isinstance(c4, dict) or int(c4.get("n_scored", -1)) != expected or
+                    int(c4.get("n_expected", -1)) != expected):
+                raise RuntimeError(f"M2 primary monitor refuses incomplete {split} C4 metrics.")
+            value = float(c4["Acc&GQA"])
+            if not np.isfinite(value):
+                raise RuntimeError(f"M2 {split} C4 Acc&GQA is nonfinite.")
+            score[f"{split}_{self.M2_MONITOR}"] = value
+
     @staticmethod
     def _m2_flatten_eval_metrics(split_scores):
         """Canonical single-source names for W&B (shared train / infer)."""
@@ -2665,10 +2680,13 @@ class CRAPipeline(BasePipeline):
                     loss_name,
                     running_loss,
                 )
-                print_info += (
-                    f" {loss_name}: "
-                    f"{running_loss:.4f}"
-                )
+                if (not self._base_m2_primary_enabled() or
+                        loss_name in ("total_loss", "v38_m1_question_loss",
+                                      "v38_m1_answer_loss", "qbound_grounding_loss")):
+                    label = {"v38_m1_question_loss": "question_loss",
+                             "v38_m1_answer_loss": "answer_loss",
+                             "qbound_grounding_loss": "ground_loss"}.get(loss_name, loss_name)
+                    print_info += f" {label}={running_loss:.4f}"
 
             print(
                 f"\r{print_info}",
@@ -2701,19 +2719,27 @@ class CRAPipeline(BasePipeline):
                 f"{value:.4f}"
             )
 
-        self.monitor.log_info(
-            "\n" + tabulate(
-                table,
-                headers="firstrow",
-                tablefmt="grid",
-            ),
-            end="\n",
-        )
-
-        if self.v38_m1_enabled:
-            print("Eval Stage: validation (CRA answer + M1 WHERE selection)")
+        if self._base_m2_primary_enabled():
+            # All detailed monitor keys remain available in W&B, not on screen.
+            names = self.monitor.name2val
+            short = []
+            for key, title in (("acc", "QA train acc"), ("total_loss", "total loss"),
+                               ("v38_m1_question_loss", "question loss"),
+                               ("v38_m1_answer_loss", "answer loss"),
+                               ("qbound_grounding_loss", "ground loss")):
+                if key in names:
+                    short.append(f"{title}={float(names[key]):.4f}")
+            print("\n[M2 TRAIN] " + " | ".join(short), flush=True)
+            print("[M2 EVAL] Validation — C4+MBR seconds; full-split required", flush=True)
         else:
-            print("Eval Stage: validation (canonical R2-C/V3.5 model selection)")
+            self.monitor.log_info(
+                "\n" + tabulate(table, headers="firstrow", tablefmt="grid"),
+                end="\n",
+            )
+            if self.v38_m1_enabled:
+                print("Eval Stage: validation (CRA answer + M1 WHERE selection)")
+            else:
+                print("Eval Stage: validation (canonical R2-C/V3.5 model selection)")
         self._m2_active_eval_epoch = epoch
         val_score, val_result = self.eval(
             self.val_dataloader, save=self.save_val_predictions
@@ -2749,14 +2775,17 @@ class CRAPipeline(BasePipeline):
                 },
                 dump_path,
             )
-            print(f"[R2 {self.r2_graph_mode}] Validation dump: {dump_path}")
+            if not self._base_m2_primary_enabled():
+                print(f"[R2 {self.r2_graph_mode}] Validation dump: {dump_path}")
 
         # Always evaluate test each epoch in M0 for OBSERVATION ONLY.
         # The returned validation result and BasePipeline selection contract must
         # NEVER use test numbers to select/update a checkpoint.
         test_score = {}
         if self.eval_test_each_epoch:
-            print("Eval Stage: test (diagnostic only; NEVER for selection)")
+            print("[M2 EVAL] Test — diagnostic only; NEVER for selection" if
+                  self._base_m2_primary_enabled() else
+                  "Eval Stage: test (diagnostic only; NEVER for selection)", flush=True)
             if self.cfgs["dataset"]["name"] == "star":
                 test_score = val_score
             else:
@@ -2774,6 +2803,7 @@ class CRAPipeline(BasePipeline):
                 in test_score.items()
             },
         }
+        self._m2_attach_primary_monitor(score)
         self._m2_write_full_scores(val_score, test_score, epoch=epoch)
         self.print_score(score)
 
@@ -2821,6 +2851,24 @@ class CRAPipeline(BasePipeline):
         return score, val_result
 
     def print_score(self, score):
+        if self._base_m2_primary_enabled():
+            # Keep M1/V2.8 diagnostics COMPUTED and in existing artifacts,
+            # but display only the official M2 C4+MBR seconds benchmark.
+            names = ("Acc&GQA", "Acc&VQA", "mIoP", "TIoP@0.3", "TIoP@0.5",
+                     "mIoU", "TIoU@0.3", "TIoU@0.5")
+            self.monitor.log_info("\n[M2 C4+MBR — SECONDS | QA=CRA | FULL SPLIT]")
+            for split, expected in (("val", 3358), ("test", 5553)):
+                key = f"{split}_v38_m2_mbr_c4_seconds"
+                values = score.get(key)
+                if (not isinstance(values, dict) or
+                        int(values.get("n_scored", -1)) != expected or
+                        int(values.get("n_expected", -1)) != expected):
+                    raise RuntimeError(f"M2 {split} attempted to print partial benchmark results.")
+                self.monitor.log_info(f"\n{split.upper()} {expected}/{expected} | " +
+                                      " | ".join(f"{m}={float(values[m]):.4f}" for m in names))
+            self.monitor.log_info("\n")
+            return
+
         def _print_score(score_dict):
             self.monitor.log_info("\n")
             for key in score_dict.keys():
@@ -4150,6 +4198,7 @@ class CRAPipeline(BasePipeline):
             },
         }
 
+        self._m2_attach_primary_monitor(score)
         self._m2_write_full_scores(val_score, test_score, epoch=None)
         self.print_score(score)
         # Frozen checkpoint evaluation must also log the EXACT C4+MBR metrics

@@ -26,6 +26,7 @@ class BasePipeline(object):
     V38_EXPERIMENT_VERSION = "3.8-minimal"
     V38_M1_EXPERIMENT_VERSION = "3.8-m1"
     M1_MONITOR = "v38_m1_cra_acc_gqa"
+    M2_MONITOR = "v38_m2_c4_acc_gqa"  # scalar VAL C4+MBR seconds Acc&GQA, not M1
     M1_EVENT_PREFIXES = ("qbound_v38_m1_bank.", "qbound_v38_m1_evidence.")
 
     def __init__(self, cfgs) -> None:
@@ -185,10 +186,16 @@ class BasePipeline(object):
             self._load_m2_eval_checkpoint(self._m2_eval_checkpoint_path)
 
         self.monitor = Monitor(cfgs)
-        self.monitor.log_info(
-            json.dumps(cfgs, sort_keys=True, indent=4),
-            end="\n",
-        )
+        if self._base_m2_primary_enabled():
+            # Preserve the complete effective configuration without flooding stdout.
+            cfg_path = os.path.join(self.save_dir, "run_config_effective.json")
+            with open(cfg_path, "w", encoding="utf-8") as stream:
+                json.dump(cfgs, stream, sort_keys=True, indent=2, ensure_ascii=False)
+            print(f"[M2] Effective configuration: {cfg_path}", flush=True)
+        else:
+            self.monitor.log_info(
+                json.dumps(cfgs, sort_keys=True, indent=4), end="\n"
+            )
 
     # ------------------------------------------------------------------
     # Q-Bound V2.8 configuration and module helpers
@@ -247,6 +254,14 @@ class BasePipeline(object):
     def _base_m1_grouped_batch(self):
         return self._base_v38_m1_enabled() or self.cfgs["dataset"].get("m1_grouped_batch", False)
 
+    def _base_m2_primary_enabled(self):
+        """M2 is the reporting/selection protocol; the trainable backbone stays M1."""
+        if not self._base_v38_m1_enabled():
+            return False
+        cfg = self._qbound_config().get("m2_mbr", {})
+        return (isinstance(cfg, dict) and cfg.get("enabled") is True
+                and cfg.get("references", True) is True)
+
     def _preflight_v38_m1_lifecycle(self):
         stat = self.cfgs["stat"]
         if stat.get("resume") and stat.get("init_from_checkpoint"):
@@ -259,8 +274,12 @@ class BasePipeline(object):
             if stat.get(flag) is not True:
                 raise ValueError(f"M1 requires stat.{flag}=true.")
         monitor = stat.get("monitor", {})
-        if monitor.get("metric") != self.M1_MONITOR or monitor.get("mode") != "max":
-            raise ValueError(f"M1 selects checkpoints only by validation {self.M1_MONITOR} (max).")
+        expected_monitor = self.M2_MONITOR if self._base_m2_primary_enabled() else self.M1_MONITOR
+        if monitor.get("metric") != expected_monitor or monitor.get("mode") != "max":
+            raise ValueError(
+                f"This run must select checkpoints by VAL {expected_monitor} (max), "
+                "never by M1 or TEST when M2 C4+MBR is enabled."
+            )
         qcfg = self._qbound_config()
         if (qcfg.get("support_graph_mode") != "fixed" or
                 qcfg.get("support_predictor_enabled") is not False or
@@ -1760,7 +1779,9 @@ class BasePipeline(object):
                 },
                 "m1_grouped_batch": True,
                 "v38_m1": {"initialization": self.v38_initialization,
-                           "monitor": self.M1_MONITOR, "where": "cra_answer_conditional"},
+                           "monitor": (self.M2_MONITOR if self._base_m2_primary_enabled()
+                                       else self.M1_MONITOR),
+                           "where": "cra_answer_conditional"},
                 "loss_contract": "L_CRA/main + lambda_G*L_ground + lambda_Q*L_Q + lambda_A*L_A",
             }
         if self._v38_enabled():
@@ -2117,9 +2138,17 @@ class BasePipeline(object):
 
             if self._base_v38_m1_enabled():
                 if score is None or self.mnt_metric not in score:
-                    raise RuntimeError(f"Missing M1 validation selection metric {self.mnt_metric!r}.")
+                    raise RuntimeError(f"Missing validation selection metric {self.mnt_metric!r}.")
                 if not math.isfinite(float(score[self.mnt_metric])):
-                    raise RuntimeError(f"Nonfinite M1 validation selection metric {self.mnt_metric!r}.")
+                    raise RuntimeError(f"Nonfinite validation selection metric {self.mnt_metric!r}.")
+                if self._base_m2_primary_enabled():
+                    full = score.get("val_v38_m2_mbr_c4_seconds")
+                    if not isinstance(full, dict) or (int(full.get("n_scored", -1)) != 3358 or
+                                                       int(full.get("n_expected", -1)) != 3358):
+                        raise RuntimeError("M2 primary model selection requires full 3358/3358 VAL.")
+                    if not math.isclose(float(score[self.mnt_metric]), float(full["Acc&GQA"]),
+                                        rel_tol=0.0, abs_tol=1e-10):
+                        raise RuntimeError("M2 monitor scalar differs from C4+MBR seconds Acc&GQA.")
 
             if score is None:
                 self._save_checkpoint(epoch)
@@ -2151,6 +2180,10 @@ class BasePipeline(object):
                         and metric_value >= self.mnt_best
                     )
 
+                    if self._base_m2_primary_enabled():
+                        # Same strict tie policy as the C4 secondary snapshot.
+                        # 'best.pth' and 'best_m2_c4_gqa.pth' MUST remain identical.
+                        improved = metric_value > self.mnt_best
                     if improved:
                         self.mnt_best = metric_value
                         not_improved_count = 0
@@ -2178,7 +2211,7 @@ class BasePipeline(object):
                 break
 
         if self._qbound_enabled():
-            if self.grounding_best:
+            if self.grounding_best and not self._base_m2_primary_enabled():
                 print("[R2 A/B/C] Validation post-hoc best checkpoint epochs:")
                 for key, info in self.grounding_best.items():
                     print(f"  {key}: epoch {info['epoch']}, value={info['value']:.4f}")
@@ -2211,11 +2244,36 @@ class BasePipeline(object):
         record_dir = self.cfgs["stat"]["record_dir"]
         dataset_name = self.cfgs["dataset"]["name"]
         os.makedirs(record_dir, exist_ok=True)
-        record_path = os.path.join(record_dir, f"{dataset_name}.csv")
+        record_path = os.path.join(
+            record_dir,
+            f"{dataset_name}_m2_c4_seconds.csv" if self._base_m2_primary_enabled()
+            else f"{dataset_name}.csv",
+        )
 
-        rows = [self.best_recorder["val"]]
-        if test_was_evaluated:
-            rows.append(self.best_recorder["test"])
+        if self._base_m2_primary_enabled():
+            # Legacy best_recorder still contains diagnostics for checkpoint compatibility;
+            # CSV reports ONLY the single, validation-selected C4 benchmark branch.
+            best_epoch = int(self.best_recorder["val"].get("epoch", 0))
+            if best_epoch < 1:
+                raise RuntimeError("No M2 Val-best checkpoint to export.")
+            rows = []
+            for split in (("val", "test") if test_was_evaluated else ("val",)):
+                stored = self.best_recorder[split]
+                c4 = stored.get(f"{split}_v38_m2_mbr_c4_seconds")
+                if not isinstance(c4, dict):
+                    raise RuntimeError(f"Missing {split} C4 scores at Val-best epoch.")
+                rows.append({"run": self.cfgs["misc"]["running_name"], "split": split,
+                             "seed": seed, "time": current_time,
+                             "selected_by": "val/C4+MBR_seconds_Acc&GQA",
+                             "epoch": best_epoch,
+                             **{k: c4[k] for k in ("Acc&GQA", "Acc&VQA", "mIoP",
+                                                  "TIoP@0.3", "TIoP@0.5", "mIoU",
+                                                  "TIoU@0.3", "TIoU@0.5", "n_scored",
+                                                  "n_expected")}})
+        else:
+            rows = [self.best_recorder["val"]]
+            if test_was_evaluated:
+                rows.append(self.best_recorder["test"])
         new_records = pd.DataFrame(rows)
         if os.path.exists(record_path):
             old_records = pd.read_csv(record_path)
@@ -2243,7 +2301,8 @@ class BasePipeline(object):
         }
         filename = os.path.join(self.checkpoint_dir, "current_checkpoint.pth")
         torch.save(state, filename)
-        print(f"Saving checkpoint: {filename} ...")
+        if not self._base_m2_primary_enabled():
+            print(f"Saving checkpoint: {filename} ...")
 
         # These snapshots are resumable: weights + optimizer + LR scheduler.
         snapshots = []
@@ -2265,10 +2324,18 @@ class BasePipeline(object):
             else:
                 raise ValueError(f"Unknown validation grounding checkpoint selector: {metric_name}")
 
-        for snapshot in snapshots:
+        for snapshot in dict.fromkeys(snapshots):
             out = os.path.join(self.checkpoint_dir, snapshot)
             shutil.copyfile(filename, out)
-            print(f"  validation-best snapshot: {out}")
+            if not self._base_m2_primary_enabled():
+                print(f"  validation-best snapshot: {out}")
+        if self._base_m2_primary_enabled() and save_best:
+            # One canonical best plus one named M2 alias; both from same epoch/state.
+            if "model_best_m2_c4_gqa.pth" not in snapshots:
+                raise RuntimeError("M2 primary best did not also improve C4 GQA selector.")
+            print(f"[M2 BEST] epoch={int(epoch):02d} | VAL C4+MBR Acc&GQA="
+                  f"{self.mnt_best:.4f}% | model_best.pth = model_best_m2_c4_gqa.pth",
+                  flush=True)
 
         # Optional diagnostic epoch-by-epoch weights, deliberately omitting
         # optimizer/scheduler so files are smaller. DO NOT resume from these.
@@ -2398,7 +2465,8 @@ class BasePipeline(object):
             and log[self.mnt_metric] <= current_best
         ) or (
             self.mnt_mode == "max"
-            and log[self.mnt_metric] >= current_best
+            and (log[self.mnt_metric] > current_best if self._base_m2_primary_enabled()
+                 else log[self.mnt_metric] >= current_best)
         )
         if not improved_val:
             return
@@ -2423,7 +2491,35 @@ class BasePipeline(object):
         )
         torch.save(result, filename)
 
+    def _print_m2_best_summary(self, epoch):
+        """Compact, validation-only selected result. Test is paired, never optimized."""
+        order = ("Acc&GQA", "Acc&VQA", "mIoP", "TIoP@0.3", "TIoP@0.5",
+                 "mIoU", "TIoU@0.3", "TIoU@0.5")
+        lines = [f"\n[M2 FINAL BEST] epoch={epoch} selected by FULL VAL "
+                 f"C4+MBR(seconds) Acc&GQA={self.mnt_best:.4f}%",
+                 "  checkpoint: model_best.pth / model_best_m2_c4_gqa.pth"]
+        for split in ("val", "test"):
+            if split == "test" and not self.cfgs["stat"].get("eval_test_each_epoch", False):
+                continue
+            stored = self.best_recorder[split].get(f"{split}_v38_m2_mbr_c4_seconds")
+            if not isinstance(stored, dict):
+                raise RuntimeError(f"Missing M2 {split} scores for Val-selected best checkpoint.")
+            expected = 3358 if split == "val" else 5553
+            if (int(stored.get("n_scored", -1)) != expected or
+                    int(stored.get("n_expected", -1)) != expected):
+                raise RuntimeError(f"M2 {split} best checkpoint is not full-split.")
+            lines.append(f"  {split.upper()} FULL {expected}/{expected}: " +
+                         " | ".join(f"{k}={float(stored[k]):.4f}" for k in order))
+        print("\n".join(lines), flush=True)
+
     def _print_best(self):
+        if self._base_m2_primary_enabled():
+            best = self.best_recorder["val"]
+            epoch = int(best.get("epoch", 0))
+            if epoch < 1:
+                raise RuntimeError("M2 primary best epoch was never selected.")
+            self._print_m2_best_summary(epoch)
+            return
         metric_name = self.cfgs["stat"]["monitor"]["metric"]
         print(
             "Best results (w.r.t {}) in validation set:".format(

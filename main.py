@@ -1,7 +1,6 @@
 """Run a VideoQA experiment from its YAML, using the installed pipeline registry."""
 
 import argparse
-import hashlib
 import inspect
 import os
 from pathlib import Path
@@ -61,16 +60,6 @@ def main(args):
     print(f"[VideoQA] Q-Bound version from YAML: {version!r}", flush=True)
     print(f"[VideoQA] CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']!r}", flush=True)
     print(f"[VideoQA] Mode: {mode}", flush=True)
-    # Fingerprint the code actually loaded, not only the YAML. This makes it
-    # possible to audit whether two same-seed runs used identical sources.
-    here = Path(__file__).resolve().parent
-    source_hashes = {}
-    for relative in ("main.py", "pipeline/base.py", "pipeline/cra_pipeline.py",
-                     "pipeline/m2_mbr.py"):
-        path = here / relative
-        if path.is_file():
-            source_hashes[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
-            print(f"[VideoQA] SHA256 {relative}: {source_hashes[relative]}", flush=True)
     if args.check_entrypoint:
         return  # Report imports only. No model construction or W&B run.
 
@@ -85,26 +74,15 @@ def main(args):
     # Initialize the pipeline first. Invalid version/configuration should
     # fail with the original traceback without creating an empty W&B run.
     pipeline = pipeline_cls(cfgs)
-    run = wandb.init(
+    wandb.init(
         entity="chinhez",
         project="CRA-GQA",
         name=misc["running_name"],
         config=cfgs,
     )
-    if run is not None:
-        wandb.config.update({"code_sha256": source_hashes,
-                             "execution_mode": mode}, allow_val_change=True)
-    # Both modes use exactly the same pipeline and M2 full-coverage guard.
-    # The inference path logs the same named C4 metrics as each train epoch.
-    try:
-        if run_infer:
-            return pipeline.infer()
-        return pipeline.train()
-    finally:
-        # Flush W&B even if a timestamp/full-coverage guard raises. Incomplete
-        # C4 benchmark scores are never logged by the pipeline.
-        if run is not None:
-            wandb.finish()
+    if run_infer:
+        return pipeline.infer()
+    return pipeline.train()
 
 
 def parse_args():
